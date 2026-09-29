@@ -38,10 +38,11 @@ uses an isolated Herdr server and writes uncommitted raw samples to
 | [`0005`](adr/0005-parent-owns-workflow-script-authority.md) | Superseded by 0009 | Historical workflow-script authority decision. |
 | [`0006`](adr/0006-limit-v1-execution-effects-to-isolated-worktrees.md) | Partially superseded by 0009 | Historical runner effect boundary; managed worktree rules remain. |
 | [`0007`](adr/0007-require-fresh-review-for-workflow-scripts.md) | Superseded by 0009 | Historical workflow-review decision. |
-| [`0008`](adr/0008-adopt-pi-only-subagent-execution.md) | Accepted; implemented | Remove the external CLI adapter and make subagent execution Pi-only. |
+| [`0008`](adr/0008-adopt-pi-only-subagent-execution.md) | Partially superseded by 0012 | Remove the legacy external CLI adapter; Pi remains the default execution path. |
 | [`0009`](adr/0009-remove-workflow-subsystem.md) | Accepted | Remove the workflow subsystem; use public subagent fan-out and parent synthesis. |
 | [`0010`](adr/0010-persistent-specialists-as-session-generations.md) | Accepted | Define persistent specialists as logical identities with policy-bound session generations. |
 | [`0011`](adr/0011-explicit-worktree-cleanup.md) | Accepted | Authorize explicit worktree cleanup by cwd containment; retain branches and reject automatic reaping. |
+| [`0012`](adr/0012-native-claude-kiro-harness.md) | Accepted | Add first-stage native Claude Code and Kiro harnesses behind a small execution seam; partially supersedes 0008. |
 
 ## Historical material
 

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -112,8 +112,12 @@ export function interruptPane(paneId: PaneId): void {
 	sendHerdrEscape(paneId);
 }
 
-export function runScriptInPane(
-	paneId: PaneId,
+/**
+ * Stage a launch script privately. Scripts can embed task and role text, so
+ * they are written 0600 (they run as `bash <path>` and need no execute bit),
+ * and directories created here are 0700. Existing directories are unchanged.
+ */
+export function stageScript(
 	command: string,
 	options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
@@ -124,14 +128,24 @@ export function runScriptInPane(
 			"pi-herdr-subagent-scripts",
 			`cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
 		);
-	mkdirSync(dirname(scriptPath), { recursive: true });
+	mkdirSync(dirname(scriptPath), { recursive: true, mode: 0o700 });
 
 	const scriptLines = ["#!/bin/bash"];
 	if (options?.scriptPreamble)
 		scriptLines.push(options.scriptPreamble.trimEnd());
 	scriptLines.push(command);
-	writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
+	writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o600 });
+	// The creation mode does not apply when an existing file is overwritten.
+	chmodSync(scriptPath, 0o600);
+	return scriptPath;
+}
 
+export function runScriptInPane(
+	paneId: PaneId,
+	command: string,
+	options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+	const scriptPath = stageScript(command, options);
 	runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
 	return scriptPath;
 }

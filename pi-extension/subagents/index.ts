@@ -30,6 +30,7 @@ import {
 	runScriptInPane,
 	closePane,
 	interruptPane,
+	runInPane,
 	shellQuote,
 	readPaneAsync,
 	inspectPane,
@@ -133,6 +134,7 @@ import {
 } from "./worktree-cleanup.ts";
 import {
 	captureWorktreeHandoff,
+	launchNativeSubagent,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	persistWorktreeResult,
@@ -142,6 +144,27 @@ import {
 	type WorktreeHandoff,
 	type WorktreeLaunch,
 } from "./launch.ts";
+import {
+	isNativeHarnessName,
+	nativeHarnessLabel,
+	nativeOutcome,
+	nativeSessionId,
+	readNativeSessionMarker,
+	releaseNativeRun,
+	resolveNativeLaunchSpec,
+	retainedNativeEvidence,
+	waitForNativeCompletion,
+	type NativeHarnessName,
+	type NativeLaunchSpec,
+	type NativeRoleDefinition,
+	type NativeRun,
+} from "./native-harness.ts";
+import {
+	confirmProcessExit,
+	terminateProcessRun,
+	type ExitConfirmation,
+	type TerminationResult,
+} from "./process-run.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -327,6 +350,8 @@ const SubagentParams = Type.Object({
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
+	/** Native harness; omitted for Pi-backed roles. */
+	cli?: NativeHarnessName;
 	model?: string;
 	tools?: string;
 	skills?: string;
@@ -529,8 +554,9 @@ function parseAgentDefinition(
 	const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
 	const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 	const thinking = getFrontmatterValue(frontmatter, "thinking");
+	const cli = getFrontmatterValue(frontmatter, "cli");
 
-	return {
+	const definition: AgentDefinition = {
 		name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
 		description: getFrontmatterValue(frontmatter, "description"),
 		model: getFrontmatterValue(frontmatter, "model"),
@@ -569,6 +595,8 @@ function parseAgentDefinition(
 				"disable-model-invocation",
 			)?.toLowerCase() === "true",
 	};
+	if (isNativeHarnessName(cli)) definition.cli = cli;
+	return definition;
 }
 
 function invalidCapabilityDeclarationDiagnostic(
@@ -589,20 +617,79 @@ function invalidCapabilityDeclarationDiagnostic(
 	};
 }
 
-function legacyExternalCliDiagnostic(
+/**
+ * Validate `cli` frontmatter. Omitted means Pi-backed. `claude` and `kiro`
+ * select a native harness whose static capabilities are checked here, so an
+ * unsupported role fails closed during discovery, before any Herdr resource.
+ */
+function nativeCliDiagnostic(
 	content: string,
 	agentName: string,
 	path: string,
 ): AgentDiagnostic | null {
 	const match = content.match(/^---\n([\s\S]*?)\n---/);
-	const cli = match ? getFrontmatterValue(match[1], "cli") : undefined;
-	if (!match || !cli) return null;
-	const resolvedAgentName = getFrontmatterValue(match[1], "name") ?? agentName;
+	if (!match) return null;
+	const frontmatter = match[1];
+	const cli = getFrontmatterValue(frontmatter, "cli");
+	const cliModel = getFrontmatterValue(frontmatter, "cli-model");
+	if (!cli && !cliModel) return null;
+	const resolvedAgentName =
+		getFrontmatterValue(frontmatter, "name") ?? agentName;
+	if (!isNativeHarnessName(cli)) {
+		return {
+			code: "external-cli-unsupported",
+			message: cli
+				? `Role "${resolvedAgentName}" requests unsupported external CLI "${cli}" in ${path}. Supported native harnesses are cli: claude and cli: kiro; omit cli (and cli-model) for a Pi-backed role that selects Claude through an authenticated Pi provider/model ID.`
+				: `Role "${resolvedAgentName}" declares cli-model without cli in ${path}. Remove cli-model; Pi-backed roles use model with an authenticated Pi provider/model ID.`,
+			path,
+			agentName: resolvedAgentName,
+		};
+	}
+	if (cliModel) {
+		return {
+			code: "native-harness-unsupported",
+			message: `Role "${resolvedAgentName}" in ${path} uses cli-model, which is not supported. Put the native ${cli} model ID in model instead.`,
+			path,
+			agentName: resolvedAgentName,
+		};
+	}
+	const parsed = parseAgentDefinition(content, agentName);
+	if (!parsed) return null;
+	try {
+		resolveNativeLaunchSpec({
+			...toNativeRoleDefinition({ ...parsed, cli }),
+			thinking: getFrontmatterValue(frontmatter, "thinking"),
+			sessionMode:
+				getFrontmatterValue(frontmatter, "session-mode") ?? parsed.sessionMode,
+		});
+	} catch (error) {
+		return {
+			code: "native-harness-unsupported",
+			message: `${error instanceof Error ? error.message : String(error)} (${path})`,
+			path,
+			agentName: resolvedAgentName,
+		};
+	}
+	return null;
+}
+
+function toNativeRoleDefinition(
+	agent: AgentDefaults & { name: string; cli: NativeHarnessName },
+): NativeRoleDefinition {
 	return {
-		code: "external-cli-unsupported",
-		message: `Role "${resolvedAgentName}" requests external CLI "${cli}" in ${path}. pi-herdr-agents is Pi-only; remove the cli and cli-model fields and select Claude through an authenticated Pi provider/model ID.`,
-		path,
-		agentName: resolvedAgentName,
+		name: agent.name,
+		cli: agent.cli,
+		model: agent.model,
+		tools: agent.tools,
+		skills: agent.skills,
+		thinking: agent.thinking,
+		spawning: agent.spawning,
+		persistent: agent.persistent,
+		autoExit: agent.autoExit,
+		interactive: agent.interactive,
+		sessionMode: agent.sessionMode,
+		systemPromptMode: agent.systemPromptMode,
+		body: agent.body,
 	};
 }
 
@@ -691,16 +778,6 @@ function discoverAgentCatalog(
 		for (const filePath of listMarkdownFiles(path)) {
 			const fallbackName = basename(filePath, ".md");
 			const content = readFileSync(filePath, "utf8");
-			const legacyDiagnostic = legacyExternalCliDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (legacyDiagnostic) {
-				diagnostics.push(legacyDiagnostic);
-				agents.delete(legacyDiagnostic.agentName ?? fallbackName);
-				continue;
-			}
 			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
 				content,
 				fallbackName,
@@ -709,6 +786,16 @@ function discoverAgentCatalog(
 			if (capabilityDiagnostic) {
 				diagnostics.push(capabilityDiagnostic);
 				agents.delete(capabilityDiagnostic.agentName ?? fallbackName);
+				continue;
+			}
+			const cliDiagnostic = nativeCliDiagnostic(
+				content,
+				fallbackName,
+				filePath,
+			);
+			if (cliDiagnostic) {
+				diagnostics.push(cliDiagnostic);
+				agents.delete(cliDiagnostic.agentName ?? fallbackName);
 				continue;
 			}
 			const parsed = parseAgentDefinition(content, fallbackName);
@@ -770,15 +857,6 @@ function discoverAgentCatalog(
 				});
 				continue;
 			}
-			const legacyDiagnostic = legacyExternalCliDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (legacyDiagnostic) {
-				diagnostics.push({ ...legacyDiagnostic, provider: metadata.provider });
-				continue;
-			}
 			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
 				content,
 				fallbackName,
@@ -789,6 +867,15 @@ function discoverAgentCatalog(
 					...capabilityDiagnostic,
 					provider: metadata.provider,
 				});
+				continue;
+			}
+			const cliDiagnostic = nativeCliDiagnostic(
+				content,
+				fallbackName,
+				filePath,
+			);
+			if (cliDiagnostic) {
+				diagnostics.push({ ...cliDiagnostic, provider: metadata.provider });
 				continue;
 			}
 			const parsed = parseAgentDefinition(content, fallbackName);
@@ -884,7 +971,8 @@ function formatVisibleAgentDefinitions(
 			const badge = ` (${formatAgentSource(agent)})`;
 			const desc = agent.description ? ` — ${agent.description}` : "";
 			const model = agent.model ? ` [${agent.model}]` : "";
-			return `• ${agent.name}${badge}${model}${desc}`;
+			const harness = agent.cli ? ` [cli: ${agent.cli}]` : "";
+			return `• ${agent.name}${badge}${harness}${model}${desc}`;
 		});
 }
 
@@ -1159,6 +1247,32 @@ function formatSessionReference(sessionFile?: string): string {
 		: "";
 }
 
+interface NativeResultReference {
+	harness: NativeHarnessName;
+	sessionId?: string;
+	markerFile: string;
+	/** `unconfirmed`: an owned native process may still be running. */
+	processExit: "confirmed" | "unconfirmed";
+	/** Owned files and surfaces retained while exit is unconfirmed. */
+	retained?: string[];
+	warning?: string;
+}
+
+const NATIVE_RESUME_UNSUPPORTED =
+	"Native resume and follow-up are unsupported; spawn a new subagent for further work.";
+
+function formatNativeSessionReference(native: NativeResultReference): string {
+	let text =
+		`\n\nNative harness: ${nativeHarnessLabel(native.harness)} (cli: ${native.harness})` +
+		`\nNative session: ${native.sessionId ?? "unknown"}` +
+		`\nNative marker: ${native.markerFile}` +
+		`\n${NATIVE_RESUME_UNSUPPORTED}`;
+	if (native.warning) text += `\nWarning: ${native.warning}`;
+	if (native.retained?.length)
+		text += `\nRetained for inspection: ${native.retained.join(", ")}`;
+	return text;
+}
+
 function resolveUnexpectedErrorPresentation(
 	prefix: string,
 	error: any,
@@ -1192,6 +1306,7 @@ interface SubagentResultDetails {
 	fallbackFailures?: ModelFailure[];
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
+	native?: NativeResultReference;
 }
 
 interface SubagentPingDetails {
@@ -1214,6 +1329,8 @@ interface SubagentStartedDetails {
 	runtimePlan?: ResolvedRuntimePlan;
 	worktree?: WorktreeLaunch;
 	warning?: string;
+	harness?: NativeHarnessName;
+	nativeThinking?: string;
 	status: "started";
 }
 
@@ -1298,11 +1415,14 @@ function resolveResultPresentation(
 		| "fallbackFailures"
 		| "runtimePlan"
 		| "worktree"
+		| "native"
 	>,
 	name: string,
 	runtimeMismatch?: string,
 ): string {
-	const sessionRef = formatSessionReference(result.sessionFile);
+	const sessionRef = result.native
+		? formatNativeSessionReference(result.native)
+		: formatSessionReference(result.sessionFile);
 	let body: string;
 	const attempted = result.fallbackAttempts ?? [];
 	const requestedModel =
@@ -1312,7 +1432,16 @@ function resolveResultPresentation(
 	const usedModel =
 		result.runtimePlan?.observed?.model ?? result.runtimePlan?.model;
 
-	if (result.errorMessage) {
+	if (result.errorMessage && result.native) {
+		// Native completion failed closed: no correlated turn evidence plus exit.
+		body =
+			`Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
+			`(native ${nativeHarnessLabel(result.native.harness)} harness).\n\n` +
+			`Error: ${result.errorMessage}\n\n` +
+			`The subagent did not produce a verified result. Next action: inspect the ` +
+			`native marker and pane evidence, resolve the cause, and spawn a new ` +
+			`subagent; native resume is unsupported.`;
+	} else if (result.errorMessage) {
 		// Pi owns provider retry policy and exposes the settled error as text. Do
 		// not infer retry counts or permanence from that text; preserve it as-is.
 		body =
@@ -1369,6 +1498,7 @@ interface SubagentResult {
 	ping?: { name: string; message: string };
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
+	native?: NativeResultReference;
 }
 
 /**
@@ -1433,10 +1563,20 @@ interface RunningSubagent {
 	stopTimeoutMs?: number;
 	crashNotified?: boolean;
 	supervisionRegistration?: SupervisionRegistration;
+	/** Native harness run; absent for Pi-backed children. */
+	native?: NativeRun;
+}
+
+/** A native run whose owned process exit could not be confirmed. */
+interface UnresolvedNativeRun {
+	run: NativeRun;
+	worktreePath?: string;
 }
 
 interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
+	/** Retained until exit is confirmed; blocks cleanup of their worktrees. */
+	unresolvedNativeRuns?: Map<string, UnresolvedNativeRun>;
 	supervision?: SupervisionCoordinator;
 	pi?: ExtensionAPI;
 	latestCtx?: ExtensionContext;
@@ -1827,7 +1967,8 @@ function evaluateNoProgressAdvisory(
 	now: number,
 	hangWarningMinutes: number,
 ): NoProgressAdvisoryEvent | undefined {
-	if (hangWarningMinutes === 0) {
+	// Native markers are not transcripts; their progress cannot be read from mtime.
+	if (hangWarningMinutes === 0 || running.native) {
 		delete running.noProgressEpisode;
 		return;
 	}
@@ -2259,6 +2400,16 @@ function handleSubagentInterrupt(
 	}
 
 	const running = resolved.running;
+	if (running.native) {
+		const error =
+			`Subagent "${running.name}" runs in the native ${nativeHarnessLabel(running.native.harness)} harness; ` +
+			"turn interrupts are unsupported because an interrupted native turn cannot produce correlated completion evidence. " +
+			"Wait for its result, or close its pane to fail the run closed.";
+		return {
+			content: [{ type: "text" as const, text: error }],
+			details: { error, id: running.id, name: running.name },
+		};
+	}
 	const now = Date.now();
 	observeRunningSubagent(running, now);
 
@@ -2314,7 +2465,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
 		for (const running of runningSubagents.values()) {
 			// Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
-			observeRunningSubagent(running, now);
+			// Native children have no Pi activity snapshot; their watcher owns observation.
+			if (!running.native) observeRunningSubagent(running, now);
 			const projection = projectLifecycle(ensureLifecycle(running), now);
 			const transition = lifecycleTransition(
 				running.lastProjectedKind,
@@ -2441,6 +2593,10 @@ export const __test__ = {
 	writeWorktreeManifest,
 	runningSubagents,
 	formatElapsed,
+	watchNativeSubagent,
+	resolveNativeSpecForParams,
+	reconcileUnresolvedNativeRuns,
+	unresolvedNativeRuns,
 };
 
 function startWidgetRefresh() {
@@ -2579,6 +2735,57 @@ async function launchSubagent(
 		});
 	}
 	runningSubagents.set(logicalId, running);
+	return running;
+}
+
+/** Validate a native role together with per-call overrides; throws before resources. */
+function resolveNativeSpecForParams(
+	params: Static<typeof SubagentParams>,
+	agentDefs: AgentDefaults & { name: string; cli: NativeHarnessName },
+): NativeLaunchSpec {
+	return resolveNativeLaunchSpec(toNativeRoleDefinition(agentDefs), {
+		model: params.model,
+		thinking: params.thinking,
+		tools: params.tools,
+		skills: params.skills,
+		fork: params.fork,
+		persistent: params.persistent,
+		interactive: params.interactive,
+	});
+}
+
+/** Launch a pre-validated native child through the common Herdr seams. */
+async function launchNativeFromParams(
+	params: Static<typeof SubagentParams>,
+	ctx: Parameters<typeof launchSubagent>[1],
+	spec: NativeLaunchSpec,
+	agentDefs: AgentDefaults | null,
+): Promise<RunningSubagent> {
+	const parentSessionFile = ctx.sessionManager.getSessionFile();
+	if (!parentSessionFile) throw new Error("No session file");
+	const running: RunningSubagent = await launchNativeSubagent({
+		kind: "native",
+		id: randomUUID(),
+		name: params.name,
+		task: params.task,
+		agent: params.agent,
+		cwd: params.cwd,
+		worktree: params.worktree,
+		parent: {
+			cwd: ctx.cwd,
+			invocationCwd: process.cwd(),
+			sessionFile: parentSessionFile,
+			sessionId: ctx.sessionManager.getSessionId(),
+			sessionDir: ctx.sessionManager.getSessionDir(),
+			agentDir: getAgentConfigDir(),
+		},
+		behavior: {
+			interactive: resolveEffectiveInteractive(params, agentDefs),
+			cwd: agentDefs?.cwd,
+		},
+		native: spec,
+	});
+	runningSubagents.set(running.id, running);
 	return running;
 }
 
@@ -2828,6 +3035,7 @@ async function watchSubagent(
 	running: RunningSubagent,
 	signal: AbortSignal,
 ): Promise<SubagentResult> {
+	if (running.native) return watchNativeSubagent(running, signal);
 	const { name, task, surface, startTime, sessionFile } = running;
 	const supervision = getSupervisionCoordinator().register(
 		sessionFile,
@@ -2980,6 +3188,208 @@ async function watchSubagent(
 	}
 }
 
+interface NativeWatchDependencies {
+	send(surface: string, text: string): void;
+	inspectPane(surface: string): Promise<PaneInspection>;
+	terminate(run: NativeRun["processRun"]): TerminationResult | void;
+	confirmExit?(run: NativeRun["processRun"]): ExitConfirmation;
+	intervalMs?: number;
+	terminationGraceMs?: number;
+}
+
+const defaultNativeWatchDependencies: NativeWatchDependencies = {
+	send: runInPane,
+	inspectPane,
+	terminate: (processRun) => terminateProcessRun(processRun),
+};
+
+function unresolvedNativeRuns(): Map<string, UnresolvedNativeRun> {
+	runtime.unresolvedNativeRuns ??= new Map();
+	return runtime.unresolvedNativeRuns;
+}
+
+/**
+ * Re-check retained native runs. A run whose exit is now confirmed releases
+ * its owned files and stops blocking worktree cleanup.
+ */
+function reconcileUnresolvedNativeRuns(
+	confirm: (run: NativeRun["processRun"]) => ExitConfirmation = (run) =>
+		confirmProcessExit(run),
+): UnresolvedNativeRun[] {
+	const unresolved = unresolvedNativeRuns();
+	for (const [id, entry] of unresolved) {
+		const exit = confirm(entry.run.processRun);
+		if (exit.kind === "confirmed") {
+			releaseNativeRun(entry.run, exit);
+			unresolved.delete(id);
+		}
+	}
+	return [...unresolved.values()];
+}
+
+/** Git state is never captured while an owned process may still write it. */
+function retainUnconfirmedNativeWorktree(
+	running: RunningSubagent,
+	reason: string,
+): WorktreeHandoff | undefined {
+	if (!running.worktree) return undefined;
+	const gitError = `Git state not captured: native process exit is unconfirmed (${reason}).`;
+	const handoff: WorktreeHandoff = {
+		...running.worktree,
+		headSha: null,
+		commitsAhead: null,
+		clean: null,
+		conflicted: null,
+		changedFiles: null,
+		untrackedFiles: null,
+		gitError,
+	};
+	try {
+		persistWorktreeResult(running.worktree, "failed", handoff);
+		writeWorktreeManifest(running.worktree.manifestFile, {
+			processExit: "unconfirmed",
+		});
+	} catch (error: any) {
+		handoff.gitError = `${gitError} Manifest update failed: ${error?.message ?? String(error)}`;
+	}
+	return handoff;
+}
+
+/**
+ * Watch a native harness child. Success requires correlated native hook/turn
+ * evidence plus durable process exit; Herdr status only updates the widget.
+ * Owned transient files are removed, and Git state is captured, only after the
+ * owned process exit is confirmed. Otherwise the run fails with a warning and
+ * its pane, Kiro profile, run files, and worktree lease are retained.
+ */
+async function watchNativeSubagent(
+	running: RunningSubagent,
+	signal: AbortSignal,
+	deps: NativeWatchDependencies = defaultNativeWatchDependencies,
+): Promise<SubagentResult> {
+	const run = running.native;
+	if (!run) throw new Error("Native watcher requires a native run.");
+	const { name, task, surface, startTime, sessionFile } = running;
+	const confirmExit =
+		deps.confirmExit ?? ((processRun) => confirmProcessExit(processRun));
+
+	const settle = (
+		exit: ExitConfirmation,
+		outcome: { completed: boolean; summary: string },
+		exitCode: number,
+		detectedAt: number,
+		extra: Partial<SubagentResult> = {},
+	): SubagentResult => {
+		const native: NativeResultReference = {
+			harness: run.harness,
+			sessionId: nativeSessionId(run),
+			markerFile: run.markerFile,
+			processExit: exit.kind,
+		};
+		let worktreeHandoff: WorktreeHandoff | undefined;
+		let summary = outcome.summary;
+		let completed = outcome.completed;
+		if (exit.kind === "confirmed") {
+			releaseNativeRun(run, exit);
+			const warnings: string[] = [];
+			if (exit.lingering.length)
+				warnings.push(
+					`the native CLI exited, but owned descendant process(es) ${exit.lingering.join(", ")} are still running`,
+				);
+			if (exit.evidence === "scan" && exit.unreadableCount > 0)
+				warnings.push(
+					`exit was confirmed by an owned-process scan that could not inspect ${exit.unreadableCount} same-user process(es)`,
+				);
+			if (warnings.length) native.warning = `${warnings.join("; ")}.`;
+			worktreeHandoff = finalizeSubagentWorktree(
+				running,
+				completed ? "ready_for_review" : "failed",
+			);
+		} else {
+			completed = false;
+			native.warning = `native process exit is unconfirmed (${exit.reason}); the run is unresolved and treated as failed.`;
+			native.retained = [
+				...retainedNativeEvidence(run),
+				...(running.worktree ? [running.worktree.path] : [`pane ${surface}`]),
+			];
+			if (!summary.includes("exit is unconfirmed"))
+				summary = `${summary} Native process exit is unconfirmed: ${exit.reason}.`;
+			unresolvedNativeRuns().set(running.id, {
+				run,
+				worktreePath: running.worktree?.path,
+			});
+			worktreeHandoff = retainUnconfirmedNativeWorktree(running, exit.reason);
+		}
+		const code = completed ? 0 : exitCode || 1;
+		running.lifecycle = markCompletionDetected(
+			ensureLifecycle(running),
+			completed
+				? { reason: "done", exitCode: 0 }
+				: { reason: "error", exitCode: code, errorMessage: summary },
+			detectedAt,
+		);
+		running.lifecycle = completed
+			? markCompleted(running.lifecycle, Date.now())
+			: markFailed(running.lifecycle, summary, Date.now(), code);
+		updateWidget();
+		const result: SubagentResult = {
+			name,
+			task,
+			summary,
+			sessionFile,
+			exitCode: code,
+			elapsed: Math.floor((detectedAt - startTime) / 1000),
+			runtimePlan: undefined,
+			native,
+			...extra,
+		};
+		if (!completed && !extra.error) result.errorMessage = summary;
+		if (worktreeHandoff) result.worktree = worktreeHandoff;
+		return result;
+	};
+
+	try {
+		const exit = await waitForNativeCompletion(run, signal, {
+			intervalMs: deps.intervalMs,
+			terminationGraceMs: deps.terminationGraceMs,
+			send: (text) => deps.send(surface, text),
+			terminate: () => deps.terminate(run.processRun),
+			inspectPane: () => deps.inspectPane(surface),
+			onPaneInspection: (inspection, observedAt) => {
+				running.lifecycle = observePaneInspection(
+					ensureLifecycle(running),
+					inspection,
+					observedAt,
+				);
+				updateWidget();
+			},
+			onStarted: (observedAt) => {
+				running.lifecycle = markProcessRunning(
+					ensureLifecycle(running),
+					observedAt,
+				);
+			},
+		});
+		const detectedAt = Date.now();
+		const outcome = nativeOutcome(run, exit);
+		return settle(exit.exit, outcome, exit.exitCode, detectedAt);
+	} catch (err: any) {
+		// Parent shutdown aborts the watcher without terminating the child,
+		// matching Pi children. Release only an already-confirmed exit.
+		const message = signal.aborted
+			? "Subagent cancelled."
+			: (err?.message ?? String(err));
+		const summary = signal.aborted ? message : `Subagent error: ${message}`;
+		return settle(
+			confirmExit(run.processRun),
+			{ completed: false, summary },
+			1,
+			Date.now(),
+			{ error: signal.aborted ? "cancelled" : message },
+		);
+	}
+}
+
 export function shouldAdvanceToFallback(
 	result: Pick<SubagentResult, "errorMessage">,
 	remainingPlans: number,
@@ -3089,12 +3499,17 @@ export default function subagentsExtension(
 					ctx.sessionManager.getSessionId(),
 					"worktree-runs",
 				),
-				liveHolders: () =>
-					[...runningSubagents.values()].flatMap((child) =>
+				liveHolders: () => [
+					...[...runningSubagents.values()].flatMap((child) =>
 						child.worktree
 							? [{ path: child.worktree.path, persistent: child.persistent }]
 							: [],
 					),
+					// Native runs with unconfirmed exit keep their worktree lease.
+					...reconcileUnresolvedNativeRuns().flatMap((entry) =>
+						entry.worktreePath ? [{ path: entry.worktreePath }] : [],
+					),
+				],
 			}),
 	});
 	let btwChild: BtwChild | undefined;
@@ -3356,6 +3771,7 @@ export default function subagentsExtension(
 								(candidate) =>
 									candidate.agentName === params.agent &&
 									(candidate.code === "external-cli-unsupported" ||
+										candidate.code === "native-harness-unsupported" ||
 										candidate.code === "invalid-capability-declaration"),
 							)
 						: undefined;
@@ -3368,10 +3784,31 @@ export default function subagentsExtension(
 					};
 				}
 
-				const persistent = resolveEffectivePersistent(
-					params,
-					params.agent ? loadAgentDefaults(params.agent, runtime.pi) : null,
-				);
+				const selectedDefs = params.agent
+					? loadAgentDefaults(params.agent, runtime.pi)
+					: null;
+				// Native harness capability checks run before any Herdr resource.
+				let nativeSpec: NativeLaunchSpec | undefined;
+				if (selectedDefs?.cli) {
+					try {
+						nativeSpec = resolveNativeSpecForParams(params, {
+							...selectedDefs,
+							cli: selectedDefs.cli,
+						});
+					} catch (error) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+								},
+							],
+							details: { error: "native-harness-unsupported" },
+						};
+					}
+				}
+
+				const persistent = resolveEffectivePersistent(params, selectedDefs);
 				const capError = persistent ? persistentCapacityError() : undefined;
 				if (capError) {
 					return {
@@ -3412,11 +3849,11 @@ export default function subagentsExtension(
 						`Unsupported parent thinking level: ${parentThinking}`,
 					);
 				}
-				const runtimePlans = resolveSubagentRuntimePlans(
-					params,
-					ctx,
-					parentThinking,
-				);
+				const noLaunchFailures: ModelFailure[] = [];
+				// Native roles pass their own model IDs through; Pi routing never applies.
+				const runtimePlans = nativeSpec
+					? []
+					: resolveSubagentRuntimePlans(params, ctx, parentThinking);
 				const worktreeLaunchWarning = resolveWorktreeLaunchWarning(
 					params,
 					runtime.pi,
@@ -3425,12 +3862,23 @@ export default function subagentsExtension(
 					running: initialRunning,
 					index: initialPlanIndex,
 					launchFailures: initialLaunchFailures,
-				} = await launchSubagentWithFallbacks(
-					params,
-					ctx,
-					parentThinking,
-					runtimePlans,
-				);
+				} = nativeSpec
+					? {
+							running: await launchNativeFromParams(
+								params,
+								ctx,
+								nativeSpec,
+								selectedDefs,
+							),
+							index: 0,
+							launchFailures: noLaunchFailures,
+						}
+					: await launchSubagentWithFallbacks(
+							params,
+							ctx,
+							parentThinking,
+							runtimePlans,
+						);
 
 				let running = initialRunning;
 
@@ -3448,16 +3896,27 @@ export default function subagentsExtension(
 				// Close after accepted delivery or explicit parent shutdown, not failed delivery.
 				let shouldCloseTemporaryPanes = false;
 				// Fire-and-forget: start watching in background
-				watchSubagentWithFallbacks(
-					running,
-					initialPlanIndex,
-					params,
-					ctx,
-					parentThinking,
-					runtimePlans,
-					watcherAbort.signal,
-					completedPanes,
-					initialLaunchFailures,
+				(nativeSpec
+					? watchSubagent(running, watcherAbort.signal).then((result) => {
+							// Retain the pane as evidence while native exit is unconfirmed.
+							if (
+								!running.worktree &&
+								result.native?.processExit !== "unconfirmed"
+							)
+								completedPanes.add(running.surface);
+							return { running, result };
+						})
+					: watchSubagentWithFallbacks(
+							running,
+							initialPlanIndex,
+							params,
+							ctx,
+							parentThinking,
+							runtimePlans,
+							watcherAbort.signal,
+							completedPanes,
+							initialLaunchFailures,
+						)
 				)
 					.then(({ running: completedRunning, result }) => {
 						running = completedRunning;
@@ -3572,9 +4031,14 @@ export default function subagentsExtension(
 						if (result.fallbackFailures)
 							resultDetails.fallbackFailures = result.fallbackFailures;
 						if (result.worktree)
-							resultDetails.worktree = captureWorktreeHandoff(result.worktree);
+							// An unconfirmed native exit must not be re-inspected as reviewable.
+							resultDetails.worktree =
+								result.native?.processExit === "unconfirmed"
+									? result.worktree
+									: captureWorktreeHandoff(result.worktree);
 						if (completedRunning.runtimePlan)
 							resultDetails.runtimePlan = completedRunning.runtimePlan;
+						if (result.native) resultDetails.native = result.native;
 						sendSubagentResult(completionApi, presentation, resultDetails);
 						shouldCloseTemporaryPanes = true;
 					})
@@ -3602,15 +4066,34 @@ export default function subagentsExtension(
 							error: err?.message,
 							sessionFile: running.sessionFile,
 						};
+						const unresolvedNative =
+							!!running.native && unresolvedNativeRuns().has(running.id);
 						if (running.worktree)
-							errDetails.worktree = captureWorktreeHandoff(running.worktree);
+							errDetails.worktree = unresolvedNative
+								? retainUnconfirmedNativeWorktree(
+										running,
+										"the watcher failed before confirming exit",
+									)
+								: captureWorktreeHandoff(running.worktree);
+						if (running.native)
+							errDetails.native = {
+								harness: running.native.harness,
+								sessionId: nativeSessionId(running.native),
+								markerFile: running.native.markerFile,
+								processExit: unresolvedNative ? "unconfirmed" : "confirmed",
+							};
 						sendSubagentResult(
 							selectCompletionApi(pi, runtime.pi),
-							resolveUnexpectedErrorPresentation(
-								`Sub-agent "${running.name}" error`,
-								err,
-								running.sessionFile,
-							),
+							running.native
+								? boundResultPresentation(
+										`Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+										formatNativeSessionReference(errDetails.native!),
+									)
+								: resolveUnexpectedErrorPresentation(
+										`Sub-agent "${running.name}" error`,
+										err,
+										running.sessionFile,
+									),
 							errDetails,
 						);
 						shouldCloseTemporaryPanes = true;
@@ -3632,6 +4115,12 @@ export default function subagentsExtension(
 					runtimePlan: running.runtimePlan,
 					status: "started",
 				};
+				if (nativeSpec) {
+					startedDetails.harness = nativeSpec.harness;
+					if (nativeSpec.model) startedDetails.model = nativeSpec.model;
+					if (nativeSpec.thinking)
+						startedDetails.nativeThinking = nativeSpec.thinking;
+				}
 				if (running.worktree) startedDetails.worktree = running.worktree;
 				if (worktreeLaunchWarning)
 					startedDetails.warning = worktreeLaunchWarning;
@@ -3864,9 +4353,19 @@ export default function subagentsExtension(
 				const list = catalog.agents.filter(
 					(agent) => !agent.disableModelInvocation,
 				);
+				const unresolved = reconcileUnresolvedNativeRuns();
 				const lines = [
 					...formatVisibleAgentDefinitions(list),
 					...formatLivePersistentSpecialists(),
+					...(unresolved.length
+						? [
+								"Native runs with unconfirmed process exit (evidence retained):",
+								...unresolved.map(
+									(entry) =>
+										`• ${entry.run.harness} run ${entry.run.processRun.id} | ${entry.worktreePath ?? "ordinary pane"} | ${entry.run.runDir}`,
+								),
+							]
+						: []),
 					...formatSupervisionDiagnostics(),
 					...formatAgentDiagnostics(catalog.diagnostics),
 				];
@@ -3993,6 +4492,17 @@ export default function subagentsExtension(
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const name = params.name ?? "Resume";
 				const id = Math.random().toString(16).slice(2, 10);
+
+				const nativeMarker = readNativeSessionMarker(params.sessionPath);
+				if (nativeMarker) {
+					const text =
+						`Error: ${params.sessionPath} is a native ${nativeHarnessLabel(nativeMarker.harness)} session marker (cli: ${nativeMarker.harness}). ` +
+						"Native resume is unsupported in this release; spawn a new subagent with the same role instead.";
+					return {
+						content: [{ type: "text", text }],
+						details: { error: "native-resume-unsupported" },
+					};
+				}
 
 				if (!isTerminalAvailable()) {
 					return muxUnavailableResult();
@@ -4507,6 +5017,7 @@ export default function subagentsExtension(
 				// Clean summary (remove session ref and leading label for display)
 				const summary = rawContent
 					.replace(/\n\nSession: .+\nResume: .+$/, "")
+					.replace(/\n\nNative harness: [\s\S]*$/, "")
 					.replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
 					.replace(
 						`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`,
@@ -4529,7 +5040,26 @@ export default function subagentsExtension(
 							contentLines.push(line.slice(0, width - 6));
 						}
 					}
-					if (details.sessionFile) {
+					if (details.native) {
+						// Native markers are not Pi transcripts; never offer pi --session.
+						contentLines.push("");
+						contentLines.push(
+							theme.fg(
+								"dim",
+								`Native harness: ${details.native.harness ?? "unknown"} · session ${details.native.sessionId ?? "unknown"}`,
+							),
+						);
+						contentLines.push(
+							theme.fg("dim", `Native marker: ${details.native.markerFile}`),
+						);
+						contentLines.push(
+							theme.fg("dim", "Resume: unsupported for native sessions"),
+						);
+						if (isString(details.native.warning))
+							contentLines.push(
+								theme.fg("warning", `Warning: ${details.native.warning}`),
+							);
+					} else if (details.sessionFile) {
 						contentLines.push("");
 						contentLines.push(
 							theme.fg("dim", `Session: ${details.sessionFile}`),

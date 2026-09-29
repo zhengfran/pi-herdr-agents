@@ -1,6 +1,7 @@
 # ADR-0008: Adopt Pi-only subagent execution
 
-- **Status:** Accepted (implemented)
+- **Status:** Accepted (implemented); partially superseded by ADR-0012
+- **Superseded in part by:** ADR-0012 reintroduces `cli: claude|kiro` as a second, fail-closed native execution path
 - **Date:** 2026-08-10
 - **Scope:** `giuseppecrj/pi-herdr-agents`
 - **Supersedes:** The external CLI runtime-adapter provisions of ADR-0002

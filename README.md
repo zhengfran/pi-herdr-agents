@@ -1,6 +1,9 @@
 # Pi Herdr Agents
 
-![Pi Herdr Agents: parallel Pi agents running asynchronously in dedicated Herdr panes and managed worktrees.](https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/pi-herdr-agents-gallery.png)
+> [!NOTE]
+> This repository is a fork of [giuseppecrj/pi-herdr-agents](https://github.com/giuseppecrj/pi-herdr-agents), based on upstream commit [`ada6018`](https://github.com/giuseppecrj/pi-herdr-agents/commit/ada60185600383a207bb2a24e43d9b66b9ed8288). This fork adds native Claude Code and Kiro harnesses while preserving the upstream Herdr and managed-worktree architecture.
+
+![Pi Herdr Agents: parallel Pi agents running asynchronously in dedicated Herdr panes and managed worktrees.](https://raw.githubusercontent.com/zhengfran/pi-herdr-agents/main/docs/assets/pi-herdr-agents-gallery.png)
 
 Asynchronous subagents for [Pi](https://github.com/earendil-works/pi), running exclusively in [Herdr](https://herdr.dev).
 
@@ -27,17 +30,17 @@ Other terminal multiplexers are not supported. Session startup skips worktree in
 
 ## Install
 
-Install from npm:
+This fork is not published under the upstream `pi-herdr-agents` npm name. Install it from Git to get the native Claude Code and Kiro support:
 
 ```bash
-pi install npm:pi-herdr-agents
+pi install git:github.com/zhengfran/pi-herdr-agents
 ```
 
 Install project-locally or try it for one run:
 
 ```bash
-pi install -l npm:pi-herdr-agents
-pi -e npm:pi-herdr-agents
+pi install -l git:github.com/zhengfran/pi-herdr-agents
+pi -e git:github.com/zhengfran/pi-herdr-agents
 ```
 
 Then start Pi inside Herdr:
@@ -81,7 +84,7 @@ Use ordinary panes for read-only agents. A single or sequential writer can work 
 
 ## How it works
 
-![Pi Herdr Agents lifecycle: spawn a child, run it in Herdr, supervise live state, and deliver one bounded result to the parent.](https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/async-subagent-lifecycle.png)
+![Pi Herdr Agents lifecycle: spawn a child, run it in Herdr, supervise live state, and deliver one bounded result to the parent.](https://raw.githubusercontent.com/zhengfran/pi-herdr-agents/main/docs/assets/async-subagent-lifecycle.png)
 
 A `subagent` call selects the target checkout, reuses its Herdr workspace, and gives the child a pane in an extension-owned `Agents` tab. Four panes fit in each tab by default; overflow opens another tab in the same workspace. A worktree is created only when explicitly requested for checkout isolation. The call launches a child Pi session and returns `started`. The parent watcher combines Herdr process state with child activity details and projects the result into a live widget:
 
@@ -107,7 +110,7 @@ If the entry exists, spawning and result extraction worked; investigate parent w
 Git package refs are pinned. To move an installed development copy back to the current `main`, install that ref explicitly and reload the active Pi session:
 
 ```bash
-pi install git:github.com/giuseppecrj/pi-herdr-agents@main
+pi install git:github.com/zhengfran/pi-herdr-agents@main
 # Then run /reload inside Pi.
 ```
 
@@ -180,10 +183,12 @@ See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
 | **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, delegates independent work, and verifies. |
 | **adversarial-reviewer** | Coordinator role | Exact eligible authenticated Pi models selected by risk and project policy | Runs two routine or three high-risk discovery reviewers, candidate-dependent cross-family verification, and parent synthesis through public asynchronous children. |
 
-All subagents execute through Pi. Claude models remain available through normal
-Pi provider/model routing. Legacy role definitions that contain `cli` fail before
-Herdr creates a pane or worktree; remove `cli` and `cli-model`, then select an
-authenticated Pi `provider/model-id`.
+Subagents execute through Pi by default, and Claude models remain available
+through normal Pi provider/model routing. A role may instead declare
+`cli: claude` or `cli: kiro` to run the native Claude Code or Kiro CLI in its
+Herdr pane; see [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles).
+Any other `cli` value, and the removed `cli-model` field, fail before Herdr
+creates a pane or worktree.
 
 Optional prerequisites fail closed and are not bundled:
 
@@ -873,7 +878,7 @@ Install both packages through Pi; the role pack remains inert if
 `pi-herdr-agents` is absent:
 
 ```bash
-pi install npm:pi-herdr-agents
+pi install git:github.com/zhengfran/pi-herdr-agents
 pi install npm:@acme/security-roles
 ```
 
@@ -935,6 +940,7 @@ Compare definitions against the reference below and verify them with
 | `persistent` | boolean | Keep this role's specialist session open between tasks. Follow-up work uses `subagent_send`; persistent specialists cannot be resumed in v1. |
 | `cwd`         | string  | Default working directory. Absolute paths are unambiguous; relative agent-frontmatter paths resolve from Pi's agent config directory (`PI_CODING_AGENT_DIR` or `~/.pi/agent`), not the project root                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide a role from discovery surfaces like `subagents_list`. The definition remains directly invocable by exact name via `subagent({ agent: "name", ... })`. |
+| `cli`         | string  | Optional native harness: `claude` or `kiro`. Omit for Pi-backed roles. Other values fail closed. See [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles). |
 
 ---
 
@@ -1009,6 +1015,106 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ```
 
 ---
+
+## Native Claude Code and Kiro roles
+
+A role with `cli: claude` or `cli: kiro` runs the native interactive Claude Code
+TUI or Kiro CLI 2.24.x V2 (`kiro-cli chat --v2`) instead of Pi. Herdr placement,
+managed worktrees, the widget, and the bounded `subagent_result` delivery are
+shared with Pi-backed children. This first stage supports ordinary fresh
+autonomous runs only, in an ordinary pane or an explicitly requested managed
+worktree.
+
+```markdown
+---
+description: Coding worker in native Claude Code
+cli: claude
+auto-exit: true
+tools: read, grep, find, write, edit, bash
+thinking: high
+system-prompt: append
+---
+
+You are a worker agent. ...
+```
+
+- `auto-exit: true` and an explicit `tools` allowlist are required. Tools map
+  strictly: Claude `read→Read`, `write→Write`, `edit→Edit`, `bash→Bash`,
+  `grep→Grep`, `find`/`ls→Glob` (`ls` requires `find`); Kiro `read`/`ls→fs_read`,
+  `write`+`edit→fs_write` (both required), `bash→execute_bash`, `grep`, `find→glob`.
+  Any other tool fails closed. Approval prompts are bypassed only for this
+  mapped set; Claude loads no MCP servers (`--strict-mcp-config`), and the Kiro
+  profile sets `mcpServers: {}` and `includeMcpJson: false`.
+- `model` is one native model ID passed to `--model`; Pi model config
+  (`models.default`, `models.agents`, `models.tasks`) is not applied. `thinking`
+  maps to `--effort` and accepts `low`, `medium`, `high`, `xhigh`, or `max`;
+  omit it for the native default.
+- Claude uses the role body through `--append-system-prompt` or
+  `--system-prompt` when `system-prompt` is set, otherwise in the task wrapper.
+  Kiro always places it in the owned profile prompt; `system-prompt: replace`
+  is rejected.
+- Prerequisites: `claude` or `kiro-cli` 2.24.x on `PATH`, and `python3`
+  (the lifecycle hooks use `fcntl`).
+
+Rejected before any pane, workspace, or worktree is created, with an actionable
+error: persistent specialists, `interactive: true` (role or per call),
+`fork`/`lineage-only` session modes (including
+`fork: true`), Pi skills, `spawning: true` or any subagent/worktree tool, Pi
+child tools (`caller_ping`, `subagent_done`), `task:<category>` models and
+comma-separated fallback lists, and unsupported thinking levels. Native
+children also reject `subagent_interrupt`, and `subagent_resume` rejects their
+session markers; spawn a new subagent for further work. `deny-tools` has no
+effect because the native tool set is exactly the mapped allowlist.
+
+Each launch owns exclusively created per-run files under the parent session's
+`artifacts/<session-id>/native-runs/<id>/`: hook configuration, correlated turn
+state, and a durable process receipt written by the launch wrapper. The task is
+tagged with a per-turn token. Completion requires the tagged turn's
+native-session-correlated `Stop` hook receipt plus a clean process exit after the
+parent sends `/exit` (Claude) or `/quit` (Kiro). Herdr idle/done status and
+terminal text never establish success. Untagged or superseding human input,
+a hook error, an acknowledgement timeout, or an exit without the correlated
+receipt fails closed; the parent then terminates only processes it can prove it
+owns and reports the failure. The native final summary is delivered through
+the normal bounded result path, with the native session ID and an explicit
+`artifacts/<session-id>/native-sessions/<id>.json` marker/loadout artifact in
+place of a Pi transcript.
+
+Process ownership is bound to an unguessable per-run token, not a PID. The
+launch wrapper re-executes itself with the token in its environment, records it
+in its receipt, and refuses to start without it or after the parent writes a
+cancel marker. On Linux the parent reads `/proc/<pid>/environ` and signals only
+processes carrying the token (the wrapper's process group only after the
+wrapper itself is verified); a reused PID is never signalled. Where ownership
+cannot be verified (for example macOS, or an unreadable process), nothing is
+signalled. Same-user processes whose environment is unreadable are disclosed as
+incomplete scan coverage, following the worktree cleanup visibility policy.
+
+Owned files are removed, and worktree Git state captured, only after process
+exit is confirmed: the wrapper recorded its exit, or a complete owned-process
+scan found nothing. Otherwise (termination refused or not observed within the
+grace period, a lost receipt with survivors, or parent shutdown while the child
+runs) the result reports `processExit: "unconfirmed"` with a warning and the
+run is treated as failed. Its pane, Kiro profile, native run files, and
+worktree are retained; the worktree manifest records `processExit:
+"unconfirmed"` without a Git snapshot, and `worktree_remove` treats the
+worktree as held by a live child until exit is later confirmed, at which point
+the owned files are released. Parent shutdown does not terminate native
+children. Launch scripts embed task text and are staged `0600` in `0700`
+directories created for them.
+
+Kiro receives a transient `.kiro/agents/pi-subagent-<uuid>.json` profile in the
+child's working directory (the worktree root for worktree runs). It is created
+exclusively, never overwrites existing configuration, lists only regular
+`AGENTS.md`/`CLAUDE.md` files in that directory as resources, and is removed
+after the run only while its content is unchanged; directories are removed only
+when this run created them and they are empty. The profile is removed before
+worktree state is captured, so it does not appear as an untracked handoff file.
+
+Limitations: Claude Code may show a first-run workspace-trust dialog for a new
+directory, including a new worktree; the parent never answers it, and the run
+fails after 120 seconds without acknowledgement. Native session persistence
+depends on the graceful exit command. Kiro V3 is unsupported.
 
 ## Tool Access Control
 
@@ -1123,7 +1229,9 @@ See [RELEASING.md](RELEASING.md) for versioning, trusted publication, and releas
 
 ## Acknowledgements
 
-This package builds on earlier open-source work by [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents) and [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents). The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
+This repository is a fork of [giuseppecrj/pi-herdr-agents](https://github.com/giuseppecrj/pi-herdr-agents); its Herdr-native orchestration, managed worktrees, persistent specialists, role system, and review workflows form the foundation of this fork. Please refer to the upstream project for its original development and release history.
+
+The upstream package builds on earlier open-source work by [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents) and [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents). The native Claude Code and Kiro harness adapters, lifecycle hooks, and process receipts in this fork are ported from [zhengfran/pi-interactive-subagents](https://github.com/zhengfran/pi-interactive-subagents) (MIT, same upstream lineage). The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
 
 ---
 

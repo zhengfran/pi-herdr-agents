@@ -4,7 +4,7 @@ These instructions apply to humans and coding agents changing `pi-herdr-agents`.
 
 ## What this package is
 
-`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Legacy role definitions that request an external CLI fail before Herdr creates resources.
+`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` for fresh autonomous runs; unknown CLIs and unsupported native capabilities fail before Herdr creates resources.
 
 The extension is fire-and-forget: `subagent` returns an acknowledgement, and completion is delivered to the parent automatically. Never add polling guidance that tells callers to sleep, tail sessions, or repeatedly check status.
 
@@ -28,10 +28,12 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `pi-extension/subagents/wake.ts`, `supervision.ts`, `supervision-config.ts` — file wake-ups, shared pane reconciliation, polling fallback, and supervision configuration
 - `pi-extension/subagents/persistent-config.ts` — strict persistent-specialist cap configuration
 - `pi-extension/subagents/completion.ts`, `session.ts`, `subagent-done.ts` — child completion, transcript handling, `caller_ping`, and `subagent_done`
+- `pi-extension/subagents/native-harness.ts`, `claude.ts`, `kiro.ts`, `process-run.ts`, `plugin/hooks/` — native `cli: claude|kiro` capability validation, owned hook/state files, correlated completion, and durable process receipts (ported from zhengfran/pi-interactive-subagents, MIT)
 - `CONTEXT.md` — orchestration-domain glossary
 - `docs/adr/` — hard-to-reverse architectural decisions
 - `docs/research/` — evidence and alternatives, never the shipped contract
 - `test/test.ts` — unit tests for public subagent extension seams
+- `test/native-harness.test.ts` — native harness unit tests using offline `test/fixtures/native-bin/` CLI stand-ins
 - `test/package-skill.test.js` — bundled skill and package manifest contract test
 - `test/integration/` — real Herdr and Pi lifecycle tests using the deterministic provider by default
 - `test/bench/supervision-bench.mjs` — manual isolated-Herdr supervision transport benchmark; raw samples stay in `/tmp/issue29-bench/`

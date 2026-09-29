@@ -4103,16 +4103,15 @@ describe("subagent discovery", () => {
 		);
 	});
 
-	it("rejects legacy external CLI roles before launch", async () => {
+	it("rejects unknown external CLI roles before launch", async () => {
 		await withIsolatedAgentEnv(
 			async ({ globalAgentsDir, projectAgentsDir }) => {
 				writeAgentFile(
 					globalAgentsDir,
 					"external-cli-reviewer",
 					[
-						"description: Legacy external CLI review adapter",
-						"cli: claude",
-						"cli-model: sonnet",
+						"description: Unknown external CLI review adapter",
+						"cli: codex",
 						"disable-model-invocation: true",
 					].join("\n"),
 				);
@@ -4120,6 +4119,28 @@ describe("subagent discovery", () => {
 					projectAgentsDir,
 					"scout",
 					["description: Legacy scout override", "cli: claude"].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"interactive-native",
+					[
+						"description: Interactive native role",
+						"cli: kiro",
+						"auto-exit: true",
+						"interactive: true",
+						"tools: read",
+					].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"legacy-cli-model",
+					[
+						"description: Legacy cli-model field",
+						"cli: claude",
+						"cli-model: sonnet",
+						"auto-exit: true",
+						"tools: read",
+					].join("\n"),
 				);
 				const { api, registeredTools } = createMockExtensionApi();
 				subagentsModule.default(api);
@@ -4133,20 +4154,42 @@ describe("subagent discovery", () => {
 				assert.equal(
 					result.details.agents.some(
 						(agent: any) =>
-							agent.name === "external-cli-reviewer" || agent.name === "scout",
+							agent.name === "external-cli-reviewer" ||
+							agent.name === "scout" ||
+							agent.name === "interactive-native" ||
+							agent.name === "legacy-cli-model",
 					),
 					false,
+					"invalid native roles must also suppress lower-precedence definitions",
+				);
+				const diagnosticCode = (name: string) =>
+					result.details.diagnostics.find(
+						(diagnostic: any) => diagnostic.agentName === name,
+					)?.code;
+				assert.equal(
+					diagnosticCode("external-cli-reviewer"),
+					"external-cli-unsupported",
+				);
+				assert.equal(diagnosticCode("scout"), "native-harness-unsupported");
+				assert.equal(
+					diagnosticCode("legacy-cli-model"),
+					"native-harness-unsupported",
 				);
 				assert.equal(
-					result.details.diagnostics.some(
-						(diagnostic: any) =>
-							diagnostic.agentName === "external-cli-reviewer" &&
-							diagnostic.code === "external-cli-unsupported",
-					),
-					true,
+					diagnosticCode("interactive-native"),
+					"native-harness-unsupported",
 				);
-				assert.match(result.content[0].text, /Pi-only/i);
-				assert.match(result.content[0].text, /remove.*cli/i);
+				assert.match(
+					result.content[0].text,
+					/"interactive-native"[^\n]*interactive: true is not supported/,
+				);
+				assert.match(
+					result.content[0].text,
+					/unsupported external CLI "codex"/,
+				);
+				assert.match(result.content[0].text, /cli: claude and cli: kiro/);
+				assert.match(result.content[0].text, /auto-exit: true/);
+				assert.match(result.content[0].text, /cli-model.*Put the native/);
 				assert.equal(testApi.loadAgentDefaults("external-cli-reviewer"), null);
 
 				const subagentTool = registeredTools.find(
@@ -4169,12 +4212,143 @@ describe("subagent discovery", () => {
 						{},
 					);
 					assert.equal(launch.details.error, "external-cli-unsupported");
-					assert.match(launch.content[0].text, /Pi-only/i);
+					assert.match(launch.content[0].text, /unsupported external CLI/);
+					const nativeLaunch = await subagentTool.execute(
+						"call-2",
+						{ name: "Scout", task: "Inspect", agent: "scout" },
+						new AbortController().signal,
+						() => {},
+						{},
+					);
+					assert.equal(
+						nativeLaunch.details.error,
+						"native-harness-unsupported",
+					);
 				} finally {
 					restoreEnvVar("HERDR_ENV", previousHerdrEnv);
 				}
 			},
 		);
+	});
+
+	it("discovers valid native claude and kiro roles with their harness", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"claude-worker",
+				[
+					"description: Native Claude worker",
+					"cli: claude",
+					"auto-exit: true",
+					"tools: read, grep, find, write, edit, bash",
+					"thinking: high",
+					"model: sonnet",
+					"system-prompt: append",
+				].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"kiro-worker",
+				[
+					"description: Native Kiro worker",
+					"cli: kiro",
+					"auto-exit: true",
+					"tools: read, write, edit, bash",
+					"spawning: false",
+				].join("\n"),
+			);
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const list = registeredTools.find(
+				(tool) => tool.name === "subagents_list",
+			);
+			const result = await list.execute();
+			const claude = result.details.agents.find(
+				(agent: any) => agent.name === "claude-worker",
+			);
+			const kiro = result.details.agents.find(
+				(agent: any) => agent.name === "kiro-worker",
+			);
+			assert.equal(claude?.cli, "claude");
+			assert.equal(kiro?.cli, "kiro");
+			assert.match(
+				result.content[0].text,
+				/claude-worker \(project\) \[cli: claude\] \[sonnet\]/,
+			);
+			assert.equal(
+				result.details.diagnostics.some((diagnostic: any) =>
+					["claude-worker", "kiro-worker"].includes(diagnostic.agentName),
+				),
+				false,
+			);
+		});
+	});
+
+	it("rejects unsupported native launch combinations before any Herdr resource", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"claude-worker",
+				[
+					"description: Native Claude worker",
+					"cli: claude",
+					"auto-exit: true",
+					"tools: read, bash",
+				].join("\n"),
+			);
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const subagentTool = registeredTools.find(
+				(tool) => tool.name === "subagent",
+			);
+			const previousHerdrEnv = process.env.HERDR_ENV;
+			// Validation must fail before the Herdr availability check.
+			delete process.env.HERDR_ENV;
+			try {
+				for (const [override, pattern] of [
+					[{ persistent: true }, /persistent specialists/],
+					[{ interactive: true }, /interactive: true is not supported/],
+					[{ fork: true }, /standalone sessions/],
+					[{ skills: "tdd" }, /Pi skills/],
+					[{ tools: "read,caller_ping" }, /caller_ping/],
+					[{ tools: "read,subagent" }, /nested subagents/],
+					[{ model: "task:coding" }, /task-category/],
+					[{ model: "a/b, c/d" }, /fallback lists/],
+					[{ thinking: "off" }, /thinking level off/],
+					[{ tools: "read,web_search" }, /cannot safely map/],
+				] as const) {
+					const launch = await subagentTool.execute(
+						"call-1",
+						{
+							name: "Native",
+							task: "Inspect",
+							agent: "claude-worker",
+							worktree: { branch: "must-not-be-created" },
+							...override,
+						},
+						new AbortController().signal,
+						() => {},
+						{},
+					);
+					assert.equal(
+						launch.details.error,
+						"native-harness-unsupported",
+						JSON.stringify(override),
+					);
+					assert.match(launch.content[0].text, pattern);
+				}
+				const accepted = await subagentTool.execute(
+					"call-2",
+					{ name: "Native", task: "Inspect", agent: "claude-worker" },
+					new AbortController().signal,
+					() => {},
+					{},
+				);
+				assert.equal(accepted.details.error, "herdr not available");
+			} finally {
+				restoreEnvVar("HERDR_ENV", previousHerdrEnv);
+			}
+		});
 	});
 
 	it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {

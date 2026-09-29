@@ -16,6 +16,16 @@ import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
 import { isNonEmptyString, isRecord, type JsonObject } from "./type-guards.ts";
 import {
+	createNativeHarnessOperations,
+	releaseNativeRun,
+	markNativeSubmitted,
+	prepareNativeRun,
+	type NativeHarnessOperations,
+	type NativeLaunchSpec,
+	type NativeRun,
+} from "./native-harness.ts";
+import { supervisedCommand } from "./process-run.ts";
+import {
 	createWorktreeSessionFork,
 	getNewEntries,
 	readSubagentSessionPolicy,
@@ -201,14 +211,22 @@ const defaultOperations: PiLaunchOperations = {
 	focusWorkspace,
 };
 
-interface ResolvedLaunch {
-	request: FreshPiLaunchRequest;
+interface LaunchLocation {
 	id: string;
 	startTime: number;
 	agentDir: string;
 	localAgentDir: string | null;
 	sourceCwd: string;
 	artifactDir: string;
+}
+
+/** Fields common to every fresh launch that selects a Herdr surface. */
+interface SurfaceLaunch extends LaunchLocation {
+	request: Pick<FreshPiLaunchRequest, "name" | "worktree" | "surface">;
+}
+
+interface ResolvedLaunch extends SurfaceLaunch {
+	request: FreshPiLaunchRequest;
 	sessionMode: SubagentSessionMode;
 	taskDelivery: "direct" | "artifact";
 }
@@ -309,31 +327,177 @@ async function launchFreshPiSubagent(
 		}
 		return createRunningChild(resolved, artifacts, launchScriptFile);
 	} catch (error) {
-		if (!surface) throw error;
-		if (!surface.worktree) {
-			if (!request.surface) {
-				try {
-					operations.closePane(surface.surface);
-				} catch {
-					// The launch error remains authoritative when cleanup also fails.
-				}
-			}
-			throw error;
-		}
-		const handoff = captureWorktreeHandoff(surface.worktree);
-		try {
-			persistWorktreeResult(surface.worktree, "failed", handoff);
-		} catch {
-			// The launch error remains authoritative when persistence also fails.
-		}
-		throw new Error(
-			`Failed to launch subagent; worktree retained at ${surface.worktree.path} ` +
-				`(workspace ${surface.worktree.workspaceId}): ${errorMessage(error)}`,
-		);
+		rethrowLaunchFailure(request.surface, surface, error, operations);
 	}
 }
 
-function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
+export interface FreshNativeLaunchRequest {
+	kind: "native";
+	id?: string;
+	name: string;
+	task: string;
+	agent?: string;
+	cwd?: string;
+	worktree?: { branch: string; base?: string } | null;
+	surface?: string;
+	parent: FreshPiLaunchRequest["parent"];
+	behavior: { interactive: boolean; cwd?: string };
+	/** Pre-validated native capability plan; see resolveNativeLaunchSpec. */
+	native: NativeLaunchSpec;
+}
+
+export interface NativeRunningChild {
+	id: string;
+	name: string;
+	task: string;
+	agent?: string;
+	surface: string;
+	startTime: number;
+	/** Native session marker/loadout artifact, never a Pi transcript. */
+	sessionFile: string;
+	launchScriptFile: string;
+	interactive: boolean;
+	runtimePlan: undefined;
+	worktree?: WorktreeLaunch;
+	lifecycle: SubagentLifecycle;
+	native: NativeRun;
+}
+
+/**
+ * Launch one pre-validated native harness child. Herdr surface and worktree
+ * provisioning, ownership manifests, and failure retention are shared with
+ * Pi launches; only the prepared command and owned run files differ.
+ */
+export async function launchNativeSubagent(
+	request: FreshNativeLaunchRequest,
+	operations: PiLaunchOperations = defaultOperations,
+	nativeOperations: NativeHarnessOperations = createNativeHarnessOperations(),
+): Promise<NativeRunningChild> {
+	const location = resolveLaunchLocation(request);
+	// Prerequisites fail before any pane, workspace, or worktree exists.
+	nativeOperations.assertAvailable(request.native.harness);
+	let surface: PreparedSurface | undefined;
+	let run: NativeRun | undefined;
+	try {
+		surface = prepareLaunchSurface({ ...location, request }, operations);
+		const prepared = prepareNativeRun({
+			id: location.id,
+			artifactDir: location.artifactDir,
+			cwd: surface.targetCwd,
+			name: request.name,
+			agent: request.agent,
+			task: request.task,
+			spec: request.native,
+			worktree: surface.worktree
+				? {
+						path: surface.worktree.path,
+						workspaceId: surface.worktree.workspaceId,
+						branch: surface.worktree.branch,
+						baseSha: surface.worktree.baseSha,
+					}
+				: undefined,
+		});
+		run = prepared.run;
+		if (surface.worktree) {
+			surface.worktree.sessionFile = run.markerFile;
+			writeWorktreeManifest(surface.worktree.manifestFile, {
+				sessionFile: run.markerFile,
+				harness: run.harness,
+			});
+		}
+		nativeOperations.validate(run);
+		await operations.waitForShellReady(surface.surface);
+		if (surface.worktree) persistWorktreeResult(surface.worktree, "running");
+		const launchScriptFile = operations.runScript(
+			surface.surface,
+			supervisedCommand(prepared.command, run.processRun),
+			{
+				scriptPath: join(
+					location.artifactDir,
+					"subagent-scripts",
+					`${safeName(request.name) || "subagent"}-${run.harness}-${location.id}.sh`,
+				),
+				scriptPreamble: [
+					shellComment(
+						`Native ${run.harness} subagent launch script for ${request.name}`,
+					),
+					shellComment(`Generated: ${new Date().toISOString()}`),
+					shellComment(`Native marker: ${run.markerFile}`),
+					shellComment(`Surface: ${surface.surface}`),
+				].join("\n"),
+			},
+		);
+		markNativeSubmitted(run);
+		return {
+			id: location.id,
+			name: request.name,
+			task: request.task,
+			agent: request.agent,
+			surface: surface.surface,
+			startTime: location.startTime,
+			sessionFile: run.markerFile,
+			launchScriptFile,
+			interactive: request.behavior.interactive,
+			runtimePlan: undefined,
+			worktree: surface.worktree,
+			lifecycle: createLifecycle(location.startTime),
+			native: run,
+		};
+	} catch (error) {
+		let failure = error;
+		if (run) {
+			// The cancel marker stops a late-starting wrapper; owned files are
+			// removed only when no owned process can be running.
+			const exit = releaseNativeRun(run);
+			if (exit.kind === "unconfirmed")
+				failure = new Error(
+					`${errorMessage(error)} Native process exit is unconfirmed (${exit.reason}); owned run files were retained at ${run.runDir}.`,
+				);
+		}
+		rethrowLaunchFailure(request.surface, surface, failure, operations);
+	}
+}
+
+/**
+ * Common failure handling after surface preparation: close only an ordinary
+ * pane this launch created, and retain a managed worktree with a failed
+ * manifest. The original launch error remains authoritative.
+ */
+function rethrowLaunchFailure(
+	callerSurface: string | undefined,
+	surface: PreparedSurface | undefined,
+	error: any,
+	operations: PiLaunchOperations,
+): never {
+	if (!surface) throw error;
+	if (!surface.worktree) {
+		if (!callerSurface) {
+			try {
+				operations.closePane(surface.surface);
+			} catch {
+				// The launch error remains authoritative when cleanup also fails.
+			}
+		}
+		throw error;
+	}
+	const handoff = captureWorktreeHandoff(surface.worktree);
+	try {
+		persistWorktreeResult(surface.worktree, "failed", handoff);
+	} catch {
+		// The launch error remains authoritative when persistence also fails.
+	}
+	throw new Error(
+		`Failed to launch subagent; worktree retained at ${surface.worktree.path} ` +
+			`(workspace ${surface.worktree.workspaceId}): ${errorMessage(error)}`,
+	);
+}
+
+function resolveLaunchLocation(request: {
+	id?: string;
+	cwd?: string;
+	parent: FreshPiLaunchRequest["parent"];
+	behavior: { cwd?: string };
+}): LaunchLocation {
 	const id = request.id ?? Math.random().toString(16).slice(2, 10);
 	const agentDir =
 		request.parent.agentDir ??
@@ -350,11 +514,7 @@ function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 			: join(cwdBase, rawCwd)
 		: request.parent.cwd;
 	const localAgentDir = rawCwd ? join(sourceCwd, ".pi", "agent") : null;
-	let sessionMode: SubagentSessionMode = request.behavior.sessionMode;
-	if (request.fork === true) sessionMode = "fork";
-	else if (request.fork === false) sessionMode = "standalone";
 	return {
-		request,
 		id,
 		startTime: Date.now(),
 		agentDir,
@@ -366,13 +526,23 @@ function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 			"artifacts",
 			request.parent.sessionId,
 		),
+	};
+}
+
+function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
+	let sessionMode: SubagentSessionMode = request.behavior.sessionMode;
+	if (request.fork === true) sessionMode = "fork";
+	else if (request.fork === false) sessionMode = "standalone";
+	return {
+		...resolveLaunchLocation(request),
+		request,
 		sessionMode,
 		taskDelivery: sessionMode === "fork" ? "direct" : "artifact",
 	};
 }
 
 function prepareLaunchSurface(
-	resolved: ResolvedLaunch,
+	resolved: SurfaceLaunch,
 	operations: PiLaunchOperations,
 ): PreparedSurface {
 	const { request } = resolved;

@@ -118,6 +118,8 @@ Possible states are:
 
 The manifest supports ownership and inspection; v1 does not provide automatic reconciliation after a full Pi/Herdr restart. Do not edit manifests by hand.
 
+Native `cli: claude` and `cli: kiro` roles use the same manifest, states, retained workspace, and handoff. Their manifest also records `harness`, and `sessionFile` points to the native session marker under `artifacts/<parent-session-id>/native-sessions/` rather than a Pi transcript. A native worktree run reaches `ready_for_review` only after correlated native turn evidence plus process exit; any other outcome is `failed`. Native children cannot call `caller_ping`, so they never reach `needs_help`. An owned transient Kiro profile is removed from the worktree root before the Git handoff is captured, and is retained only if it was modified. If the native process exit cannot be confirmed, the run is `failed` with `processExit: "unconfirmed"`, no Git state is captured (fields are unknown), the Kiro profile is retained, and explicit cleanup treats the worktree as held by a live child until the parent later confirms the owned process is gone.
+
 ## Completion handoff
 
 The parent receives the normal child summary plus:

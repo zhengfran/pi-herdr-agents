@@ -124,8 +124,23 @@ describe("bundled orchestration skill", () => {
 				`missing package file: ${path}`,
 			);
 		}
+		for (const path of [
+			"pi-extension/subagents/native-harness.ts",
+			"pi-extension/subagents/claude.ts",
+			"pi-extension/subagents/kiro.ts",
+			"pi-extension/subagents/process-run.ts",
+			"pi-extension/subagents/plugin/hooks/claude-lifecycle.py",
+			"pi-extension/subagents/plugin/hooks/kiro-lifecycle.py",
+		]) {
+			assert.equal(
+				packageFiles.has(path),
+				true,
+				`missing native harness file: ${path}`,
+			);
+		}
 		for (const path of packageFiles) {
-			assert.doesNotMatch(path, /(^|\/)(?:claude\.ts|plugin)(?:\/|$)/);
+			// The removed legacy Claude plugin adapter must not return.
+			assert.doesNotMatch(path, /(^|\/)\.claude-plugin(?:\/|$)/);
 		}
 		assert.equal(
 			packageFiles.has("pi-extension/subagents/workflow-worker.js"),

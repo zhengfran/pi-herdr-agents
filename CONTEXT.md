@@ -24,11 +24,31 @@ JSONL or activity snapshot. It is advisory only and never changes the child's
 outcome or triggers recovery.
 _Avoid_: Hang verdict, automatic recovery, stall replacement
 
-**Legacy external CLI role**:
-An old role definition that contains `cli`. Discovery reports a migration
-diagnostic, and launch fails before Herdr creates a pane or worktree. Remove
-`cli` and `cli-model`, then select the model through Pi provider/model routing.
-_Avoid_: Silent Pi reinterpretation, compatibility adapter
+**Native harness role**:
+A role definition with `cli: claude` or `cli: kiro` whose child runs the native
+CLI in its Herdr pane or managed worktree instead of Pi. Only fresh autonomous
+runs are supported; success requires correlated native turn evidence plus
+process exit, and the result is delivered through the normal child result path.
+_Avoid_: Screen-scraped completion, fake Pi transcript, Pi model routing
+
+**Unconfirmed native exit**:
+A native run whose owned process cannot be proven gone: no exit receipt and no
+complete owned-process scan showing none remain. It is reported as failed with
+a warning, and its pane, Kiro profile, run files, and worktree lease are
+retained until exit is confirmed.
+_Avoid_: Assumed exit, cleanup on timeout, PID-based ownership
+
+**Native session marker**:
+The parent-owned `native-sessions/<id>.json` artifact recording a native child's
+harness, session identity, and loadout. It anchors result references and is not
+a Pi transcript or a resumable session.
+_Avoid_: Transcript, resume handle
+
+**Unsupported external CLI role**:
+A role definition whose `cli` is neither `claude` nor `kiro`, or that uses the
+removed `cli-model` field. Discovery reports a diagnostic, and launch fails
+before Herdr creates a pane or worktree.
+_Avoid_: Silent Pi reinterpretation
 
 **Public review fan-out**:
 A parent procedure that materializes pinned evidence, launches fresh public
