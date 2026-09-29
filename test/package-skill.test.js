@@ -131,6 +131,11 @@ describe("bundled orchestration skill", () => {
 			"pi-extension/subagents/process-run.ts",
 			"pi-extension/subagents/plugin/hooks/claude-lifecycle.py",
 			"pi-extension/subagents/plugin/hooks/kiro-lifecycle.py",
+			"pi-extension/subagents/native-turns.ts",
+			"pi-extension/subagents/native-session.ts",
+			"pi-extension/subagents/native-context.ts",
+			"pi-extension/subagents/native-bridge.ts",
+			"pi-extension/subagents/plugin/mcp/subagent-bridge.py",
 		]) {
 			assert.equal(
 				packageFiles.has(path),

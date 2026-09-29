@@ -42,7 +42,8 @@ uses an isolated Herdr server and writes uncommitted raw samples to
 | [`0009`](adr/0009-remove-workflow-subsystem.md) | Accepted | Remove the workflow subsystem; use public subagent fan-out and parent synthesis. |
 | [`0010`](adr/0010-persistent-specialists-as-session-generations.md) | Accepted | Define persistent specialists as logical identities with policy-bound session generations. |
 | [`0011`](adr/0011-explicit-worktree-cleanup.md) | Accepted | Authorize explicit worktree cleanup by cwd containment; retain branches and reject automatic reaping. |
-| [`0012`](adr/0012-native-claude-kiro-harness.md) | Accepted | Add first-stage native Claude Code and Kiro harnesses behind a small execution seam; partially supersedes 0008. |
+| [`0012`](adr/0012-native-claude-kiro-harness.md) | Partially superseded by 0013 | Add first-stage native Claude Code and Kiro harnesses behind a small execution seam; partially supersedes 0008. |
+| [`0013`](adr/0013-native-harness-second-stage.md) | Accepted | Add native persistent specialists, fork/lineage context, skills, nested delegation, native model routing and fallback, resume, interrupts, follow-ups, and interactive sessions; extends 0010. |
 
 ## Historical material
 

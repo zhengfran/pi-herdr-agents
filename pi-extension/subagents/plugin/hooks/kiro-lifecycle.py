@@ -4,9 +4,11 @@
 # HazAT and contributors), pi-extension/subagents/plugin/hooks/.
 """Kiro CLI 2.24 V2 hooks: locked, atomic native-session/turn receipts.
 
-Stop carries assistant_response but no turn ID. Accept only one outstanding
-prompt; overlapping/ambiguous native events fail closed rather than assigning
-an old response to a newer prompt. The parent serializes its own follow-ups.
+Stop carries assistant_response but no turn ID. Only one outstanding prompt
+is correlated; an overlapping prompt is recorded as untagged rather than
+assigning an old response to a newer prompt. The parent serializes its own
+follow-ups at verified stop points. Untagged (human-driven) turns are counted
+and disclosed separately.
 """
 import fcntl
 import json
@@ -17,6 +19,7 @@ import tempfile
 
 UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 TOKEN = re.compile(r"^\[pi-subagent-turn:([0-9a-f-]{36})\](?:\s|$)")
+MAX_SUMMARY = 16000
 
 
 def atomic(path, value):
@@ -67,19 +70,24 @@ def main(config):
             if state["phase"] == "active":
                 raise ValueError("agent changed during an outstanding turn")
         elif kind == "userPromptSubmit":
-            if state["phase"] == "active":
-                raise ValueError("overlapping prompts: stop result cannot be correlated safely")
             prompt = event.get("prompt")
             if not isinstance(prompt, str):
                 raise ValueError("prompt hook has no prompt string")
             match = TOKEN.match(prompt)
-            token = match.group(1) if match else None
+            # A prompt overlapping an outstanding turn makes the eventual stop
+            # unattributable: never guess, record it as untagged.
+            token = match.group(1) if match and state["phase"] != "active" else None
             state = {**state, "phase": "active", "token": token, "summary": None}
         elif kind == "stop":
             if state["phase"] != "active":
                 return  # duplicate/late Stop without a submitted turn
             if not state["token"]:
-                state = {**state, "phase": "untracked", "summary": None}
+                # A human-driven turn: disclosed separately, never a task result.
+                response = event.get("assistant_response")
+                state = {**state, "phase": "untracked", "summary": None,
+                         "untracked_turns": state.get("untracked_turns", 0) + 1,
+                         "untracked_summary": response.strip()[:MAX_SUMMARY]
+                         if isinstance(response, str) and response.strip() else None}
             else:
                 summary = event.get("assistant_response")
                 if not isinstance(summary, str) or not summary.strip():

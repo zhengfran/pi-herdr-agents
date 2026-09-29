@@ -8,6 +8,7 @@
  * `pi-extension/subagents/process-run.ts`. Owner-token identity, verified
  * signalling, owned-process scans, and the start-cancel marker are additions.
  */
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { shellQuote } from "./terminal.ts";
@@ -49,12 +50,14 @@ export function cancelMarkerFile(run: ProcessRun): string {
 	return `${run.receiptFile}.cancel`;
 }
 
-export function writeCancelMarker(run: ProcessRun): void {
+export function writeCancelMarker(run: ProcessRun): boolean {
 	try {
 		writeFileSync(cancelMarkerFile(run), `${Date.now()}\n`, { mode: 0o600 });
+		return true;
 	} catch {
 		// A missing marker leaves the late-start window open; callers still
 		// require receipt or owned-process evidence before confirming exit.
+		return false;
 	}
 }
 
@@ -90,6 +93,27 @@ export function isProcessAlive(pid: number): boolean {
 	}
 }
 
+/** A process's place in the process tree, when the platform reports it. */
+export interface ProcessRelation {
+	pid: number;
+	/** Parent PID, or `null` when the listing omitted it. */
+	ppid: number | null;
+	/** Process group ID, or `null` when the listing omitted it. */
+	pgid: number | null;
+}
+
+/** One same-user process from a platform environment listing. */
+export interface ProcessEnvironmentEntry extends ProcessRelation {
+	/** Raw command and exec-time environment text as reported. */
+	text: string;
+	/** Whether any environment was visible for this process. */
+	readable: boolean;
+}
+
+export type ProcessEnvironmentListing =
+	| { kind: "complete"; entries: ProcessEnvironmentEntry[] }
+	| { kind: "unavailable"; reason: string };
+
 /** Platform seams for ownership checks; Linux reads `/proc`. */
 export interface ProcessInspector {
 	/** `null` when this platform cannot read process environments. */
@@ -97,6 +121,95 @@ export interface ProcessInspector {
 	uid: number | null;
 	isAlive(pid: number): boolean;
 	kill(pid: number, signal: NodeJS.Signals): void;
+	/**
+	 * Without `/proc` (macOS): list same-user processes with their exec-time
+	 * environments, or `unavailable` unless the listing proves it can see
+	 * environments. Used only to prove owned processes present or absent,
+	 * never to authorize a signal.
+	 */
+	listEnvironments?(): ProcessEnvironmentListing;
+}
+
+const ENVIRONMENT_WORD = /(^|\s)[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Parse `ps -E -ww -x -o pid= -o ppid= -o pgid= -o command=` (macOS). The
+ * listing is trusted only when this process's own line shows its environment
+ * (`PATH=`); a line without any `KEY=value` word is counted as unreadable. A
+ * line that does not start with the three ID columns continues the previous
+ * process's text (an environment value containing a newline); such a line
+ * before any process makes the listing unusable.
+ */
+export function parsePsEnvironments(
+	output: string,
+	selfPid: number = process.pid,
+): ProcessEnvironmentListing {
+	const entries: ProcessEnvironmentEntry[] = [];
+	for (const line of output.split("\n")) {
+		if (!line.trim()) continue;
+		const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s(.*))?$/);
+		if (!match) {
+			const previous = entries[entries.length - 1];
+			if (!previous)
+				return {
+					kind: "unavailable",
+					reason: "the process listing could not be parsed",
+				};
+			previous.text = `${previous.text}\n${line}`;
+			previous.readable ||= ENVIRONMENT_WORD.test(line);
+			continue;
+		}
+		const text = match[4] ?? "";
+		entries.push({
+			pid: Number.parseInt(match[1], 10),
+			ppid: Number.parseInt(match[2], 10),
+			pgid: Number.parseInt(match[3], 10),
+			text,
+			readable: ENVIRONMENT_WORD.test(text),
+		});
+	}
+	const self = entries.find((entry) => entry.pid === selfPid);
+	if (!self || !/(^|\s)PATH=/.test(self.text))
+		return {
+			kind: "unavailable",
+			reason:
+				"the process listing does not show this process's own environment",
+		};
+	return { kind: "complete", entries };
+}
+
+function listPsEnvironments(): ProcessEnvironmentListing {
+	try {
+		return parsePsEnvironments(
+			execFileSync(
+				"ps",
+				[
+					"-E",
+					"-ww",
+					"-x",
+					"-o",
+					"pid=",
+					"-o",
+					"ppid=",
+					"-o",
+					"pgid=",
+					"-o",
+					"command=",
+				],
+				{
+					encoding: "utf8",
+					timeout: 5_000,
+					maxBuffer: 64 * 1024 * 1024,
+					stdio: ["ignore", "pipe", "ignore"],
+				},
+			),
+		);
+	} catch (error) {
+		return {
+			kind: "unavailable",
+			reason: `process listing failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
 }
 
 export const defaultProcessInspector: ProcessInspector = {
@@ -104,6 +217,8 @@ export const defaultProcessInspector: ProcessInspector = {
 	uid: process.getuid?.() ?? null,
 	isAlive: isProcessAlive,
 	kill: (pid, signal) => process.kill(pid, signal),
+	listEnvironments:
+		process.platform === "darwin" ? listPsEnvironments : undefined,
 };
 
 /**
@@ -122,40 +237,126 @@ function environCarries(environ: string, token: string): boolean {
 	return environ.split("\0").includes(`${OWNER_ENV}=${token}`);
 }
 
-export function readOwnership(
+/** Ownership plus whether the process belongs to this user. */
+interface ProcessInspection {
+	ownership: Ownership;
+	/** `false` only for a process proven to belong to another user. */
+	sameUser: boolean;
+}
+
+function inspectProcess(
 	pid: number,
 	token: string,
-	inspector: ProcessInspector = defaultProcessInspector,
-): Ownership {
-	if (!inspector.procRoot) {
-		return inspector.isAlive(pid) ? "unverifiable" : "not-owned";
-	}
+	inspector: ProcessInspector,
+): ProcessInspection | null {
+	if (!inspector.procRoot)
+		return inspector.isAlive(pid)
+			? { ownership: "unverifiable", sameUser: true }
+			: null;
 	try {
 		const environ = readFileSync(
 			`${inspector.procRoot}/${pid}/environ`,
 			"utf8",
 		);
-		return environCarries(environ, token) ? "owned" : "not-owned";
+		return {
+			ownership: environCarries(environ, token) ? "owned" : "not-owned",
+			sameUser: true,
+		};
 	} catch (error) {
 		const code = errnoCode(error);
-		if (code === "ENOENT" || code === "ESRCH") return "not-owned";
+		if (code === "ENOENT" || code === "ESRCH") return null;
 		try {
 			// Another user's process cannot carry this run's environment.
 			const owner = statSync(`${inspector.procRoot}/${pid}`).uid;
 			return inspector.uid != null && owner !== inspector.uid
-				? "not-owned"
-				: "unverifiable";
+				? { ownership: "not-owned", sameUser: false }
+				: { ownership: "unverifiable", sameUser: true };
 		} catch {
-			return inspector.isAlive(pid) ? "unverifiable" : "not-owned";
+			return inspector.isAlive(pid)
+				? { ownership: "unverifiable", sameUser: true }
+				: null;
 		}
 	}
+}
+
+export function readOwnership(
+	pid: number,
+	token: string,
+	inspector: ProcessInspector = defaultProcessInspector,
+): Ownership {
+	return inspectProcess(pid, token, inspector)?.ownership ?? "not-owned";
+}
+
+/** `/proc/<pid>/stat` facts; relation fields are `null` when unreadable. */
+interface ProcessStat extends ProcessRelation {
+	zombie: boolean;
+}
+
+function readProcessStat(pid: number, procRoot: string): ProcessStat {
+	try {
+		const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
+		// Fields after the parenthesized command: state ppid pgrp ...
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const ppid = Number.parseInt(fields[1] ?? "", 10);
+		const pgid = Number.parseInt(fields[2] ?? "", 10);
+		return {
+			pid,
+			ppid: Number.isInteger(ppid) ? ppid : null,
+			pgid: Number.isInteger(pgid) && pgid > 0 ? pgid : null,
+			zombie: fields[0] === "Z",
+		};
+	} catch {
+		return { pid, ppid: null, pgid: null, zombie: false };
+	}
+}
+
+/**
+ * PIDs that may belong to a run: members of the given process groups or of
+ * any root's group, plus every descendant, by parent links, of those members
+ * and of the roots themselves. Roots are excluded.
+ */
+export function relatedProcessIds(
+	relations: readonly ProcessRelation[],
+	roots: readonly number[],
+	seedGroups: readonly number[] = [],
+): Set<number> {
+	const rootSet = new Set(roots);
+	const groups = new Set(seedGroups);
+	const children = new Map<number, number[]>();
+	for (const relation of relations) {
+		if (rootSet.has(relation.pid) && relation.pgid !== null)
+			groups.add(relation.pgid);
+		if (relation.ppid === null) continue;
+		const siblings = children.get(relation.ppid);
+		if (siblings) siblings.push(relation.pid);
+		else children.set(relation.ppid, [relation.pid]);
+	}
+	const queue = [...roots];
+	for (const relation of relations)
+		if (relation.pgid !== null && groups.has(relation.pgid))
+			queue.push(relation.pid);
+	const related = new Set<number>();
+	for (let pid = queue.pop(); pid !== undefined; pid = queue.pop()) {
+		if (related.has(pid)) continue;
+		related.add(pid);
+		for (const child of children.get(pid) ?? []) queue.push(child);
+	}
+	for (const root of rootSet) related.delete(root);
+	return related;
 }
 
 export type OwnedProcessScan =
 	| {
 			kind: "complete";
 			pids: number[];
-			/** Same-user PIDs whose environment is unreadable (bounded sample). */
+			/**
+			 * Same-user processes in the run's process tree or process group
+			 * that are not proven owned: their environment is unreadable or
+			 * lacks the token, or (when unreadable) their relationship is
+			 * unknown. A live run descendant cannot be ruled out.
+			 */
+			related: number[];
+			/** Other same-user PIDs whose environment is unreadable (sample). */
 			unreadable: number[];
 			unreadableCount: number;
 	  }
@@ -163,47 +364,122 @@ export type OwnedProcessScan =
 
 const UNREADABLE_SAMPLE = 5;
 
-/**
- * Enumerate every process whose exec-time environment carries this run's
- * token. `complete` with no PIDs is positive evidence that no readable owned
- * process exists. Following the worktree cleanup process-visibility policy
- * (ADR-0011), an individually unreadable same-user process (for example a
- * non-dumpable keyring or sshd) is disclosed as incomplete coverage rather
- * than blocking; such processes are never signalled. Failed enumeration and
- * platforms without `/proc` are unavailable.
- */
-export function scanOwnedProcesses(
+/** One process as seen by an ownership scan. */
+interface ScannedProcess extends ProcessRelation {
+	inspection: ProcessInspection;
+	/** Proven zombie (Linux); a zombie wrapper still names its own group. */
+	zombie: boolean;
+}
+
+function listScannedProcesses(
 	run: ProcessRun,
-	inspector: ProcessInspector = defaultProcessInspector,
-): OwnedProcessScan {
-	if (!inspector.procRoot)
-		return {
-			kind: "unavailable",
+	inspector: ProcessInspector,
+): ScannedProcess[] | { kind: "unavailable"; reason: string } {
+	if (!inspector.procRoot) {
+		const listing = inspector.listEnvironments?.() ?? {
+			kind: "unavailable" as const,
 			reason: `process ownership cannot be verified on ${process.platform}`,
 		};
-	let entries: string[];
+		if (listing.kind === "unavailable") return listing;
+		// Presence only: a token seen anywhere in a same-user process's
+		// command or environment keeps the run unconfirmed (fail closed).
+		const marker = `${OWNER_ENV}=${run.ownerToken}`;
+		return listing.entries.map((entry) => ({
+			pid: entry.pid,
+			ppid: entry.ppid,
+			pgid: entry.pgid,
+			zombie: false,
+			inspection: {
+				ownership: entry.text.split(/\s+/).includes(marker)
+					? "owned"
+					: entry.readable
+						? "not-owned"
+						: "unverifiable",
+				sameUser: true,
+			},
+		}));
+	}
+	const procRoot = inspector.procRoot;
+	let names: string[];
 	try {
-		entries = readdirSync(inspector.procRoot);
+		names = readdirSync(procRoot);
 	} catch (error) {
 		return {
 			kind: "unavailable",
 			reason: `process enumeration failed: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
-	const pids: number[] = [];
+	return names.flatMap((name) => {
+		if (!/^\d+$/.test(name)) return [];
+		const pid = Number.parseInt(name, 10);
+		const inspection = inspectProcess(pid, run.ownerToken, inspector);
+		return inspection
+			? [{ ...readProcessStat(pid, procRoot), inspection }]
+			: [];
+	});
+}
+
+/**
+ * Enumerate every process whose exec-time environment carries this run's
+ * token, and every same-user process related to the run by process tree or
+ * group that is not proven owned. `complete` with no PIDs and nothing related
+ * is positive evidence that no run process exists. Following the worktree
+ * cleanup process-visibility policy (ADR-0011), an unreadable same-user
+ * process unrelated to the run (for example a non-dumpable keyring or sshd)
+ * is disclosed as incomplete coverage rather than blocking. Nothing here
+ * authorizes a signal. Failed enumeration is unavailable.
+ */
+function wrapperPidReused(
+	wrapper: number,
+	processes: readonly ScannedProcess[],
+	inspector: ProcessInspector,
+): boolean {
+	const holder = processes.find((entry) => entry.pid === wrapper);
+	if (!holder)
+		// Absent from a same-user listing yet alive: another user's process.
+		return !inspector.procRoot && inspector.isAlive(wrapper);
+	return holder.inspection.ownership === "not-owned" && !holder.zombie;
+}
+
+export function scanOwnedProcesses(
+	run: ProcessRun,
+	inspector: ProcessInspector = defaultProcessInspector,
+): OwnedProcessScan {
+	const processes = listScannedProcesses(run, inspector);
+	if (!Array.isArray(processes)) return processes;
+	const pids = processes
+		.filter((entry) => entry.inspection.ownership === "owned")
+		.map((entry) => entry.pid);
+	// The wrapper's PID names its process group: a job-control shell makes
+	// it the group leader, and orphaned descendants keep that group. The
+	// kernel never reuses a PID still naming a group, so the group is the
+	// run's unless that PID now belongs to a provably different process.
+	const wrapper = readProcessReceipt(run)?.pid;
+	const tree = relatedProcessIds(
+		processes,
+		pids,
+		wrapper !== undefined && !wrapperPidReused(wrapper, processes, inspector)
+			? [wrapper]
+			: [],
+	);
+	const related: number[] = [];
 	const unreadable: number[] = [];
 	let unreadableCount = 0;
-	for (const entry of entries) {
-		if (!/^\d+$/.test(entry)) continue;
-		const pid = Number.parseInt(entry, 10);
-		const ownership = readOwnership(pid, run.ownerToken, inspector);
-		if (ownership === "owned") pids.push(pid);
+	for (const entry of processes) {
+		const { ownership, sameUser } = entry.inspection;
+		if (ownership === "owned" || !sameUser) continue;
+		const unknownRelation = entry.ppid === null || entry.pgid === null;
+		if (
+			tree.has(entry.pid) ||
+			(ownership === "unverifiable" && unknownRelation)
+		)
+			related.push(entry.pid);
 		else if (ownership === "unverifiable") {
 			unreadableCount++;
-			if (unreadable.length < UNREADABLE_SAMPLE) unreadable.push(pid);
+			if (unreadable.length < UNREADABLE_SAMPLE) unreadable.push(entry.pid);
 		}
 	}
-	return { kind: "complete", pids, unreadable, unreadableCount };
+	return { kind: "complete", pids, related, unreadable, unreadableCount };
 }
 
 /** Receipt-derived state; liveness never trusts a PID without ownership. */
@@ -308,9 +584,13 @@ export function terminateProcessRun(
 	}
 	if (targets.size === 0 && !group) return { kind: "nothing-owned" };
 	const signalled: number[] = [];
+	const unverified: number[] = [];
 	for (const pid of targets) {
-		// Re-verify immediately before signalling each individual PID.
-		if (readOwnership(pid, run.ownerToken, inspector) !== "owned") continue;
+		// Re-verify immediately before signalling each individual PID; a
+		// listing-only match (no /proc proof) is never signalled.
+		const ownership = readOwnership(pid, run.ownerToken, inspector);
+		if (ownership === "unverifiable") unverified.push(pid);
+		if (ownership !== "owned") continue;
 		try {
 			inspector.kill(pid, signal);
 			signalled.push(pid);
@@ -318,6 +598,11 @@ export function terminateProcessRun(
 			// The process may have exited after verification.
 		}
 	}
+	if (!group && signalled.length === 0 && unverified.length > 0)
+		return {
+			kind: "unverifiable",
+			reason: `ownership of process(es) ${unverified.join(", ")} cannot be proven for signalling`,
+		};
 	return { kind: "signalled", pids: signalled, group };
 }
 
@@ -325,22 +610,18 @@ function readProcessGroup(
 	pid: number,
 	inspector: ProcessInspector,
 ): number | null {
-	if (!inspector.procRoot) return null;
-	try {
-		const stat = readFileSync(`${inspector.procRoot}/${pid}/stat`, "utf8");
-		// Fields after the parenthesized command: state ppid pgrp ...
-		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-		const pgrp = Number.parseInt(fields[2] ?? "", 10);
-		return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
-	} catch {
-		return null;
-	}
+	return inspector.procRoot
+		? readProcessStat(pid, inspector.procRoot).pgid
+		: null;
 }
 
 /**
- * `confirmed`: the wrapper recorded its exit, or a complete owned-process scan
- * found no process and the cancel marker prevents a late start.
- * `unconfirmed`: an owned process may still be running.
+ * `confirmed`: no owned process can still be running. Either the wrapper
+ * recorded its exit and no owned descendant survives, or a complete
+ * owned-process scan found nothing and the cancel marker prevents a late
+ * start; in both cases no same-user process in the run's process tree or
+ * group remains unproven. `unconfirmed`: an owned process, including a
+ * descendant that outlived the wrapper, may still be running.
  */
 export type ExitConfirmation =
 	| {
@@ -348,12 +629,14 @@ export type ExitConfirmation =
 			/** `receipt`: the wrapper recorded its exit; `scan`: no owned process found. */
 			evidence: "receipt" | "scan";
 			exitCode: number | null;
-			/** Owned descendants still running after the wrapper exited. */
-			lingering: number[];
 			/** Same-user processes the scan could not inspect (count). */
 			unreadableCount: number;
 	  }
-	| { kind: "unconfirmed"; reason: string };
+	| { kind: "unconfirmed"; reason: string; lingering?: number[] };
+
+function unprovenRelatedReason(related: readonly number[]): string {
+	return `process(es) ${related.slice(0, UNREADABLE_SAMPLE).join(", ")}${related.length > UNREADABLE_SAMPLE ? ` and ${related.length - UNREADABLE_SAMPLE} more` : ""} in the run's process tree or group are still running and cannot be proven unrelated to it`;
+}
 
 export function confirmProcessExit(
 	run: ProcessRun,
@@ -362,12 +645,31 @@ export function confirmProcessExit(
 	const state = readProcessRunState(run, inspector);
 	if (state.kind === "exited") {
 		const scan = scanOwnedProcesses(run, inspector);
+		// A descendant that inherited the owner token keeps the run alive: it
+		// can still write the checkout or drive the native session.
+		if (scan.kind === "complete" && scan.pids.length > 0)
+			return {
+				kind: "unconfirmed",
+				reason: `the launch wrapper exited, but owned descendant process(es) ${scan.pids.join(", ")} are still running`,
+				lingering: scan.pids,
+			};
+		if (scan.kind === "complete" && scan.related.length > 0)
+			return {
+				kind: "unconfirmed",
+				reason: unprovenRelatedReason(scan.related),
+			};
+		// A wrapper receipt proves nothing about descendants: without a
+		// complete owned-process scan the run stays unresolved.
+		if (scan.kind === "unavailable")
+			return {
+				kind: "unconfirmed",
+				reason: `the launch wrapper exited, but owned descendants could not be checked (${scan.reason})`,
+			};
 		return {
 			kind: "confirmed",
 			evidence: "receipt",
 			exitCode: state.exitCode,
-			lingering: scan.kind === "complete" ? scan.pids : [],
-			unreadableCount: scan.kind === "complete" ? scan.unreadableCount : 0,
+			unreadableCount: scan.unreadableCount,
 		};
 	}
 	if (state.kind === "running")
@@ -382,19 +684,29 @@ export function confirmProcessExit(
 		return {
 			kind: "unconfirmed",
 			reason: `owned process(es) ${scan.pids.join(", ")} still running without an exit receipt`,
+			lingering: scan.pids,
 		};
+	if (scan.related.length > 0)
+		return { kind: "unconfirmed", reason: unprovenRelatedReason(scan.related) };
 	if (state.kind === "not-started") {
 		// A wrapper between exec and its start receipt would see the marker.
-		writeCancelMarker(run);
+		// Without a confirmed marker write, an absent receipt cannot rule out a
+		// delayed wrapper that has not started yet.
+		const cancelled = writeCancelMarker(run);
 		const recheck = readProcessRunState(run, inspector);
 		if (recheck.kind !== "not-started")
 			return confirmProcessExit(run, inspector);
+		if (!cancelled)
+			return {
+				kind: "unconfirmed",
+				reason:
+					"the launch has no start receipt and its late-start cancel marker could not be written",
+			};
 	}
 	return {
 		kind: "confirmed",
 		evidence: "scan",
 		exitCode: null,
-		lingering: [],
 		unreadableCount: scan.unreadableCount,
 	};
 }

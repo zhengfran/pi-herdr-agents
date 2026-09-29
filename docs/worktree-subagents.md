@@ -54,7 +54,7 @@ For a worktree launch:
 
 For an explicit interactive handoff, use `/worktree <worktree> [task]`. It creates the worktree from the current committed branch, forks the active conversation branch into the target-cwd session, launches a normal long-lived Pi process in the returned root pane, and focuses the destination workspace only after Herdr confirms Pi is running with the expected session and worktree cwd. Use `/worktree list` to inspect managed worktrees whose source repositories are inside the current cwd subtree, including cross-session orphans. The original process and session remain intact; pane movement is not used to change a running shell's cwd.
 
-`worktree` cannot be set in agent frontmatter and is not exposed by the `/subagent <agent> <task>` shorthand. It is selected per call to the `subagent` tool. Ordered model fallback lists are not supported for worktree subagents: a failed attempt retains its worktree and branch for review, so a retry cannot safely reuse the requested branch. A persistent specialist either holds one worktree lease for its full lifetime or runs read-only in an ordinary pane; it cannot be re-bound.
+`worktree` cannot be set in agent frontmatter and is not exposed by the `/subagent <agent> <task>` shorthand. It is selected per call to the `subagent` tool. Ordered Pi model fallback lists are not supported for worktree subagents: a failed attempt retains its worktree and branch for review, so a retry cannot safely reuse the requested branch. Native (`cli: claude|kiro`) roles may retry only under the strict reuse rule below. A persistent specialist either holds one worktree lease for its full lifetime or runs read-only in an ordinary pane; it cannot be re-bound.
 
 ## Parent and worker responsibilities
 
@@ -119,6 +119,15 @@ Possible states are:
 The manifest supports ownership and inspection; v1 does not provide automatic reconciliation after a full Pi/Herdr restart. Do not edit manifests by hand.
 
 Native `cli: claude` and `cli: kiro` roles use the same manifest, states, retained workspace, and handoff. Their manifest also records `harness`, and `sessionFile` points to the native session marker under `artifacts/<parent-session-id>/native-sessions/` rather than a Pi transcript. A native worktree run reaches `ready_for_review` only after correlated native turn evidence plus process exit; any other outcome is `failed`. Native children cannot call `caller_ping`, so they never reach `needs_help`. An owned transient Kiro profile is removed from the worktree root before the Git handoff is captured, and is retained only if it was modified. If the native process exit cannot be confirmed, the run is `failed` with `processExit: "unconfirmed"`, no Git state is captured (fields are unknown), the Kiro profile is retained, and explicit cleanup treats the worktree as held by a live child until the parent later confirms the owned process is gone.
+
+Native worktree runs have three additional lease rules (see [ADR-0013](adr/0013-native-harness-second-stage.md)):
+
+- **Durable lease.** Every native run bound to a worktree holds `<manifest>.native-lease`, naming its receipt and owner token, until its exit (descendants included) is confirmed. The lease also records the launching parent's reservation (PID, kernel start time, random token); while that parent lives, or its identity cannot be proven, the lease stays held even after the named run exits, until the parent releases it at final settlement. It survives parent crashes. Explicit cleanup treats a held lease as a blocker, and native resume refuses to drive the worktree while it is held. A stale lease is reclaimed only with confirmed exit evidence.
+- **Model fallback reuse.** With several native model candidates, a failed attempt's worktree is reused for the next candidate, in its retained root shell, only with positive evidence that the attempt did no work. That means its exit is confirmed, and its own session receipt shows active hooks with no prompt-submit receipt or hook error. The checkout must also be pristine (clean, no untracked files, head at the base). A `StopFailure` or any failure after the prompt started is never retried. The durable lease stays reserved by the parent between attempts: each attempt receives it by an atomic replace that checks the previous holder and the parent token, and it is released only after the final attempt's exit is confirmed, so a cleanup or resume racing between attempts always sees it held. The manifest records `fallbackAttempt` and `nativeModel`. Otherwise no further model is tried.
+- **Native resume.** `subagent_resume` of a worktree-bound native session marker runs in a new ordinary pane at the retained worktree path. Before resuming, it verifies the same path, branch, and workspace, a manifest not marked `removed`, no live or unconfirmed in-memory holder, and no held durable lease. The resumed run holds the worktree lease until its exit is confirmed, then reports Git state again and updates the manifest. It never recreates, moves, or removes the workspace, and it keeps the session's recorded mode. Pi child sessions are still not resumable this way.
+- **Launch failure after dispatch.** If a native launch fails after its script was sent and the owned exit cannot be confirmed, the worktree is marked `failed` with `processExit: "unconfirmed"` and unknown Git state. Its root pane, Kiro profile, and leases are retained until exit is confirmed. For a fallback attempt, the result and manifest name that attempt (its marker, model, and pane); earlier attempts are history only.
+- **Abort before dispatch.** A parent shutdown or cancelled call while a native launch waits for its shell stops it before its process is dispatched. The never-started run's leases are released, and the worktree is retained and marked `failed`.
+- **Nested delegation.** Nested children launched by a native worktree child run in ordinary panes with the requester's cwd, within its tool ceiling. While they run, the requester stays alive and holds the lease; explicit cleanup's process check still sees them as holders.
 
 ## Completion handoff
 
@@ -195,11 +204,12 @@ The extension never pushes, creates a PR, merges, cherry-picks, or changes the p
 - **Creation failure:** the manifest is marked failed. If Herdr created the branch but returned an incomplete response, the extension reconciles a unique branch match through `/worktree list` and records any recovered workspace/path.
 - **Launch failure after creation:** the manifest is marked failed and the workspace, forked session, and path are retained. The destination is not focused unless Pi startup is confirmed.
 - **Worker failure:** summary and available Git state are returned; the workspace remains open. Auto-exit waits until Pi is fully settled, so a transient provider error followed by automatic compaction or retry does not end the worker early.
-- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace rather than through `subagent_resume`. Public `subagent_resume` rejects managed-worktree child sessions before creating a pane so it cannot silently lose worktree ownership or policy.
+- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace rather than through `subagent_resume`. Public `subagent_resume` rejects managed-worktree Pi child sessions before creating a pane so it cannot silently lose worktree ownership or policy.
+- **Native worktree follow-up:** send a follow-up to a running native child with `subagent_send`, or resume a finished one from its native marker as described above; the worktree lease is held for either.
 - **Parent `/reload`, `/new`, `/resume`, or `/fork`:** active in-memory watchers transfer to the replacement parent session.
 - **Full process restart or crash:** the worktree remains, but v1 does not automatically rediscover and resume its watcher.
 
-`subagent_resume` rejects managed-worktree sessions. It does not reattach the managed worktree lifecycle or produce a new worktree handoff. For worktree follow-up, focus the retained workspace and resume manually from its shell:
+`subagent_resume` rejects managed-worktree Pi sessions. It does not reattach the managed worktree lifecycle or produce a new worktree handoff for them. For worktree follow-up, focus the retained workspace and resume manually from its shell:
 
 ```bash
 herdr workspace focus <workspace-id>
@@ -243,7 +253,7 @@ This first version intentionally does not provide:
 
 - automatic push, PR creation, merge, or cherry-pick
 - automatic worktree or branch removal
-- worktree-aware `subagent_resume`
+- worktree-aware `subagent_resume` for Pi sessions (native markers use the verified lease rule above)
 - durable restart reconciliation
 - dependency DAG scheduling or merge queues
 - stacked-branch management

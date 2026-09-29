@@ -26,11 +26,29 @@ export interface TaskPreferencesMeta {
 	method: "research" | "registry-only";
 }
 
+/** Native CLI harnesses whose model IDs never share Pi's provider/model namespace. */
+export const NATIVE_MODEL_HARNESSES = ["claude", "kiro"] as const;
+export type NativeModelHarness = (typeof NATIVE_MODEL_HARNESSES)[number];
+/** One native CLI model ID (for example `opus` or `claude-sonnet-4.5`). */
+export const NATIVE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,199}$/;
+export type NativeTaskPreferences = Partial<
+	Record<NativeModelHarness, TaskPreferences>
+>;
+
+export function isNativeModelHarness(value: any): value is NativeModelHarness {
+	return value === "claude" || value === "kiro";
+}
+
 export interface ModelConfig {
 	default?: string;
 	agents: Record<string, string>;
 	tasks?: TaskPreferences;
 	tasksMeta?: TaskPreferencesMeta;
+	/**
+	 * Ordered native CLI model IDs per harness and task category. These are
+	 * passed to the native `--model` flag and never resolved through Pi.
+	 */
+	native?: NativeTaskPreferences;
 }
 
 function invalidModelConfig(source: string, message: string): never {
@@ -50,10 +68,15 @@ function rejectTaskReference(
 	}
 }
 
-function parseTasks(value: any, source: string): TaskPreferences | undefined {
+function parseTasks(
+	value: any,
+	source: string,
+	field = "models.tasks",
+	validateCandidate?: (candidate: string, path: string) => void,
+): TaskPreferences | undefined {
 	if (value == null) return undefined;
 	if (!isPlainObject(value))
-		invalidModelConfig(source, "models.tasks must be an object");
+		invalidModelConfig(source, `${field} must be an object`);
 	const keys = Object.keys(value);
 	if (keys.length === 0) return undefined;
 	const unsupported = keys.filter(
@@ -63,7 +86,7 @@ function parseTasks(value: any, source: string): TaskPreferences | undefined {
 	if (unsupported.length > 0) {
 		invalidModelConfig(
 			source,
-			`models.tasks.${unsupported[0]} is unsupported; supported categories: ${TASK_CATEGORIES.join(", ")}`,
+			`${field}.${unsupported[0]} is unsupported; supported categories: ${TASK_CATEGORIES.join(", ")}`,
 		);
 	}
 	const tasks: TaskPreferences = {};
@@ -73,7 +96,7 @@ function parseTasks(value: any, source: string): TaskPreferences | undefined {
 		if (!Array.isArray(candidates) || candidates.length === 0) {
 			invalidModelConfig(
 				source,
-				`models.tasks.${category} must be a non-empty list`,
+				`${field}.${category} must be a non-empty list`,
 			);
 		}
 		const seen = new Set<string>();
@@ -81,16 +104,17 @@ function parseTasks(value: any, source: string): TaskPreferences | undefined {
 			if (!isString(candidate) || candidate.trim() === "") {
 				invalidModelConfig(
 					source,
-					`models.tasks.${category}[${index}] must be a non-empty string`,
+					`${field}.${category}[${index}] must be a non-empty string`,
 				);
 			}
 			const reference = candidate.trim();
 			if (seen.has(reference)) {
 				invalidModelConfig(
 					source,
-					`models.tasks.${category} has duplicate candidate ${JSON.stringify(reference)}`,
+					`${field}.${category} has duplicate candidate ${JSON.stringify(reference)}`,
 				);
 			}
+			validateCandidate?.(reference, `${field}.${category}[${index}]`);
 			seen.add(reference);
 			return reference;
 		});
@@ -135,6 +159,51 @@ function parseTasksMeta(
 	return { generatedAt: value.generatedAt, method: value.method };
 }
 
+/**
+ * Parse `models.native.<harness>.tasks`. Candidates are native CLI model IDs,
+ * validated syntactically only: the native CLI owns their authentication.
+ */
+function parseNativeTasks(
+	value: any,
+	source: string,
+): NativeTaskPreferences | undefined {
+	if (value == null) return undefined;
+	if (!isPlainObject(value))
+		invalidModelConfig(source, "models.native must be an object");
+	const native: NativeTaskPreferences = {};
+	for (const harness of Object.keys(value)) {
+		const entry = value[harness];
+		if (!isNativeModelHarness(harness))
+			invalidModelConfig(
+				source,
+				`models.native.${harness} is unsupported; supported harnesses: ${NATIVE_MODEL_HARNESSES.join(", ")}`,
+			);
+		if (!isPlainObject(entry))
+			invalidModelConfig(source, `models.native.${harness} must be an object`);
+		const unsupported = Object.keys(entry).filter((key) => key !== "tasks");
+		if (unsupported.length > 0)
+			invalidModelConfig(
+				source,
+				`models.native.${harness} has unsupported key(s): ${unsupported.join(", ")}`,
+			);
+		const tasks = parseTasks(
+			entry.tasks,
+			source,
+			`models.native.${harness}.tasks`,
+			(candidate, path) => {
+				rejectTaskReference(candidate, path, source);
+				if (candidate.includes(",") || !NATIVE_MODEL_ID.test(candidate))
+					invalidModelConfig(
+						source,
+						`${path} must be one native CLI model ID, not ${JSON.stringify(candidate)}`,
+					);
+			},
+		);
+		if (tasks) native[harness] = tasks;
+	}
+	return Object.keys(native).length > 0 ? native : undefined;
+}
+
 export function parseModelConfig(
 	rawConfig: any,
 	source = "config.json",
@@ -145,7 +214,13 @@ export function parseModelConfig(
 	if (models == null) return { agents: {} };
 	if (!isPlainObject(models))
 		invalidModelConfig(source, "models must be an object");
-	const allowedKeys = new Set(["default", "agents", "tasks", "tasksMeta"]);
+	const allowedKeys = new Set([
+		"default",
+		"agents",
+		"tasks",
+		"tasksMeta",
+		"native",
+	]);
 	const unsupportedKeys = Object.keys(models).filter(
 		(key) => !allowedKeys.has(key),
 	);
@@ -185,10 +260,12 @@ export function parseModelConfig(
 	}
 	const tasks = parseTasks(models.tasks, source);
 	const tasksMeta = parseTasksMeta(models.tasksMeta, source);
+	const native = parseNativeTasks(models.native, source);
 	const config: ModelConfig = { agents };
 	if (defaultModel) config.default = defaultModel;
 	if (tasks) config.tasks = tasks;
 	if (tasksMeta) config.tasksMeta = tasksMeta;
+	if (native) config.native = native;
 	return config;
 }
 

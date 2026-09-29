@@ -3,8 +3,10 @@
 """Offline Claude Code stand-in for native launch tests; never contacts a model.
 
 Adapted from zhengfran/pi-interactive-subagents test/fixtures/claude-cli.py
-(MIT). It fires the owned per-run hooks like the interactive TUI, then waits
-for the parent's graceful /exit on stdin. FAKE_NATIVE_MODE selects failures.
+(MIT). It fires the owned per-run hooks like the interactive TUI, then reads
+parent input lines from stdin: tagged follow-ups start new turns, `HUMAN x`
+models a human-typed prompt, `ESC` models an interrupt key, and `/exit`
+exits. FAKE_NATIVE_MODE selects failures.
 """
 import json
 import os
@@ -18,29 +20,36 @@ if args == ["--version"]:
     sys.exit(0)
 
 mode = os.environ.get("FAKE_NATIVE_MODE", "ok")
+log = os.environ["FAKE_NATIVE_LOG"]
 assert "-p" not in args and "--print" not in args and "--output-format" not in args
 assert "--dangerously-skip-permissions" in args
 assert args[args.index("--permission-mode") + 1] == "bypassPermissions"
-assert "--strict-mcp-config" in args and "--mcp-config" not in args
-assert "--resume" not in args, "native resume is unsupported"
+assert "--strict-mcp-config" in args
 tools = args[args.index("--tools") + 1]
 settings = json.loads(pathlib.Path(args[args.index("--settings") + 1]).read_text())
-sid = args[args.index("--session-id") + 1]
+resumed = "--resume" in args
+sid = args[args.index("--resume" if resumed else "--session-id") + 1]
 prompt = args[-1]
 assert prompt.startswith("[pi-subagent-turn:")
-pathlib.Path(os.environ["FAKE_NATIVE_LOG"]).write_text(
-    json.dumps({"harness": "claude", "args": args, "cwd": os.getcwd(), "tools": tools})
+pathlib.Path(log).write_text(
+    json.dumps({"harness": "claude", "args": args, "cwd": os.getcwd(), "tools": tools,
+                "resumed": resumed})
 )
+model = args[args.index("--model") + 1] if "--model" in args else None
+failing = os.environ.get("FAKE_FAIL_MODEL", "").split(",")
+if mode in ("exit-before-ack", "exit-before-hooks"):
+    sys.exit(1)  # no receipt at all: never positive evidence of no work
+if model and model == os.environ.get("FAKE_STOP_FAILURE_MODEL"):
+    mode = "stop-failure"
+reject_model = bool(model and model in failing)
 
-if mode == "untagged":
-    prompt = "human typed this"
-if mode == "other-session":
-    sid = "22222222-2222-4222-8222-222222222222"
-events = [("SessionStart", {"source": "startup"}), ("UserPromptSubmit", {"prompt": prompt})]
-if mode != "no-stop":
-    events.append(("Stop", {"stop_hook_active": False,
-                            "last_assistant_message": "Claude fixture result"}))
-for kind, extra in events:
+
+def event(line):
+    with open(log + ".events", "a", encoding="utf8") as stream:
+        stream.write(json.dumps(line) + "\n")
+
+
+def fire(kind, **extra):
     payload = {"hook_event_name": kind, "cwd": os.getcwd(), "session_id": sid,
                "transcript_path": "/nonexistent/fixture.jsonl", **extra}
     for group in settings["hooks"][kind]:
@@ -49,8 +58,70 @@ for kind, extra in events:
                                     text=True, capture_output=True)
             assert result.stdout == ""
 
-if mode == "no-stop":
-    sys.exit(0)
-# Model nothing; exit like the TUI after the parent's graceful /exit.
-line = sys.stdin.readline().strip()
-sys.exit(0 if line == "/exit" else 3)
+
+def mcp_delegate(agent):
+    config = json.loads(pathlib.Path(args[args.index("--mcp-config") + 1]).read_text())
+    server = config["mcpServers"]["pi-subagents"]
+    proc = subprocess.Popen([server["command"], *server["args"]], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
+
+    def rpc(mid, method, params):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": method,
+                                     "params": params}) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    rpc(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "fixture", "version": "1"}})
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    listed = rpc(2, "tools/list", {})
+    called = rpc(3, "tools/call", {"name": "subagent", "arguments": {
+        "agent": agent, "name": "probe", "task": "Inspect the bridge"}})
+    proc.stdin.close()
+    proc.wait()
+    event({"mcp": {"tools": listed["result"]["tools"], "call": called["result"]}})
+
+
+if mode == "spawn" and "--mcp-config" not in args:
+    mode = "ok"  # a nested leaf has no bridge and cannot delegate
+if mode == "other-session":
+    sid = "22222222-2222-4222-8222-222222222222"
+fire("SessionStart", source="resume" if resumed else "startup")
+if reject_model:
+    sys.exit(1)  # session receipt proves hooks ran; the prompt was never submitted
+fire("UserPromptSubmit", prompt="human typed this" if mode == "untagged" else prompt)
+if mode == "spawn":
+    mcp_delegate(os.environ.get("FAKE_SPAWN_AGENT", "scout"))
+    fire("Stop", stop_hook_active=False, last_assistant_message="Delegated to a nested subagent")
+elif mode == "stop-failure":
+    fire("StopFailure", error="rate_limit", error_details="fixture overload")
+elif mode not in ("no-stop", "hang-turn"):
+    fire("Stop", stop_hook_active=False, last_assistant_message="Claude fixture result")
+
+if os.environ.get("FAKE_LINGER"):
+    # An owned descendant (inherits the owner token) outliving the CLI.
+    child = subprocess.Popen(["sleep", "60"], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    event({"lingering": child.pid})
+if mode == "no-stop" or os.environ.get("FAKE_EXIT_AFTER_STOP"):
+    sys.exit(0)  # exits right after its correlated Stop (fast exit)
+turn = 1
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    event({"input": line})
+    if line == "/exit":
+        sys.exit(0)
+    if line == "ESC":
+        continue  # Claude fires no Stop for a user interrupt.
+    if line.startswith("HUMAN "):
+        fire("UserPromptSubmit", prompt=line[len("HUMAN "):])
+        fire("Stop", stop_hook_active=False, last_assistant_message="Human-driven answer")
+        continue
+    if line.startswith("[pi-subagent-turn:"):
+        turn += 1
+        fire("UserPromptSubmit", prompt=line)
+        if os.environ.get("FAKE_FOLLOW_UP") != "hang":
+            fire("Stop", stop_hook_active=False,
+                 last_assistant_message="Claude follow-up result %d" % turn)
+        continue
+sys.exit(3)

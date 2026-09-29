@@ -18,7 +18,8 @@ Delegate investigation, implementation, and review without blocking the parent s
 - **Conversation handoff** — continue the active Pi conversation in a new worktree with `/worktree` while preserving the parent session.
 - **Orchestrated reviews** — fan out fresh public reviewers and synthesize their evidence in the parent.
 - **Reusable roles** — use bundled agents, project or global definitions, and installable role packs.
-- **Persistent specialists** — retain one policy-bound Pi session for sequential, turn-based tasks.
+- **Persistent specialists** — retain one policy-bound Pi or native session for sequential, turn-based tasks.
+- **Native Claude Code and Kiro roles** — run `cli: claude|kiro` roles with correlated turn receipts, exact-loadout resume, queued follow-ups, verified interrupts, interactive sessions, fork context, skills, native model fallback, and allowlisted nested delegation.
 
 ## Requirements
 
@@ -127,13 +128,13 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagent_send`      | Deliver a follow-up task to an idle persistent specialist                                   |
+| `subagent_interrupt` | Interrupt a running subagent's current turn (native: verified owned live turns only)       |
+| `subagent_send`      | Deliver a follow-up task to an idle persistent specialist, or queue a follow-up for a running native child |
 | `subagent_stop`      | Gracefully stop a persistent specialist after its active task settles                      |
 | `subagents_list`     | List available agent definitions                                                            |
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
-| `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
+| `subagent_resume`    | Resume a previous Pi session, or a native session marker with its exact loadout, in a new ordinary pane (async) |
 | `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
 
 | Pi child-only tool | Description |
@@ -348,6 +349,21 @@ exact IDs from your authenticated model catalog:
     "tasksMeta": {
       "generatedAt": "2026-09-17T00:00:00Z",
       "method": "research"
+    }
+  }
+}
+```
+
+Native `cli: claude|kiro` roles never use these Pi provider/model refs. Their
+`task:<category>` values resolve from a separate `models.native` section of
+ordered native CLI model IDs, edited by hand (the writer below preserves it):
+
+```json
+{
+  "models": {
+    "native": {
+      "claude": { "tasks": { "coding": ["opus", "sonnet"], "review": ["opus"] } },
+      "kiro": { "tasks": { "coding": ["claude-sonnet-4.5"] } }
     }
   }
 }
@@ -575,7 +591,7 @@ subagent({
 | `fork`                 | boolean | —              | Override the child session mode: `true` forces fork, `false` forces standalone. Omit to inherit the agent `session-mode` frontmatter |
 | `persistent`           | boolean | `false`        | Keep one specialist session alive for sequential tasks; follow-ups use `subagent_send` only       |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent. Native roles take native CLI model IDs instead (see [Native models and fallback](#native-models-and-fallback)) |
 | `thinking`             | string  | parent level   | Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; this is a discouraged fallback for orchestrated children. |
 | `systemPrompt`         | string  | —              | Role/system-prompt text for a bare spawn; named agents keep their definition body                  |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
@@ -612,6 +628,8 @@ The extension does **not** push, create a PR, merge, cherry-pick, or remove the 
 
 Set `persistent: true` on a `subagent` launch to create one logical specialist with one v1 session generation. Its resolved tools, denied tools, model, thinking level, and optional worktree binding are snapshotted at launch and do not change when work is sent later. `subagents_list` shows each live specialist's logical ID, generation ID, state, completed-task count, and effective policy.
 
+Native `cli: claude|kiro` roles with `persistent: true` follow the same contract. Their policy hash is the native loadout hash. The parent types a dispatched task once, as a new tagged turn, at the verified idle point that makes the specialist idle. `subagent_stop` types the native graceful exit (`/exit` or `/quit`) only at such a point. Specialist crash and stop notices carry the same facts. Native specialists cannot delegate (`spawn-agents`) and never advance to another model.
+
 The initial task and each `subagent_send({ id|name, message })` task are delivered exactly once with a task ID. A specialist accepts one task at a time. Sends while it is working are recorded as `rejected-busy`; no queue is retained. After a task result arrives, it is idle and accepts the next task. A persistent child's `caller_ping` records a help request but keeps the session alive; answer with `subagent_send`.
 
 Use `subagent_stop({ id|name })` to request graceful shutdown. If a task is active, stop becomes `stop-pending` and the task reaches its terminal outcome first. The parent reports `stopped` only after process-exit evidence is confirmed, then closes an ordinary pane it created and releases the name. If confirmation times out, the specialist is `stalled` in an unconfirmed-stop state: `subagent_send` rejects follow-up work while retaining evidence. Request `subagent_stop` again to make another bounded exit check, or spawn a new specialist. A pane or process disappearance without a stop directive produces one facts-only crash notice; persistent sessions cannot be resumed in v1, so spawn a new specialist. There is no automatic restart, replay, or revival.
@@ -633,6 +651,8 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 `id` and `name` are each optional, but execution requires one usable target: an exact running ID or an exact, unambiguous display name. When both are supplied, `id` is used. Duplicate names are rejected.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+
+For a native `cli: claude|kiro` child, the interrupt is accepted only when its process is running with a `/proc`-verified owner token and a correlated hook receipt shows its tagged turn in progress; otherwise nothing is sent. The interrupt is recorded before Escape is sent, so the turn is reported as `interrupted`, never as a success, even if a `Stop` races the key. Interactive native sessions stay open for the human. An autonomous run exits gracefully if a native `Stop` receipt proves the turn ended within 10 seconds, otherwise its verified owned processes are terminated. Its result reports the interruption and can be resumed with `subagent_resume` if the CLI persisted the session. A persistent specialist reports the task as interrupted and accepts tasks again only after a verified idle point; otherwise it is ended the same way. macOS cannot prove process ownership for a signal, so native interrupts are refused there.
 
 ---
 
@@ -667,7 +687,9 @@ The `caller_ping` tool lets a Pi-backed subagent request help from its parent ag
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response fully settles. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `autoExit` (optional): For Pi sessions, whether the resumed session should auto-exit after its next response fully settles. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff. Native sessions always resume in their recorded mode; a conflicting `autoExit` is rejected.
+
+**Native sessions:** pass a native marker (`artifacts/<session-id>/native-sessions/<id>.json`, shown in native results) as `sessionPath`, with a required `message`. See [Native resume](#native-resume).
 
 Each public child stores a session-adjacent versioned launch-policy sidecar. Public resume restores its resolved tool allowlist and denied subagent tools rather than looking up the current role, so later role changes cannot widen a child. An intentionally unrestricted launch remains unrestricted (no `--tools` argument); a restricted launch restores its exact allowlist. The `autoExit` override still controls whether `subagent_done` is available, while `caller_ping` remains available. Missing, malformed, or unsupported policy fails closed before a pane is created with recovery guidance. Public resume rejects managed-worktree child sessions; use their retained workspace instead. Unknown policy owners, including legacy workflow sidecars, fail closed.
 
@@ -910,8 +932,8 @@ collision rules, and rejected alternatives.
 - `/subagent list` shows the expected source and a smoke launch succeeds.
 
 Capability declarations are strict: use the unquoted, unindented keys
-`tools:`, `deny-tools:`, and `spawning:` exactly once when present. Declare
-`tools` and `deny-tools` as non-empty inline comma-separated scalars, and
+`tools:`, `deny-tools:`, `spawn-agents:`, and `spawning:` exactly once when present. Declare
+`tools`, `deny-tools`, and `spawn-agents` as non-empty inline comma-separated scalars, and
 `spawning` as exactly `true` or `false`. YAML lists, containers, multiline
 values, quotes, comments, empty values, duplicates, noncanonical key spelling,
 and invalid booleans are rejected. A role with an invalid capability declaration
@@ -941,6 +963,7 @@ Compare definitions against the reference below and verify them with
 | `cwd`         | string  | Default working directory. Absolute paths are unambiguous; relative agent-frontmatter paths resolve from Pi's agent config directory (`PI_CODING_AGENT_DIR` or `~/.pi/agent`), not the project root                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide a role from discovery surfaces like `subagents_list`. The definition remains directly invocable by exact name via `subagent({ agent: "name", ... })`. |
 | `cli`         | string  | Optional native harness: `claude` or `kiro`. Omit for Pi-backed roles. Other values fail closed. See [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles). |
+| `spawn-agents` | string | Native roles only: one inline comma-separated allowlist of roles the native child may delegate to through its owned bridge (see [Nested delegation](#nested-delegation)). Pi-backed roles declaring it are rejected. |
 
 ---
 
@@ -1021,9 +1044,10 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 A role with `cli: claude` or `cli: kiro` runs the native interactive Claude Code
 TUI or Kiro CLI 2.24.x V2 (`kiro-cli chat --v2`) instead of Pi. Herdr placement,
 managed worktrees, the widget, and the bounded `subagent_result` delivery are
-shared with Pi-backed children. This first stage supports ordinary fresh
-autonomous runs only, in an ordinary pane or an explicitly requested managed
-worktree.
+shared with Pi-backed children. Every orchestrator prompt is a *tagged turn*
+settled only by its own correlated native hook receipt; terminal text and Herdr
+status never establish success. [ADR-0013](docs/adr/0013-native-harness-second-stage.md)
+records the design.
 
 ```markdown
 ---
@@ -1038,47 +1062,228 @@ system-prompt: append
 You are a worker agent. ...
 ```
 
-- `auto-exit: true` and an explicit `tools` allowlist are required. Tools map
-  strictly: Claude `read→Read`, `write→Write`, `edit→Edit`, `bash→Bash`,
-  `grep→Grep`, `find`/`ls→Glob` (`ls` requires `find`); Kiro `read`/`ls→fs_read`,
-  `write`+`edit→fs_write` (both required), `bash→execute_bash`, `grep`, `find→glob`.
-  Any other tool fails closed. Approval prompts are bypassed only for this
-  mapped set; Claude loads no MCP servers (`--strict-mcp-config`), and the Kiro
-  profile sets `mcpServers: {}` and `includeMcpJson: false`.
-- `model` is one native model ID passed to `--model`; Pi model config
-  (`models.default`, `models.agents`, `models.tasks`) is not applied. `thinking`
-  maps to `--effort` and accepts `low`, `medium`, `high`, `xhigh`, or `max`;
-  omit it for the native default.
+- An explicit `tools` allowlist is required. Tools map strictly: Claude
+  `read→Read`, `write→Write`, `edit→Edit`, `bash→Bash`, `grep→Grep`,
+  `find`/`ls→Glob` (`ls` requires `find`); Kiro `read`/`ls→fs_read`,
+  `write`+`edit→fs_write` (both required), `bash→execute_bash`, `grep`,
+  `find→glob`. Any other tool fails closed. Approval prompts are bypassed only
+  for this mapped set. Claude loads no MCP servers except the owned delegation
+  bridge (`--strict-mcp-config`); the Kiro profile sets `includeMcpJson: false`
+  and lists only that bridge, if any.
+- `model` is a native CLI model ID, an ordered comma-separated native list, or
+  `task:<category>` from `models.native.<cli>.tasks` (see
+  [Native models and fallback](#native-models-and-fallback)). Pi model config
+  and Pi provider/model refs never apply. `thinking` maps to `--effort` and
+  accepts `low`, `medium`, `high`, `xhigh`, or `max`; omit it for the native
+  default.
 - Claude uses the role body through `--append-system-prompt` or
-  `--system-prompt` when `system-prompt` is set, otherwise in the task wrapper.
+  `--system-prompt` when `system-prompt` is set, otherwise in the first turn.
   Kiro always places it in the owned profile prompt; `system-prompt: replace`
   is rejected.
 - Prerequisites: `claude` or `kiro-cli` 2.24.x on `PATH`, and `python3`
-  (the lifecycle hooks use `fcntl`).
+  (the lifecycle hooks use `fcntl`; the delegation bridge is a stdio MCP
+  server in Python).
 
-Rejected before any pane, workspace, or worktree is created, with an actionable
-error: persistent specialists, `interactive: true` (role or per call),
-`fork`/`lineage-only` session modes (including
-`fork: true`), Pi skills, `spawning: true` or any subagent/worktree tool, Pi
-child tools (`caller_ping`, `subagent_done`), `task:<category>` models and
-comma-separated fallback lists, and unsupported thinking levels. Native
-children also reject `subagent_interrupt`, and `subagent_resume` rejects their
-session markers; spawn a new subagent for further work. `deny-tools` has no
-effect because the native tool set is exactly the mapped allowlist.
+### Native modes
+
+| Mode | Role frontmatter | Behavior |
+| --- | --- | --- |
+| Autonomous | `auto-exit: true` | After the last tagged turn's correlated `Stop`, the parent types `/exit` (Claude) or `/quit` (Kiro). Human input fails the run closed. |
+| Interactive | no `auto-exit` | The parent never types an exit command. A human may type in the pane; human-driven turns are counted and disclosed in the result, never presented as the orchestrator's result. The result is delivered once, when the human quits. It succeeds only if every tagged turn completed. Stall notices do not wake the parent. |
+| Persistent | `persistent: true` | A [persistent specialist](#persistent-specialists) with native tasks. Human input fails closed. |
+
+Parent input (follow-ups, tasks, nested results, exit commands) is typed only at
+a *verified idle point*: the latest tagged turn's correlated `Stop`/`StopFailure`
+receipt, or in interactive sessions a completed human-driven turn. It is never
+typed while a typed turn awaits acknowledgement, and never into a busy TUI or a
+dialog. Typed text is flattened to one line of at most 8 KiB with terminal
+control characters removed. A typed turn not acknowledged within 30 seconds is
+never retyped. Autonomous and persistent runs fail closed. An interactive
+session records the turn as `unacknowledged` (a human may have been typing)
+and suspends further parent input.
+
+### Follow-ups
+
+`subagent_send({ id|name, message })` to a running non-persistent native child
+queues one follow-up (at most 4 pending) and returns `queued`. It is typed as a
+new tagged turn at the next verified idle point, exactly once. The final result
+lists every tagged turn and its outcome (`completed`, `failed`, `interrupted`,
+`superseded`, `unacknowledged`, `not-delivered`), and its summary is the last
+completed turn's. An autonomous run that ends a turn in failure types no queued
+follow-up; those are `not-delivered`. Pi-backed non-persistent children still
+reject `subagent_send`.
+
+### Native resume
+
+Every fresh native run writes a v2 marker with its complete loadout and a
+SHA-256 integrity hash. The loadout covers tools and their native mapping,
+model, thinking, prompt mode, role-identity hash (identity text in a 0600
+file), mode, session mode, skills, nested-spawn allowlist, Kiro agent name,
+lineage, and worktree binding.
+`subagent_resume({ sessionPath: <marker>, message, name? })` replays exactly
+that loadout, including its recorded mode: it never reads the current role and
+cannot widen or narrow anything. An `autoExit` that disagrees with the recorded
+mode (for example `autoExit: false` for an autonomous session) is rejected
+before launch; one that restates it is accepted. Claude reopens
+the same UUID with `--resume`. Kiro exclusively recreates the saved agent
+profile name and passes `--resume-id`. Hooks fail the run closed if the native
+session identity changes.
+
+An exclusive session lease (`<marker>.lease`) binds a session to the one run
+driving it. Leases are durable files naming the run's receipt and owner token,
+so any later parent process can check them. A lease is released only after
+that run's exit is confirmed, including every owned descendant process. A
+second resume, including one from another parent process after a crash, is
+refused while an owned process may still run. A stale lease is reclaimed only
+with confirmed exit evidence. Refused resumes launch nothing. They include
+tampered or v1 markers, a changed skill snapshot or role identity file,
+persistent specialists, missing native identity, unconfirmed exits, a mode
+change, and a missing working directory. The role identity text is read once
+at launch and must match its recorded hash, so the text that launches is
+exactly the text verified.
+
+A native run in a managed worktree also holds a durable worktree lease
+(`<manifest>.native-lease`) for its lifetime. The lease also records a
+reservation by the launching parent (PID, kernel start time, and a random
+token). While that exact parent lives, the lease stays held even between
+fallback attempts. Once the parent is provably gone, only the run's own exit
+evidence matters. Without `/proc` the parent's identity cannot be proven, so
+a live reservation stays held (fail closed). A worktree-bound session resumes
+in a new ordinary pane at the retained worktree. It requires the same path,
+branch, and workspace, a manifest not marked removed, no live or unconfirmed
+in-memory holder, and no durable worktree lease whose run may still be alive
+(for example one left by a crashed parent). It holds the worktree lease until
+its exit is confirmed. Git state is reported again on completion and the
+manifest is updated. The workspace itself is never recreated, moved, or
+removed.
+
+### Fork and lineage
+
+`session-mode: lineage-only` records the parent session in the loadout and
+transfers no turns. `fork` (or `fork: true`) transfers a bounded (32 KiB) text
+rendering of the parent's compaction-aware active branch, up to but excluding
+the user turn that requested the child. It includes user and assistant text,
+compaction and branch summaries, and tool-call names. Tool results, tool
+arguments, hidden reasoning, and images are omitted; when the bound is
+exceeded, the oldest messages are dropped and counted. The rendering is placed
+in the first tagged turn inside an unguessable boundary marked as untrusted
+reference data, and recorded as a 0600 `inherited-context.md` artifact whose
+hash is in the loadout. No native history is fabricated.
+
+### Skills
+
+`skills` names installed Pi skills (from the parent's skill discovery). Each is
+embedded in the first turn as a Pi-format `<skill>` block. A skill with
+supporting files is first copied into a private, content-addressed snapshot
+(`artifacts/<session-id>/native-skills/<sha256>/`, read-only files). The
+block then points only at that snapshot, never at the live installation. The
+snapshot hash is bound into the loadout. Resume fails closed, both when it is
+requested and again immediately before launch, if the snapshot no longer holds
+exactly those bytes. It also fails closed if the snapshot or its root is a
+symbolic link or not a real directory, lies outside the session's own artifact
+directory, or holds a symbolic link, hard link, or special file at any depth.
+Files are read without following links. Every directory and file read is
+pinned by inode, metadata, and content, and all of them are rechecked after the
+walk, so replacing or editing any nested entry during verification fails
+closed. Later edits to the installed skill never reach the resumed session. A
+skill is rejected before launch, never truncated, when:
+
+- it exceeds 24 KiB (48 KiB total) or declares `allowed-tools`/`tools` the
+  role lacks;
+- its supporting files exceed 256 KiB (512 KiB total), 200 files, or 4 levels;
+- it contains symbolic links or special files;
+- it has supporting files and the role lacks `read`, or ships scripts and the
+  role lacks `bash`.
+
+Instructions that assume Pi-only tools (for example `subagent` or
+`caller_ping`) cannot be detected; those tools do not exist natively.
+
+### Native models and fallback
+
+Candidates are ordered native model IDs; `null` (no `model`) means the CLI
+default. Values that name a model in Pi's provider/model registry are rejected.
+A later candidate is tried only with positive evidence that the failed attempt
+did no task work. Its exit must be confirmed, including every owned
+descendant. The run's own correlated session-start hook receipt must prove
+its hooks were active, with no prompt-submit receipt, human turn, or hook
+error ever recorded.
+
+These are never retried, because the turn started or nothing proves it did
+not:
+
+- a completed result, even a negative one;
+- a correlated Claude `StopFailure` (it follows an active turn that may have
+  used tools);
+- an interrupted or superseded turn;
+- an exit after the prompt was submitted;
+- an exit before any hook receipt.
+
+Persistent specialists use only the first candidate. A managed worktree is
+reused for the next attempt, in its retained root pane, only under the same
+evidence and when the checkout is verifiably pristine (clean, no untracked
+files, head at the base). The durable worktree lease is never absent between
+attempts. The launching parent reserves it, and it is handed from each attempt
+to the next by an atomic replace. It is released only after the final
+attempt's exit is confirmed. A parent shutdown between attempts, or while an
+attempt waits for its shell, launches no further process. If a later
+attempt's watcher fails, that attempt's own exit is re-checked before its
+leases are released. If a later attempt fails after dispatch with an
+unconfirmed exit, the result is about that attempt: its marker, session,
+model, and pane are primary and recovery targets it, while earlier attempts
+appear only in the history. Results list `Models attempted` and raw
+per-attempt errors with each attempt's marker.
+
+### Nested delegation
+
+A native role may delegate only through an explicit allowlist:
+
+```yaml
+spawn-agents: scout, reviewer
+```
+
+`spawning: true` without `spawn-agents` is rejected, as are Pi orchestration
+tools in `tools`. The child receives one owned stdio MCP server (`pi-subagents`)
+with a single `subagent` tool (`agent`, `name`, `task`). Each call writes an
+HMAC-signed request into the run's private directory. The parent atomically
+claims it and verifies the run, nonce freshness, age, and that the sender PID
+carries the run's owner token. It then launches the role only when it is on
+the allowlist, has an explicit `tools` allowlist within the requester's own
+tools, is `auto-exit: true`, and is not persistent. The launch is a standalone
+ordinary-pane leaf in the requester's cwd with every spawning tool denied.
+Limits are 4 concurrent and 16 total per run. The nested result
+returns to the requester as one correlated follow-up turn marked as untrusted
+data; an autonomous requester does not exit while results are owed. If the
+requester has ended, the parent receives the result instead. Delegation needs
+Linux `/proc` and is not available to persistent specialists. The bridge
+resists stale, replayed, misdirected, and sibling requests, but not a malicious
+same-user process that reads the run's 0600 files.
+
+### Still rejected
+
+Rejected before any pane, workspace, or worktree is created: Pi child tools
+(`caller_ping`, `subagent_done`) and Pi orchestration tools in `tools`;
+unmappable tools; `cli-model`; unknown `cli` values; unsupported thinking
+levels; `system-prompt: replace` for Kiro; `spawning: true` without
+`spawn-agents`; delegation by persistent specialists or without `/proc`;
+unknown task categories or missing native candidates; Pi provider/model refs;
+uninstalled or non-portable skills; fork without a persisted parent session;
+and initial prompts over 120 KiB. `deny-tools` has no effect because the native
+tool set is exactly the mapped allowlist.
+
+### Receipts, ownership, and cleanup
 
 Each launch owns exclusively created per-run files under the parent session's
 `artifacts/<session-id>/native-runs/<id>/`: hook configuration, correlated turn
-state, and a durable process receipt written by the launch wrapper. The task is
-tagged with a per-turn token. Completion requires the tagged turn's
-native-session-correlated `Stop` hook receipt plus a clean process exit after the
-parent sends `/exit` (Claude) or `/quit` (Kiro). Herdr idle/done status and
-terminal text never establish success. Untagged or superseding human input,
-a hook error, an acknowledgement timeout, or an exit without the correlated
-receipt fails closed; the parent then terminates only processes it can prove it
-owns and reports the failure. The native final summary is delivered through
-the normal bounded result path, with the native session ID and an explicit
-`artifacts/<session-id>/native-sessions/<id>.json` marker/loadout artifact in
-place of a Pi transcript.
+state, a durable process receipt written by the launch wrapper, and, when
+delegation is granted, the bridge configuration and request directories.
+Completion requires every tagged turn's native-session-correlated receipt plus
+a clean process exit after the graceful exit command (autonomous) or the
+human's exit (interactive). Untagged input in a non-interactive run, a hook
+error, an acknowledgement timeout, or an exit without the correlated receipt
+fails closed. The parent then terminates only processes it can prove it owns
+and reports the failure. Results cite the native session ID, the turn outcomes,
+and the `artifacts/<session-id>/native-sessions/<id>.json` marker in place of a
+Pi transcript.
 
 Process ownership is bound to an unguessable per-run token, not a PID. The
 launch wrapper re-executes itself with the token in its environment, records it
@@ -1090,18 +1295,83 @@ cannot be verified (for example macOS, or an unreadable process), nothing is
 signalled. Same-user processes whose environment is unreadable are disclosed as
 incomplete scan coverage, following the worktree cleanup visibility policy.
 
-Owned files are removed, and worktree Git state captured, only after process
-exit is confirmed: the wrapper recorded its exit, or a complete owned-process
-scan found nothing. Otherwise (termination refused or not observed within the
-grace period, a lost receipt with survivors, or parent shutdown while the child
-runs) the result reports `processExit: "unconfirmed"` with a warning and the
-run is treated as failed. Its pane, Kiro profile, native run files, and
-worktree are retained; the worktree manifest records `processExit:
-"unconfirmed"` without a Git snapshot, and `worktree_remove` treats the
-worktree as held by a live child until exit is later confirmed, at which point
-the owned files are released. Parent shutdown does not terminate native
-children. Launch scripts embed task text and are staged `0600` in `0700`
-directories created for them.
+Owned files are removed, leases released, and worktree Git state captured only
+after process exit is confirmed. Confirmation means either the wrapper recorded
+its exit and no owned descendant carrying the token survives, or a complete
+owned-process scan found nothing. In both cases, no same-user process related
+to the run may remain unproven. A related process is a descendant of an owned
+process, or a member of the wrapper's process group, which orphaned
+descendants keep. It is unproven when its environment is unreadable or lacks
+the token (for example a scrubbed environment). Unreadable unrelated processes
+are only disclosed. A descendant that outlives the CLI (for example a
+background command a tool started) is given a short grace period, then keeps
+the run unresolved; it is never signalled on a normal exit. A wrapper's exit
+receipt alone never confirms exit.
+
+Otherwise the result reports `processExit: "unconfirmed"` with a warning and
+the run is treated as failed. This covers termination refused or not observed
+within the grace period, a lost receipt with survivors, live descendants,
+parent shutdown while the child runs, and a launch that fails after its script
+was dispatched. Its pane, Kiro profile, native run files, session and worktree
+leases, and worktree are retained. The worktree manifest records
+`processExit: "unconfirmed"` without a Git snapshot. `worktree_remove` treats
+the worktree as held, through the in-memory holder and the durable native
+lease, until exit is later confirmed; then the owned files and leases are
+released. Parent shutdown does not terminate native children. Launch scripts
+embed task text and are staged `0600` in `0700` directories created for them.
+A parent shutdown or a cancelled `subagent`/`subagent_resume` call, while a
+native launch still waits for its shell, stops the launch before its process
+is dispatched. The never-started run's files and leases, and a pane that launch
+created, are then released; a managed worktree is retained and marked failed.
+
+Linux scans `/proc` (environments, parent PIDs, and process groups). macOS
+lists same-user processes with their parent PID, process group, and
+environment (`ps -E`). It trusts the listing only when it shows this parent's
+own environment. Any process whose command or environment carries the owner
+token, and any unproven related process, keeps the run unresolved. A listed
+process with an unknown parent or group and an unreadable environment counts
+as related. That listing only proves processes present or absent and never
+authorizes a signal, so macOS never signals native processes. Where `ps` does
+not show environments, no native exit can be confirmed: every native run stays
+unresolved, and its leases and worktree stay held. On either platform, a
+descendant that leaves both the run's process tree and its process group (for
+example with `setsid`) and also hides or scrubs its environment cannot be
+detected.
+
+A persistent specialist's settled task is delivered to the parent exactly
+once. Every settlement is queued once per task ID before any delivery attempt,
+including a `Stop` written just before the CLI exits, which the final outcome
+settles. It is also appended to a private `<marker>.settled.jsonl` record.
+Delivery sends only tasks this parent settled from correlated receipts and
+never reads that record, so a line another process writes there is never
+delivered. If the parent send fails (for example across `/reload`), the task
+stays owed and the specialist stays busy (`rejected-busy`) until a retry
+succeeds. The durable delivery ledger and an in-memory record prevent
+duplicates. An unreadable ledger proves nothing, so owed results stay pending
+and retryable, and the in-memory record still prevents duplicates. A task
+whose dispatch cannot be recorded is withdrawn before it is typed, and
+`subagent_send` reports that nothing was dispatched. After the process ends,
+owed results are retried for up to two minutes before the stop or exit notice
+is sent; any still undelivered are included in that notice. A notice that
+fails to send is retried until the same deadline. A specialist that exits
+without a stop request is reported as having exited, with the number of results
+delivered before the notice and the reason the run ended.
+
+A native specialist's first task is recorded before its process exists. The
+ledger is checked for writability before any pane, worktree, or run is
+created, so an unwritable ledger launches nothing. A `planned` record is
+written just before the process is dispatched and is committed as
+`dispatched` right after. A launch that fails before dispatch is recorded as
+`abandoned`, so it never appears as an active task. If the commit itself
+fails, the live specialist is still registered and supervised and the
+acknowledgement carries a warning; it is never left untracked. A plan left
+behind by a parent crash is resolved at the next session start. The run's
+cancel marker is written first, so a wrapper that has not started can never
+start its CLI. A run without a start receipt is then `abandoned`, and one
+with a receipt is `dispatched`. Launches still in flight, unresolved, or
+supervised in the current process, including across `/reload`, are never
+touched. A Pi-backed specialist whose first dispatch cannot be recorded is
+likewise kept supervised, with a warning.
 
 Kiro receives a transient `.kiro/agents/pi-subagent-<uuid>.json` profile in the
 child's working directory (the worktree root for worktree runs). It is created
@@ -1110,15 +1380,21 @@ exclusively, never overwrites existing configuration, lists only regular
 after the run only while its content is unchanged; directories are removed only
 when this run created them and they are empty. The profile is removed before
 worktree state is captured, so it does not appear as an untracked handoff file.
+A resume recreates the same profile name; if a modified profile with that name
+was retained, the resume fails closed.
 
 Limitations: Claude Code may show a first-run workspace-trust dialog for a new
 directory, including a new worktree; the parent never answers it, and the run
 fails after 120 seconds without acknowledgement. Native session persistence
-depends on the graceful exit command. Kiro V3 is unsupported.
+depends on the CLI: an interrupted autonomous run is usually ended by verified
+termination (Claude fires no hook for a user interrupt), so its resume depends
+on what the CLI saved. The interrupt key is Escape for both CLIs; if Kiro
+ignores it, the turn keeps running but is still recorded as interrupted, and an
+autonomous run is terminated after the grace period. Kiro V3 is unsupported.
 
 ## Tool Access Control
 
-Without a restrictive `tools` allowlist or spawning policy, a sub-agent can spawn further sub-agents. Control this with frontmatter:
+Without a restrictive `tools` allowlist or spawning policy, a sub-agent can spawn further sub-agents. Control this with frontmatter. Native `cli: claude|kiro` roles never receive Pi tools; they delegate only through an explicit `spawn-agents` allowlist, within their own tool ceiling (see [Nested delegation](#nested-delegation)):
 
 ### `spawning: false`
 

@@ -24,6 +24,13 @@ v1; a same-name spawn is a new specialist with a fresh ledger.
 
 ## Consequences
 
+Native (`cli: claude|kiro`) specialists follow the same rules (ADR-0013):
+their policy hash is the native loadout hash, a dispatched task is typed once
+at a verified idle point, and stop types the graceful exit only there. Their
+first task is recorded as `planned` before the process is dispatched and
+committed as `dispatched` after it (or `abandoned` if it never started), so a
+ledger failure never leaves a live, untracked specialist.
+
 Evidence and policy sidecars remain after stop or crash. Automatic context relay
 will add unbounded successful generation rotations in a follow-up issue; it is
 not part of v1.

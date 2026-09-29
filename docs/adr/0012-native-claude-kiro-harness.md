@@ -1,6 +1,6 @@
 # ADR-0012: Add first-stage native Claude Code and Kiro harnesses
 
-- **Status:** Accepted
+- **Status:** Accepted; partially superseded by ADR-0013
 - **Date:** 2026-09-29
 - **Scope:** `zhengfran/pi-herdr-agents` fork
 - **Supersedes in part:** ADR-0008's rejection of every `cli` role
@@ -17,6 +17,8 @@ pane or an explicitly requested managed worktree. Persistent specialists,
 fork/lineage session modes, Pi skills, nested spawning, Pi child tools,
 task-category or Pi fallback model semantics, native resume, native
 interrupt, and running follow-up are rejected before resources exist.
+ADR-0013 later defines native meanings for all of these except Pi child tools
+(`caller_ping`, `subagent_done`), which remain rejected.
 
 A small harness seam (`native-harness.ts`) owns only what varies: capability
 validation and strict tool mapping, per-run exclusively created hook and state

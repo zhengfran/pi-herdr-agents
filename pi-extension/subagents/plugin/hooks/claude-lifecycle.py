@@ -4,8 +4,9 @@
 # HazAT and contributors), pi-extension/subagents/plugin/hooks/.
 """Claude Code hooks: locked, atomic, native-session/turn-correlated receipts.
 
-The TUI stays interactive. Only a Stop for the expected launch session after
-one tagged UserPromptSubmit can complete the parent watcher. No screen text,
+The TUI stays interactive. Only a Stop for the expected launched/resumed
+session after a tagged UserPromptSubmit settles a parent turn. Untagged
+(human-driven) turns are counted and disclosed separately. No screen text,
 stale Stop, transcript guess or 'latest session in cwd' is ever a result.
 Never write stdout: UserPromptSubmit/SessionStart stdout becomes model context.
 """
@@ -18,6 +19,7 @@ import tempfile
 
 UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 TOKEN = re.compile(r"^\[pi-subagent-turn:([0-9a-f-]{36})\](?:\s|$)")
+MAX_SUMMARY = 16000
 
 
 def atomic(path, value):
@@ -76,7 +78,11 @@ def main(config):
             elif state["phase"] != "active":
                 return  # duplicate/late Stop without a submitted turn
             elif not state["token"]:
-                state = {**state, "phase": "untracked"}
+                # A human-driven turn: disclosed separately, never a task result.
+                state = {**state, "phase": "untracked",
+                         "untracked_turns": state.get("untracked_turns", 0) + 1,
+                         "untracked_summary": summary.strip()[:MAX_SUMMARY]
+                         if isinstance(summary, str) and summary.strip() else None}
             else:
                 if isinstance(summary, str) and summary.strip():
                     state = {**state, "phase": "stopped", "summary": summary.strip()}
@@ -86,7 +92,9 @@ def main(config):
             if state["phase"] != "active":
                 return
             if not state["token"]:
-                state = {**state, "phase": "untracked"}
+                state = {**state, "phase": "untracked",
+                         "untracked_turns": state.get("untracked_turns", 0) + 1,
+                         "untracked_summary": None}
             else:
                 details = event.get("error_details")
                 error = str(event.get("error") or "unknown")

@@ -3,8 +3,10 @@
 """Offline Kiro CLI 2.24 stand-in for native launch tests; never contacts a model.
 
 Adapted from zhengfran/pi-interactive-subagents test/fixtures/kiro-cli.py
-(MIT). It fires the owned profile hooks, then waits for the parent's graceful
-/quit on stdin. FAKE_NATIVE_MODE selects failures.
+(MIT). It fires the owned profile hooks, then reads parent input lines from
+stdin: tagged follow-ups start new turns, `HUMAN x` models a human-typed
+prompt, `ESC` models an interrupt key, and `/quit` exits.
+FAKE_NATIVE_MODE selects failures.
 """
 import json
 import os
@@ -22,34 +24,102 @@ if args[:3] == ["agent", "validate", "--path"]:
     sys.exit(0)
 
 mode = os.environ.get("FAKE_NATIVE_MODE", "ok")
+log = os.environ["FAKE_NATIVE_LOG"]
 if mode == "ignore-term":
     # Model a native process that survives termination: exit stays unconfirmed.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 assert args[:2] == ["chat", "--v2"]
-assert "--trust-all-tools" in args and "--resume-id" not in args
+assert "--trust-all-tools" in args
 name = args[args.index("--agent") + 1]
 profile = json.loads((pathlib.Path(".kiro/agents") / (name + ".json")).read_text())
 assert profile["allowedTools"] == []
-assert profile["includeMcpJson"] is False and profile["mcpServers"] == {}
-pathlib.Path(os.environ["FAKE_NATIVE_LOG"]).write_text(
-    json.dumps({"harness": "kiro", "args": args, "cwd": os.getcwd(), "profile": profile})
+assert profile["includeMcpJson"] is False
+assert profile["mcpServers"] == {} or list(profile["mcpServers"]) == ["pi-subagents"]
+resumed = "--resume-id" in args
+pathlib.Path(log).write_text(
+    json.dumps({"harness": "kiro", "args": args, "cwd": os.getcwd(), "profile": profile,
+                "resumed": resumed})
 )
-sid = "11111111-1111-4111-8111-111111111111"
-prompt = args[-1] if mode not in ("untagged", "ignore-term") else "human typed this"
-events = [("agentSpawn", {}), ("userPromptSubmit", {"prompt": prompt})]
-if mode not in ("no-stop", "hang"):
-    events.append(("stop", {"assistant_response": "Kiro fixture result"}))
-for kind, extra in events:
+model = args[args.index("--model") + 1] if "--model" in args else None
+failing = os.environ.get("FAKE_FAIL_MODEL", "").split(",")
+if mode in ("exit-before-ack", "exit-before-hooks"):
+    sys.exit(1)  # no receipt at all: never positive evidence of no work
+if model and model == os.environ.get("FAKE_STOP_FAILURE_MODEL"):
+    mode = "stop-failure"
+reject_model = bool(model and model in failing)
+sid = args[args.index("--resume-id") + 1] if resumed else "11111111-1111-4111-8111-111111111111"
+
+
+def event(line):
+    with open(log + ".events", "a", encoding="utf8") as stream:
+        stream.write(json.dumps(line) + "\n")
+
+
+def fire(kind, **extra):
     payload = {"hook_event_name": kind, "cwd": os.getcwd(), "session_id": sid, **extra}
     for hook in profile["hooks"][kind]:
         result = subprocess.run(hook["command"], shell=True, input=json.dumps(payload),
                                 text=True, capture_output=True)
         assert result.stdout == ""
 
+
+def mcp_delegate(agent):
+    server = profile["mcpServers"]["pi-subagents"]
+    proc = subprocess.Popen([server["command"], *server["args"]], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
+
+    def rpc(mid, method, params):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": method,
+                                     "params": params}) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    rpc(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                          "clientInfo": {"name": "fixture", "version": "1"}})
+    listed = rpc(2, "tools/list", {})
+    called = rpc(3, "tools/call", {"name": "subagent", "arguments": {
+        "agent": agent, "name": "probe", "task": "Inspect the bridge"}})
+    proc.stdin.close()
+    proc.wait()
+    event({"mcp": {"tools": listed["result"]["tools"], "call": called["result"]}})
+
+
+if mode == "spawn" and not profile["mcpServers"]:
+    mode = "ok"  # a nested leaf has no bridge and cannot delegate
+prompt = args[-1] if mode not in ("untagged", "ignore-term") else "human typed this"
+fire("agentSpawn")
+if reject_model:
+    sys.exit(1)  # session receipt proves hooks ran; the prompt was never submitted
+fire("userPromptSubmit", prompt=prompt)
+if mode == "spawn":
+    mcp_delegate(os.environ.get("FAKE_SPAWN_AGENT", "scout"))
+    fire("stop", assistant_response="Delegated to a nested subagent")
+elif mode == "stop-failure":
+    sys.exit(2)
+elif mode not in ("no-stop", "hang", "hang-turn"):
+    fire("stop", assistant_response="Kiro fixture result")
+
 if mode == "no-stop":
     sys.exit(0)
 if mode in ("hang", "ignore-term"):
     while True:
         signal.pause()
-line = sys.stdin.readline().strip()
-sys.exit(0 if line == "/quit" else 3)
+turn = 1
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    event({"input": line})
+    if line == "/quit":
+        sys.exit(0)
+    if line == "ESC":
+        continue
+    if line.startswith("HUMAN "):
+        fire("userPromptSubmit", prompt=line[len("HUMAN "):])
+        fire("stop", assistant_response="Human-driven answer")
+        continue
+    if line.startswith("[pi-subagent-turn:"):
+        turn += 1
+        fire("userPromptSubmit", prompt=line)
+        if os.environ.get("FAKE_FOLLOW_UP") != "hang":
+            fire("stop", assistant_response="Kiro follow-up result %d" % turn)
+        continue
+sys.exit(3)

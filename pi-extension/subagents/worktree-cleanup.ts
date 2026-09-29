@@ -17,6 +17,7 @@ import {
 	type HerdrWorktreeInfo,
 } from "./herdr.ts";
 import { readWorktreeManifest, writeWorktreeManifest } from "./launch.ts";
+import { inspectRunLease, nativeWorktreeLeaseFile } from "./native-session.ts";
 import { isString, type JsonObject } from "./type-guards.ts";
 
 export interface CleanupGitState {
@@ -659,7 +660,22 @@ function processHolders(
 	return { blockers, warnings };
 }
 
-export const __worktreeCleanupTest__ = { processHolders };
+/**
+ * Durable native worktree leases survive parent crashes that clear the
+ * in-memory holder list: a lease whose run is not provably gone blocks.
+ */
+function nativeLeaseBlockers(entry: WorktreeInventoryEntry): string[] {
+	return entry.manifest.flatMap(({ file }) => {
+		const lease = inspectRunLease(nativeWorktreeLeaseFile(file));
+		if (lease.kind === "held")
+			return [`Native run lease holds the worktree: ${lease.reason}`];
+		if (lease.kind === "invalid")
+			return [`Native run lease is unreadable: ${lease.reason}`];
+		return [];
+	});
+}
+
+export const __worktreeCleanupTest__ = { processHolders, nativeLeaseBlockers };
 
 export function createWorktreeCleanupOperations(input: {
 	manifestDir: string;
@@ -698,6 +714,7 @@ export function createWorktreeCleanupOperations(input: {
 						? "Persistent-specialist lease holds the worktree"
 						: "Live child holds the worktree",
 				);
+			blockers.push(...nativeLeaseBlockers(entry));
 			const idleShellPids = new Set<number>();
 			if (entry.workspaceId) {
 				const panes = await listHerdrPanes(CLEANUP_TIMEOUT_MS);

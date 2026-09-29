@@ -4,7 +4,7 @@ These instructions apply to humans and coding agents changing `pi-herdr-agents`.
 
 ## What this package is
 
-`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` for fresh autonomous runs; unknown CLIs and unsupported native capabilities fail before Herdr creates resources.
+`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` in autonomous, interactive, or persistent mode, with exact-loadout resume, queued follow-ups, verified interrupts, fork/lineage context, Pi skills, native model fallback, and allowlisted nested delegation (ADR-0013). Unknown CLIs and unrepresentable native capabilities fail before Herdr creates resources.
 
 The extension is fire-and-forget: `subagent` returns an acknowledgement, and completion is delivered to the parent automatically. Never add polling guidance that tells callers to sleep, tail sessions, or repeatedly check status.
 
@@ -28,12 +28,16 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `pi-extension/subagents/wake.ts`, `supervision.ts`, `supervision-config.ts` — file wake-ups, shared pane reconciliation, polling fallback, and supervision configuration
 - `pi-extension/subagents/persistent-config.ts` — strict persistent-specialist cap configuration
 - `pi-extension/subagents/completion.ts`, `session.ts`, `subagent-done.ts` — child completion, transcript handling, `caller_ping`, and `subagent_done`
-- `pi-extension/subagents/native-harness.ts`, `claude.ts`, `kiro.ts`, `process-run.ts`, `plugin/hooks/` — native `cli: claude|kiro` capability validation, owned hook/state files, correlated completion, and durable process receipts (ported from zhengfran/pi-interactive-subagents, MIT)
+- `pi-extension/subagents/native-harness.ts`, `claude.ts`, `kiro.ts`, `process-run.ts`, `plugin/hooks/` — native `cli: claude|kiro` capability validation, pre-resource launch planning, owned hook/state files, correlated completion, and durable process receipts (ported from zhengfran/pi-interactive-subagents, MIT)
+- `pi-extension/subagents/native-turns.ts` — harness-neutral tagged-turn driver: verified idle points, follow-up queue, interrupts, interactive/persistent/autonomous exit policy
+- `pi-extension/subagents/native-session.ts` — v2 native session markers, loadout integrity, and the exclusive native session lease
+- `pi-extension/subagents/native-context.ts` — typed-input sanitization, bounded untrusted fork context, and materialized Pi skills
+- `pi-extension/subagents/native-bridge.ts`, `plugin/mcp/subagent-bridge.py` — authenticated nested-spawn bridge (signed requests, owner-token sender check) for `spawn-agents` roles
 - `CONTEXT.md` — orchestration-domain glossary
 - `docs/adr/` — hard-to-reverse architectural decisions
 - `docs/research/` — evidence and alternatives, never the shipped contract
 - `test/test.ts` — unit tests for public subagent extension seams
-- `test/native-harness.test.ts` — native harness unit tests using offline `test/fixtures/native-bin/` CLI stand-ins
+- `test/native-harness.test.ts`, `test/native-stage2.test.ts`, `test/native-flows.test.ts`, `test/native-regressions.test.ts` — native harness unit, end-to-end, and review-regression tests using offline `test/fixtures/native-bin/` CLI stand-ins, `test/native-fixtures.ts`, and `test/native-flow-harness.ts` (flows run through the extension's tool handlers with a fake Herdr test seam)
 - `test/package-skill.test.js` — bundled skill and package manifest contract test
 - `test/integration/` — real Herdr and Pi lifecycle tests using the deterministic provider by default
 - `test/bench/supervision-bench.mjs` — manual isolated-Herdr supervision transport benchmark; raw samples stay in `/tmp/issue29-bench/`
@@ -52,6 +56,7 @@ Preserve these invariants when changing worktree behavior:
 8. Completion reports reviewable Git state; inspection failures are unknown, never guessed clean or conflict-free.
 9. The extension does not push, create PRs, merge, cherry-pick, switch the parent checkout, or remove worktrees automatically. Explicit parent-owned cleanup uses cwd containment and fail-closed eligibility; branches are never deleted.
 10. Ordinary non-worktree subagent behavior remains unchanged.
+11. A managed worktree is reused across native model fallback attempts only with positive evidence that the failed attempt never started its first turn (confirmed exit including descendants, a correlated session receipt with no prompt-submit receipt or hook error) and a pristine checkout; its durable lease stays parent-reserved across attempts, is handed to each attempt atomically, and is released only after the final attempt's confirmed exit. Native runs hold a durable `<manifest>.native-lease` that cleanup and resume honour after parent crashes.
 
 Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing any of these semantics.
 
@@ -62,7 +67,8 @@ Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing 
 - Keep overlapping or dependent writing tasks sequential unless the dependency is committed and used as the next exact base.
 - Tell worktree workers whether to commit. A good default is: edit, test, commit, report the SHA, and do not push/merge/remove.
 - The parent owns review, integration, publication, and cleanup.
-- Do not use `subagent_resume` as if it reattached worktree ownership; v1 resumes into an ordinary pane.
+- Do not use `subagent_resume` as if it reattached worktree ownership; v1 resumes into an ordinary pane. A worktree-bound native marker resumes in an ordinary pane at the verified retained checkout and holds only its lease, never workspace ownership.
+- Native (`cli: claude|kiro`) follow-ups go through `subagent_send` and are typed only at verified idle points; never type into a native pane yourself on the parent's behalf. Native resume replays the recorded loadout and cannot widen it.
 
 ## Documentation synchronization
 
@@ -94,7 +100,7 @@ git diff --check
 
 Run LSP diagnostics on every changed TypeScript file; lint and tests do not catch every TypeScript error.
 
-For Herdr or lifecycle changes, run the deterministic suite from inside Herdr. Run only one integration suite at a time on a Herdr instance; concurrent suites compete for terminal focus and process capacity and can cause false timeouts or leaked test resources.
+For Herdr or lifecycle changes, run the deterministic suite from inside Herdr. `test/integration/native-harness.test.ts` drives the offline native fixtures through real Herdr panes; it needs no Claude or Kiro credentials and never contacts a model. Run only one integration suite at a time on a Herdr instance; concurrent suites compete for terminal focus and process capacity and can cause false timeouts or leaked test resources.
 
 When a test reports that a `pi-integ-*` worktree path already exists, first check whether the same test already created that worktree and the deterministic provider dispatched the tool twice after asynchronous completion. Deterministic providers must make each requested tool call one-shot after its started result appears. Remove only verified test-owned residue after confirming that no workspace or process owns it.
 

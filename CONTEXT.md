@@ -26,23 +26,118 @@ _Avoid_: Hang verdict, automatic recovery, stall replacement
 
 **Native harness role**:
 A role definition with `cli: claude` or `cli: kiro` whose child runs the native
-CLI in its Herdr pane or managed worktree instead of Pi. Only fresh autonomous
-runs are supported; success requires correlated native turn evidence plus
-process exit, and the result is delivered through the normal child result path.
+CLI in its Herdr pane or managed worktree instead of Pi. It runs in one native
+mode: autonomous (`auto-exit: true`), interactive, or persistent. Success
+requires correlated native turn evidence plus process exit, and the result is
+delivered through the normal child result path.
 _Avoid_: Screen-scraped completion, fake Pi transcript, Pi model routing
 
+**Tagged turn**:
+One orchestrator-submitted native prompt carrying its own
+`[pi-subagent-turn:<token>]` tag. Only that token's correlated `Stop` or
+`StopFailure` hook receipt settles it as completed or failed. An interrupt,
+supersession, missing acknowledgement, or undelivered follow-up settles it
+without success.
+_Avoid_: Latest assistant text, Herdr idle status, human turn
+
+**Verified idle point**:
+The moment a native TUI provably accepts input: the latest tagged turn's
+correlated `Stop`/`StopFailure` receipt, or in interactive sessions a completed
+human-driven turn. The parent types follow-ups, tasks, nested results, and exit
+commands only here, and never while a typed turn awaits acknowledgement.
+_Avoid_: Typing into a busy TUI, answering a dialog, retyping lost input
+
+**Human-driven turn**:
+An untagged native turn started by a person typing into the pane. In
+interactive sessions it is counted and disclosed separately and never presented
+as the orchestrator's result; in autonomous and persistent runs it fails closed.
+_Avoid_: Orchestrator turn, task result
+
+**Native follow-up**:
+A `subagent_send` message queued for a running non-persistent native child
+(limit 4) and typed once as a new tagged turn at the next verified idle point.
+Its outcome is reported in the final result.
+_Avoid_: Persistent task, steer into a busy session
+
+**Native interrupt**:
+An interrupt recorded against the active tagged turn of a verified owned live
+native run before Escape is sent. The turn settles as interrupted, never as a
+success. Without a later verified idle point, autonomous and persistent runs
+are ended by verified termination; interactive sessions stay open.
+_Avoid_: Kill, successful completion, unverified signal
+
 **Unconfirmed native exit**:
-A native run whose owned process cannot be proven gone: no exit receipt and no
-complete owned-process scan showing none remain. It is reported as failed with
-a warning, and its pane, Kiro profile, run files, and worktree lease are
-retained until exit is confirmed.
-_Avoid_: Assumed exit, cleanup on timeout, PID-based ownership
+A native run whose owned processes cannot be proven gone. Either no trusted
+owned-process scan (Linux `/proc`, or a macOS `ps -E` listing that shows the
+parent's own environment) shows none remain, or a token-carrying descendant
+survives, or a same-user process related to the run (a descendant of an owned
+process, or a member of the wrapper's process group) cannot be proven unowned
+because its environment is unreadable or lacks the token. A wrapper exit
+receipt alone never confirms exit. This includes a
+launch that failed after its script was dispatched. It is reported as failed
+with a warning, and its pane, Kiro profile, run files, native session lease,
+and worktree lease are retained until exit is confirmed.
+_Avoid_: Assumed exit, cleanup on timeout, PID-based ownership, wrapper-only exit
 
 **Native session marker**:
-The parent-owned `native-sessions/<id>.json` artifact recording a native child's
-harness, session identity, and loadout. It anchors result references and is not
-a Pi transcript or a resumable session.
-_Avoid_: Transcript, resume handle
+The parent-owned v2 `native-sessions/<id>.json` artifact recording a native
+child's harness, native session identity, cwd, and complete loadout with its
+SHA-256. It anchors result references and native resume; it is not a Pi
+transcript.
+_Avoid_: Transcript, current role definition
+
+**Native loadout**:
+Everything that bounds a native session: tools and their native mapping,
+model, thinking, prompt mode, identity hash, mode, session mode, skills with
+their snapshot hashes, nested-spawn allowlist, Kiro agent name, lineage, and
+worktree binding. Resume replays it exactly, including its mode, and never
+widens or narrows it.
+_Avoid_: Role lookup at resume, per-call override, mode change on resume
+
+**Native session lease**:
+The exclusive, durable `<marker>.lease` file (and for worktree runs the
+`<manifest>.native-lease` worktree lease) naming the one run driving a native
+session or worktree by receipt and owner token. It survives parent crashes and
+is released only after that run's exit, descendants included, is confirmed. A
+worktree lease also carries the launching parent's reservation (PID, start
+time, token), is handed between fallback attempts by an atomic replace, and
+stays held while that parent lives until it releases the lease at final
+settlement. A stale lease is reclaimed only with
+confirmed exit evidence.
+_Avoid_: PID lock, time-based expiry, in-memory-only holder
+
+**Inherited context artifact**:
+The bounded, untrusted text rendering of the parent's active branch that a
+native `fork` child receives in its first tagged turn and that is recorded as a
+0600 artifact. `lineage-only` transfers no turns.
+_Avoid_: Fabricated native history, full transcript copy
+
+**Materialized skill**:
+An installed Pi skill embedded in a native child's first turn as a bounded
+`<skill>` block, only when its declared tools, supporting files, and scripts
+are usable with the role's tools. Supporting files are copied into a private,
+content-addressed, read-only snapshot bound into the loadout; the block never
+points at the live installation. Resume verifies the snapshot at the session's
+own artifact location, rejects linked or non-directory roots and any nested
+symbolic link, hard link, or special file, reads pinned files without
+following links, rechecks every traversed entry's identity and content after
+the walk, and verifies again immediately before launch. Oversized skills are
+rejected, never truncated.
+_Avoid_: Partial skill, live asset reference, Pi-only runtime assumption
+
+**Nested-spawn bridge**:
+The owned stdio MCP server and signed request directory through which a native
+child with a `spawn-agents` allowlist asks the parent to launch leaf children
+within its own tool ceiling. Results return as untrusted-data follow-up turns.
+_Avoid_: Shelling out to Pi, unrestricted delegation
+
+**Native model candidates**:
+Ordered native CLI model IDs for one native launch, from an exact ID, a list,
+or `models.native.<cli>.tasks`. They are never Pi provider/model refs. Fallback
+advances only with positive evidence that the failed attempt never started
+its first turn: a correlated session receipt with no prompt-submit receipt or
+hook error, and a confirmed exit.
+_Avoid_: Pi task shortlist, retrying a completed result, retry after StopFailure
 
 **Unsupported external CLI role**:
 A role definition whose `cli` is neither `claude` nor `kiro`, or that uses the
@@ -84,17 +179,21 @@ output, coverage gaps, or unresolved serious candidates. A child-reported
 _Avoid_: Hidden missing coverage, certified uncertainty
 
 **Persistent specialist**:
-A logical subagent that retains one policy-bound Pi session between sequential
-tasks until it is stopped or crashes.
+A logical subagent that retains one policy-bound Pi or native session between
+sequential tasks until it is stopped or crashes.
 _Avoid_: Immortal process, reusable pane
 
 **Session generation**:
-One concrete Pi session serving a persistent specialist's logical identity.
+One concrete Pi or native session serving a persistent specialist's logical
+identity.
 _Avoid_: Logical specialist, revived session
 
 **Task outcome**:
 The recorded terminal result for one persistent-specialist task, including
 `delivered`, `rejected-busy`, or a stop-pending task's eventual terminal state.
+A native specialist's first task is `planned` before its process is
+dispatched, then `dispatched` once it is, or `abandoned` when its launch
+provably never started; a plan alone is never an active task.
 _Avoid_: Assumed completion, replay candidate
 
 **Delivery ledger**:
@@ -116,8 +215,9 @@ surface or its checkout.
 _Avoid_: Completed agent process, disposable pane, automatic worktree cleanup
 
 **Worktree lease**:
-The lifetime-exclusive binding between a persistent specialist generation and
-one managed worktree, when that specialist writes in a worktree.
+The lifetime-exclusive binding between a live child and one managed worktree:
+a persistent specialist generation, a native run including its fallback
+attempts, or a native resume bound to that retained checkout.
 _Avoid_: Rebindable checkout, shared worktree ownership
 
 **Worktree inventory**:
@@ -171,7 +271,7 @@ candidate plans resolve before launch; ordinary nonpersistent runs can retry
 after launch failure or a running child's provider/agent error, not a completed
 negative task result. Persistent specialists do not advance after a running-child
 error. Worktrees select the first authenticated candidate only, without fallback
-retries. Cross-family independent review requires a reviewer from a different
+retries. Native roles use native model candidates instead. Cross-family independent review requires a reviewer from a different
 model family than the author. For ordinary review, prefer a different
 authenticated model family. When no other authenticated model family is
 available, ordinary review may use a same-family reviewer in a fresh standalone

@@ -2,10 +2,11 @@
 /**
  * Native harness seam for roles declaring `cli: claude` or `cli: kiro`.
  *
- * Only execution varies here: capability validation, native command/hook
- * preparation, correlated turn evidence, process receipts, and owned-file
- * cleanup. Herdr pane/worktree provisioning and parent result delivery stay in
- * the common launch and watch paths.
+ * Only execution varies here: capability validation, pre-resource launch
+ * planning (models, skills, inherited context), native command/hook
+ * preparation, correlated turn evidence, process receipts, session leases,
+ * and owned-file cleanup. Herdr pane/worktree provisioning and parent result
+ * delivery stay in the common launch and watch paths.
  *
  * The receipt and correlation approach is ported from
  * zhengfran/pi-interactive-subagents (MIT, Copyright (c) 2026 HazAT and
@@ -16,26 +17,23 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
+	CLAUDE_START_ACK_MS,
 	NATIVE_EFFORT_LEVELS,
+	claudeAdapter,
 	claudeCommand,
-	claudeOutcome,
 	claudeTools,
 	prepareClaudeRun,
-	readClaudeState,
-	tickClaudeRun,
 	type ClaudeRun,
-	type NativeTurnOutcome,
 } from "./claude.ts";
 import { isNonEmptyString } from "./type-guards.ts";
 import {
+	KIRO_ACK_MS,
 	assertKiroAvailable,
 	cleanupKiroRun,
+	kiroAdapter,
 	kiroCommand,
-	kiroOutcome,
 	kiroTools,
 	prepareKiroRun,
-	readKiroState,
-	tickKiroRun,
 	validateKiroProfile,
 	type ExecFile,
 	type KiroRun,
@@ -54,6 +52,65 @@ import {
 	type TerminationResult,
 } from "./process-run.ts";
 import type { PaneInspection } from "./lifecycle.ts";
+import {
+	MAX_INITIAL_PROMPT_BYTES,
+	formatInheritedContextBlock,
+	materializeSkills,
+	parseSkillNames,
+	readParentContextEntries,
+	renderInheritedContext,
+	sha256,
+	writeSkillSnapshots,
+	type InheritedContext,
+	type InstalledSkill,
+	type MaterializedSkill,
+} from "./native-context.ts";
+import {
+	acquireNativeSessionLease,
+	acquireRunLease,
+	currentLeaseParent,
+	handoffRunLease,
+	nativeWorktreeLeaseFile,
+	releaseRunLease,
+	appendNativeRunRecord,
+	inspectNativeSessionLease,
+	loadoutSha256,
+	readIdentityText,
+	releaseNativeSessionLease,
+	verifyNativeSessionMarker,
+	writeNativeSessionMarker,
+	type AnyNativeSessionMarker,
+	type NativeLoadout,
+	type NativeRunMode,
+	type NativeSessionMarker,
+	type NativeSessionMode,
+	type NativeWorktreeBinding,
+} from "./native-session.ts";
+import {
+	NativeTurnFailure,
+	createNativeDriver,
+	currentNativeTurn,
+	nativeDriverOutcome,
+	nativePrompt,
+	tickNativeDriver,
+	type NativeDriver,
+	type NativeRunOutcome,
+	type NativeTurn,
+	type NativeTurnAdapter,
+} from "./native-turns.ts";
+import { prepareNativeBridge, type NativeBridge } from "./native-bridge.ts";
+import {
+	NATIVE_MODEL_ID,
+	TASK_CATEGORIES,
+	type NativeTaskPreferences,
+	type TaskCategory,
+} from "./model-config.ts";
+
+export {
+	readNativeSessionMarker,
+	type AnyNativeSessionMarker,
+	type NativeSessionMarker,
+} from "./native-session.ts";
 
 export const NATIVE_HARNESSES = ["claude", "kiro"] as const;
 export type NativeHarnessName = (typeof NATIVE_HARNESSES)[number];
@@ -79,7 +136,7 @@ const PI_SPAWNING_TOOLS = new Set([
 	"worktree_list",
 	"worktree_remove",
 ]);
-const NATIVE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,199}$/;
+const ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
 /** Role fields relevant to native harness capability validation. */
 export interface NativeRoleDefinition {
@@ -90,6 +147,8 @@ export interface NativeRoleDefinition {
 	skills?: string;
 	thinking?: string;
 	spawning?: boolean;
+	/** Comma-separated roles this native child may delegate to. */
+	spawnAgents?: string;
 	persistent?: boolean;
 	autoExit?: boolean;
 	interactive?: boolean;
@@ -109,20 +168,37 @@ export interface NativeLaunchOverrides {
 	interactive?: boolean;
 }
 
+export type NativeModelRequest =
+	| { kind: "default" }
+	| { kind: "exact"; model: string }
+	| { kind: "list"; models: string[] }
+	| { kind: "task"; category: TaskCategory };
+
 export interface NativeLaunchSpec {
 	harness: NativeHarnessName;
+	role: string;
 	/** Validated Pi-vocabulary allowlist that was mapped. */
 	tools: string;
 	/** Native tool names: Claude `--tools` entries or Kiro profile tools. */
 	nativeTools: string[];
-	/** Native model ID passed through to the CLI, never a Pi provider ref. */
+	/** Requested native model routing; resolved by planNativeLaunch. */
+	modelRequest: NativeModelRequest;
+	/** First native model candidate, never a Pi provider ref. */
 	model: string | null;
 	thinking: string | null;
 	/** Identity passed through a native system-prompt channel, if any. */
 	identity: string | null;
+	/** The complete role body, recorded for exact resume. */
+	identityText: string | null;
 	promptMode: "append" | "replace" | null;
 	/** Identity folded into the initial task when no prompt channel is used. */
 	roleBlock: string;
+	/** Session behavior: autonomous auto-exit, human-driven, or persistent. */
+	mode: NativeRunMode;
+	sessionMode: NativeSessionMode;
+	skills: string[];
+	/** Nested-spawn allowlist, or null when delegation is not granted. */
+	spawnAgents: string[] | null;
 }
 
 export class NativeCapabilityError extends Error {
@@ -133,6 +209,37 @@ export class NativeCapabilityError extends Error {
 		);
 		this.name = "NativeCapabilityError";
 	}
+}
+
+function parseModelRequest(
+	model: string | null,
+	fail: (reason: string) => never,
+): NativeModelRequest {
+	if (!model) return { kind: "default" };
+	const task = model.match(/^task:(.*)$/i);
+	if (task) {
+		const category = task[1].trim().toLowerCase();
+		// SAFETY: membership is checked against the fixed category set.
+		if (!TASK_CATEGORIES.includes(category as TaskCategory))
+			fail(
+				`cannot use ${model}; supported task categories: ${TASK_CATEGORIES.join(", ")}.`,
+			);
+		// SAFETY: validated against TASK_CATEGORIES above.
+		return { kind: "task", category: category as TaskCategory };
+	}
+	const candidates = model
+		.split(",")
+		.map((candidate) => candidate.trim())
+		.filter(Boolean);
+	if (candidates.length === 0) fail("has an empty model value.");
+	for (const candidate of candidates)
+		if (!NATIVE_MODEL_ID.test(candidate))
+			fail(`cannot use model "${candidate}"; expected native CLI model IDs.`);
+	if (new Set(candidates).size !== candidates.length)
+		fail("has a duplicate native model candidate.");
+	return candidates.length === 1
+		? { kind: "exact", model: candidates[0] }
+		: { kind: "list", models: candidates };
 }
 
 /**
@@ -146,34 +253,26 @@ export function resolveNativeLaunchSpec(
 	const fail = (reason: string): never => {
 		throw new NativeCapabilityError(role.name, role.cli, reason);
 	};
-	if (overrides.persistent ?? role.persistent)
-		fail(
-			"does not support persistent specialists. Remove persistent, or use a Pi-backed role for turn-based follow-up work.",
-		);
-	const sessionMode =
+	const persistent = (overrides.persistent ?? role.persistent) === true;
+	const requestedMode =
 		overrides.fork === true
 			? "fork"
 			: overrides.fork === false
 				? "standalone"
 				: (role.sessionMode ?? "standalone");
-	if (sessionMode !== "standalone")
-		fail(
-			`supports only standalone sessions; ${sessionMode} (fork/lineage) context cannot be represented natively. Omit fork and session-mode, or use a Pi-backed role.`,
-		);
-	if ((overrides.skills ?? role.skills)?.trim())
-		fail("cannot auto-load Pi skills. Remove skills, or use a Pi-backed role.");
-	if (role.spawning === true)
-		fail(
-			"cannot spawn nested subagents. Set spawning: false or omit it; the parent owns delegation.",
-		);
-	if (role.autoExit !== true)
-		fail(
-			"supports only autonomous fresh runs. Set auto-exit: true; interactive native sessions are not supported yet.",
-		);
-	if ((overrides.interactive ?? role.interactive) === true)
-		fail(
-			"supports only autonomous runs; interactive: true is not supported. Remove interactive or set it to false.",
-		);
+	if (
+		requestedMode !== "standalone" &&
+		requestedMode !== "lineage-only" &&
+		requestedMode !== "fork"
+	)
+		fail(`cannot use session-mode ${requestedMode}.`);
+	// SAFETY: validated against the three session modes above.
+	const sessionMode = requestedMode as NativeSessionMode;
+	const mode: NativeRunMode = persistent
+		? "persistent"
+		: role.autoExit === true
+			? "autonomous"
+			: "interactive";
 
 	const tools = (overrides.tools ?? role.tools)?.trim();
 	const requested = (tools ?? "")
@@ -188,7 +287,7 @@ export function resolveNativeLaunchSpec(
 	const spawningTools = requested.filter((tool) => PI_SPAWNING_TOOLS.has(tool));
 	if (spawningTools.length)
 		fail(
-			`cannot spawn nested subagents or manage worktrees (${spawningTools.join(", ")}). Remove them from tools.`,
+			`cannot receive Pi orchestration tools (${spawningTools.join(", ")}). Remove them from tools; grant nested delegation with a spawn-agents allowlist instead.`,
 		);
 	let nativeTools: string[] = [];
 	try {
@@ -200,19 +299,28 @@ export function resolveNativeLaunchSpec(
 		);
 	}
 
+	const spawnAgents = (role.spawnAgents ?? "")
+		.split(",")
+		.map((agent) => agent.trim())
+		.filter(Boolean);
+	if (role.spawning === true && spawnAgents.length === 0)
+		fail(
+			"cannot spawn nested subagents without an explicit spawn-agents allowlist. Add spawn-agents: <role>[, <role>], or set spawning: false.",
+		);
+	if (role.spawning === false && spawnAgents.length > 0)
+		fail("declares spawn-agents while spawning is false.");
+	for (const agent of spawnAgents)
+		if (!ROLE_NAME.test(agent))
+			fail(`has an invalid spawn-agents role name "${agent}".`);
+	if (spawnAgents.includes(role.name))
+		fail("cannot list itself in spawn-agents.");
+	if (spawnAgents.length && persistent)
+		fail(
+			"cannot delegate as a persistent specialist; the parent owns delegation for specialists. Remove spawn-agents or persistent.",
+		);
+
 	const model = (overrides.model ?? role.model)?.trim() || null;
-	if (model) {
-		if (/^task:/i.test(model))
-			fail(
-				"does not support task-category model routing. Pass an exact native model ID or omit model.",
-			);
-		if (model.includes(","))
-			fail(
-				"does not support Pi model fallback lists. Pass one exact native model ID.",
-			);
-		if (!NATIVE_MODEL_ID.test(model))
-			fail(`cannot use model "${model}"; expected one native model ID.`);
-	}
+	const modelRequest = parseModelRequest(model, fail);
 	const thinking = (overrides.thinking ?? role.thinking)?.trim() || null;
 	if (thinking && !NATIVE_EFFORT_LEVELS.some((level) => level === thinking))
 		fail(
@@ -231,79 +339,235 @@ export function resolveNativeLaunchSpec(
 		role.cli === "kiro" ? identity : role.systemPromptMode ? identity : null;
 	return {
 		harness: role.cli,
+		role: role.name,
 		tools: requested.join(","),
 		nativeTools,
-		model,
+		modelRequest,
+		model:
+			modelRequest.kind === "exact"
+				? modelRequest.model
+				: modelRequest.kind === "list"
+					? modelRequest.models[0]
+					: null,
 		thinking,
 		identity: identityChannel,
+		identityText: identity,
 		promptMode:
 			role.cli === "kiro" ? "append" : (role.systemPromptMode ?? null),
 		roleBlock: identity && !identityChannel ? identity : "",
+		mode,
+		sessionMode,
+		skills: parseSkillNames(overrides.skills ?? role.skills),
+		spawnAgents: spawnAgents.length ? spawnAgents : null,
 	};
 }
 
-const NATIVE_MODE_HINT =
-	"Complete your task autonomously. When you are finished, simply stop — your session ends automatically.";
-const NATIVE_SUMMARY_INSTRUCTION =
-	"Your FINAL assistant message should summarize what you accomplished.";
+const MODE_HINTS = {
+	autonomous:
+		"Complete your task autonomously. When you are finished, simply stop — your session ends automatically.",
+	interactive:
+		"Complete your task. A human may interact with you in this session at any time and ends it when done.",
+	persistent:
+		"You are a persistent specialist. Complete this task, then stop; later tasks arrive as new messages in this same session.",
+} satisfies Record<NativeRunMode, string>;
+const SUMMARY_INSTRUCTION = {
+	autonomous:
+		"Your FINAL assistant message should summarize what you accomplished.",
+	interactive:
+		"Your FINAL assistant message for this task should summarize what you accomplished.",
+	persistent:
+		"Your FINAL assistant message for each task should summarize what you accomplished for that task.",
+} satisfies Record<NativeRunMode, string>;
 
-export function buildNativeTask(task: string, roleBlock: string): string {
-	return [roleBlock, NATIVE_MODE_HINT, task, NATIVE_SUMMARY_INSTRUCTION]
+function delegationHint(agents: readonly string[]): string {
+	return `You may delegate bounded, self-contained subtasks with the pi-subagents "subagent" tool (allowed agents: ${agents.join(", ")}). Nested subagents never receive more tools than you have and cannot delegate further. Their results arrive later as new messages beginning with "Nested subagent result"; after delegating, end your turn instead of polling.`;
+}
+
+/** Initial tagged turn text for a fresh native run. */
+export function buildNativeTask(
+	task: string,
+	options: {
+		roleBlock?: string;
+		mode?: NativeRunMode;
+		skills?: readonly MaterializedSkill[];
+		inheritedContext?: string;
+		spawnAgents?: readonly string[] | null;
+	} = {},
+): string {
+	const mode = options.mode ?? "autonomous";
+	return [
+		options.roleBlock ?? "",
+		...(options.skills ?? []).map((skill) => skill.block),
+		MODE_HINTS[mode],
+		options.spawnAgents?.length ? delegationHint(options.spawnAgents) : "",
+		options.inheritedContext ?? "",
+		task,
+		SUMMARY_INSTRUCTION[mode],
+	]
 		.filter((part) => part.trim())
 		.join("\n\n");
 }
 
-export interface NativeSessionMarker {
-	version: 1;
-	type: "native_session";
-	harness: NativeHarnessName;
-	/** Claude: parent-chosen UUID. Kiro: published by the owned hook. */
-	nativeSessionId: string | null;
-	runId: string;
-	name: string;
-	agent?: string;
-	cwd: string;
-	createdAt: number;
-	resume: "unsupported";
-	loadout: {
-		tools: string;
-		nativeTools: string[];
-		model: string | null;
-		thinking: string | null;
-		promptMode: "append" | "replace" | null;
-		autoExit: true;
-		kiroProfile?: string;
-		worktree?: {
-			path: string;
-			workspaceId: string;
-			branch: string;
-			baseSha: string;
-		};
+/** Everything resolved before any Herdr resource exists. */
+export interface NativeLaunchPlan {
+	spec: NativeLaunchSpec;
+	/** Ordered native model candidates; `null` means the native default. */
+	models: (string | null)[];
+	skills: MaterializedSkill[];
+	lineage?: {
+		mode: "lineage-only" | "fork";
+		parentSessionFile: string;
+		context?: InheritedContext;
 	};
+	/** Complete initial turn text, before the per-turn tag. */
+	initialText: string;
 }
 
-export function readNativeSessionMarker(
-	path: string,
-): NativeSessionMarker | null {
-	try {
-		const data = JSON.parse(readFileSync(path, "utf8"));
-		return data?.type === "native_session" &&
-			data.version === 1 &&
-			isNativeHarnessName(data.harness)
-			? data
-			: null;
-	} catch {
-		return null;
+export interface NativePlanContext {
+	task: string;
+	/** Absent when the parent has no persisted session (fork/lineage fail). */
+	parentSessionFile?: string;
+	installedSkills: () => InstalledSkill[];
+	nativeTasks?: NativeTaskPreferences;
+	/** True when a value names an authenticated Pi provider/model. */
+	isPiModelRef?: (value: string) => boolean;
+	inspector?: Pick<ProcessInspector, "procRoot">;
+	/** Pre-rendered parent context entries (tests); defaults to the file. */
+	parentEntries?: () => readonly any[];
+	/**
+	 * Private directory for content-addressed skill snapshots. Without it,
+	 * skills with supporting files are rejected.
+	 */
+	snapshotRoot?: string;
+}
+
+/**
+ * Resolve models, skills, inherited context, and the bounded initial prompt.
+ * Every rejection happens here, before any pane, workspace, or worktree.
+ */
+export function planNativeLaunch(
+	spec: NativeLaunchSpec,
+	context: NativePlanContext,
+): NativeLaunchPlan {
+	const fail = (reason: string): never => {
+		throw new NativeCapabilityError(spec.role, spec.harness, reason);
+	};
+	let models: (string | null)[];
+	switch (spec.modelRequest.kind) {
+		case "default":
+			models = [null];
+			break;
+		case "exact":
+			models = [spec.modelRequest.model];
+			break;
+		case "list":
+			models = [...spec.modelRequest.models];
+			break;
+		case "task": {
+			const configured =
+				context.nativeTasks?.[spec.harness]?.[spec.modelRequest.category];
+			if (!configured?.length)
+				fail(
+					`has no native ${spec.harness} candidates for task:${spec.modelRequest.category}. Configure models.native.${spec.harness}.tasks.${spec.modelRequest.category} with native CLI model IDs; Pi models.tasks entries are Pi provider/model refs and never apply to native roles.`,
+				);
+			models = [...(configured ?? [])];
+			break;
+		}
 	}
+	for (const model of models)
+		if (model && context.isPiModelRef?.(model))
+			fail(
+				`cannot use "${model}": it is a Pi provider/model reference. Native roles take native CLI model IDs.`,
+			);
+	// Persistent specialists never advance to another model after launch.
+	if (spec.mode === "persistent") models = models.slice(0, 1);
+
+	if (
+		spec.spawnAgents &&
+		!(context.inspector ?? defaultProcessInspector).procRoot
+	)
+		fail(
+			"cannot delegate here: nested requests must be bound to a verified owned process, which needs Linux /proc.",
+		);
+
+	let skills: MaterializedSkill[] = [];
+	if (spec.skills.length) {
+		try {
+			skills = materializeSkills(
+				spec.skills,
+				context.installedSkills(),
+				new Set(spec.tools.split(",").filter(Boolean)),
+				context.snapshotRoot,
+			);
+		} catch (error) {
+			fail(
+				`cannot carry a requested Pi skill: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	let lineage: NativeLaunchPlan["lineage"];
+	let inheritedBlock = "";
+	if (spec.sessionMode !== "standalone") {
+		if (!context.parentSessionFile)
+			fail(
+				`cannot use ${spec.sessionMode} without a persisted parent session.`,
+			);
+		lineage = {
+			mode: spec.sessionMode,
+			// SAFETY: fail() above throws when the parent session is absent.
+			parentSessionFile: context.parentSessionFile!,
+		};
+		if (spec.sessionMode === "fork") {
+			let entries: readonly any[];
+			try {
+				entries =
+					context.parentEntries?.() ??
+					readParentContextEntries(lineage.parentSessionFile);
+			} catch (error) {
+				fail(
+					`cannot fork: the parent session could not be read (${error instanceof Error ? error.message : String(error)}).`,
+				);
+			}
+			// SAFETY: fail() above always throws when entries were not assigned.
+			lineage.context = renderInheritedContext(entries!);
+			inheritedBlock = formatInheritedContextBlock(lineage.context);
+		}
+	}
+
+	const initialText = buildNativeTask(context.task, {
+		roleBlock: spec.roleBlock,
+		mode: spec.mode,
+		skills,
+		inheritedContext: inheritedBlock,
+		spawnAgents: spec.spawnAgents,
+	});
+	const bytes = Buffer.byteLength(initialText, "utf8");
+	if (bytes > MAX_INITIAL_PROMPT_BYTES)
+		fail(
+			`cannot deliver a ${bytes}-byte initial prompt; the native limit is ${MAX_INITIAL_PROMPT_BYTES} bytes including role, skills, and inherited context.`,
+		);
+	return { spec, models, skills, lineage, initialText };
 }
 
 export interface NativeRun {
+	version: 1;
 	harness: NativeHarnessName;
+	kind: "fresh" | "resume";
 	processRun: ProcessRun;
 	markerFile: string;
 	runDir: string;
+	sessionKey: string;
+	/** Native model passed to this attempt (null: native default). */
+	model: string | null;
+	driver: NativeDriver;
+	/** Durable worktree lease held for this run's lifetime, if bound. */
+	worktreeLease?: string;
+	/** Integrity hash of the loadout this run drives (policy hash). */
+	loadoutSha256: string;
 	claude?: ClaudeRun;
 	kiro?: KiroRun;
+	bridge?: NativeBridge;
 }
 
 export interface PreparedNativeRun {
@@ -312,142 +576,372 @@ export interface PreparedNativeRun {
 	command: string;
 }
 
+function writePrivate(path: string, content: string): void {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	writeFileSync(path, content, { flag: "wx", mode: 0o600 });
+}
+
+export interface NativeResumeRequest {
+	marker: NativeSessionMarker;
+	markerFile: string;
+	message: string;
+	mode: "autonomous" | "interactive";
+}
+
+/**
+ * Create a fresh native session (plan) or reopen an existing one (resume).
+ * Owned files are exclusively created; the session lease is acquired before
+ * any process can start and released only after exit is confirmed.
+ */
 export function prepareNativeRun(options: {
 	id: string;
 	artifactDir: string;
 	cwd: string;
 	name: string;
 	agent?: string;
-	task: string;
-	spec: NativeLaunchSpec;
-	worktree?: NativeSessionMarker["loadout"]["worktree"];
+	plan?: NativeLaunchPlan;
+	/** Model candidate for this attempt; defaults to the plan's first. */
+	model?: string | null;
+	resume?: NativeResumeRequest;
+	worktree?: NativeWorktreeBinding;
+	/**
+	 * Fallback attempt: take over the parent-reserved worktree lease from
+	 * this run ID by atomic handoff instead of acquiring a new one.
+	 */
+	worktreeLeaseFrom?: string;
+	inspector?: ProcessInspector;
 	now?: number;
 }): PreparedNativeRun {
-	const { spec } = options;
 	const runDir = join(options.artifactDir, "native-runs", options.id);
-	const markerFile = join(
-		options.artifactDir,
-		"native-sessions",
-		`${options.id}.json`,
-	);
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
-	mkdirSync(dirname(markerFile), { recursive: true, mode: 0o700 });
 	const processRun = createProcessRun(options.id, join(runDir, "process.json"));
-	const nativeSessionId = spec.harness === "claude" ? randomUUID() : null;
+	const resume = options.resume;
+	const plan = options.plan;
+	if (!resume && !plan)
+		throw new Error("A native launch needs a plan or a resume request.");
+	if (resume && resume.mode !== resume.marker.loadout.mode)
+		throw new Error(
+			`Native resume must keep the recorded ${resume.marker.loadout.mode} mode.`,
+		);
+	const markerFile =
+		resume?.markerFile ??
+		join(options.artifactDir, "native-sessions", `${options.id}.json`);
+	const sessionKey = resume?.marker.sessionKey ?? options.id;
+	const harness = resume?.marker.harness ?? plan!.spec.harness;
+	const loadout = resume?.marker.loadout;
+	const mode: NativeRunMode = resume ? resume.mode : plan!.spec.mode;
+	const model =
+		options.model !== undefined
+			? options.model
+			: resume
+				? (loadout?.model ?? null)
+				: (plan!.models[0] ?? null);
+	const spawnAgents = resume
+		? (loadout?.spawnAgents ?? null)
+		: plan!.spec.spawnAgents;
+	const driver = createNativeDriver({
+		mode,
+		firstTurn: {
+			id: options.id,
+			kind: resume ? "resume" : "initial",
+			ackTimeoutMs: harness === "claude" ? CLAUDE_START_ACK_MS : KIRO_ACK_MS,
+		},
+	});
 	const run: NativeRun = {
-		harness: spec.harness,
+		version: 1,
+		harness,
+		kind: resume ? "resume" : "fresh",
 		processRun,
 		markerFile,
 		runDir,
+		sessionKey,
+		model,
+		driver,
+		loadoutSha256: resume?.marker.loadoutSha256 ?? "",
 	};
-	const task = buildNativeTask(options.task, spec.roleBlock);
-	let command: string;
-	if (spec.harness === "claude") {
-		run.claude = prepareClaudeRun({
-			runDir,
-			processRun,
-			cwd: options.cwd,
-			sessionId: nativeSessionId!,
-			now: options.now,
-		});
-		command = claudeCommand(run.claude, task, {
-			tools: spec.nativeTools.join(","),
-			model: spec.model,
-			thinking: spec.thinking,
-			identity: spec.identity,
-			promptMode: spec.promptMode,
-		});
-	} else {
-		run.kiro = prepareKiroRun({
-			runDir,
-			processRun,
-			cwd: options.cwd,
-			markerFile,
-			tools: spec.nativeTools,
-			identity: spec.identity,
-			now: options.now,
-		});
-		command = kiroCommand(run.kiro, task, {
-			model: spec.model,
-			thinking: spec.thinking,
-		});
-	}
-	// A marker, not a fabricated Pi transcript. It anchors identity, loadout,
-	// and result references without mixing native history into Pi's format.
-	const marker: NativeSessionMarker = {
-		version: 1,
-		type: "native_session",
-		harness: spec.harness,
-		nativeSessionId,
-		runId: options.id,
-		name: options.name,
-		cwd: run.claude?.cwd ?? run.kiro!.cwd,
-		createdAt: options.now ?? Date.now(),
-		resume: "unsupported",
-		loadout: {
-			tools: spec.tools,
-			nativeTools: spec.nativeTools,
-			model: spec.model,
-			thinking: spec.thinking,
-			promptMode: spec.promptMode,
-			autoExit: true,
-		},
-	};
-	if (options.agent) marker.agent = options.agent;
-	if (run.kiro) marker.loadout.kiroProfile = run.kiro.profilePath;
-	if (options.worktree) marker.loadout.worktree = options.worktree;
+	let leaseHeld = false;
 	try {
-		writeFileSync(markerFile, `${JSON.stringify(marker, null, 2)}\n`, {
-			flag: "wx",
-			mode: 0o600,
+		mkdirSync(dirname(markerFile), { recursive: true, mode: 0o700 });
+		if (resume) {
+			acquireNativeSessionLease(markerFile, sessionKey, processRun);
+			leaseHeld = true;
+		}
+		// A durable worktree lease survives parent crashes: a later driver
+		// (resume or another parent) is refused until this run's owned
+		// processes, including descendants, are provably gone.
+		if (options.worktree?.manifestFile) {
+			const path = nativeWorktreeLeaseFile(options.worktree.manifestFile);
+			const parent = currentLeaseParent(options.inspector);
+			if (options.worktreeLeaseFrom)
+				handoffRunLease(path, options.worktreeLeaseFrom, processRun, parent);
+			else
+				acquireRunLease(
+					path,
+					options.worktree.path,
+					processRun,
+					"Native worktree",
+					options.inspector,
+					parent,
+				);
+			run.worktreeLease = path;
+		}
+		if (spawnAgents)
+			run.bridge = prepareNativeBridge({
+				runDir,
+				runId: options.id,
+				agents: spawnAgents,
+			});
+		if (resume) {
+			// Fail-closed recheck immediately before launch: the loadout,
+			// identity, and skill snapshots must still verify exactly.
+			const reason = verifyNativeSessionMarker(
+				resume.marker,
+				resume.markerFile,
+			);
+			if (reason)
+				throw new Error(`Native resume refused: the session ${reason}.`);
+		}
+		const firstText = resume
+			? buildNativeTask(resume.message, { mode })
+			: plan!.initialText;
+		const tagged = nativePrompt(firstText, driver.turns[0].token);
+		let identity: string | null;
+		let identityFile: string | undefined;
+		if (resume) {
+			identity = readIdentityText(resume.marker);
+			identityFile = resume.marker.identityFile;
+		} else {
+			identity = plan!.spec.identityText;
+			if (identity) {
+				identityFile = join(dirname(markerFile), `${options.id}.identity.md`);
+				writePrivate(identityFile, identity);
+			}
+		}
+		const spec = plan?.spec;
+		const tools = loadout?.tools ?? spec!.tools;
+		const nativeTools = loadout?.nativeTools ?? spec!.nativeTools;
+		const thinking = loadout ? loadout.thinking : spec!.thinking;
+		const promptMode = loadout ? loadout.promptMode : spec!.promptMode;
+		// Claude receives the identity through its prompt channel only when the
+		// role asked for one; resume replays exactly the recorded channel.
+		const identityChannel = harness === "kiro" || promptMode ? identity : null;
+		let command: string;
+		if (harness === "claude") {
+			run.claude = prepareClaudeRun({
+				runDir,
+				processRun,
+				cwd: options.cwd,
+				sessionId: resume?.marker.nativeSessionId ?? randomUUID(),
+				resume: !!resume,
+				mcpServer: run.bridge?.server,
+			});
+			command = claudeCommand(run.claude, tagged, {
+				tools: nativeTools.join(","),
+				model,
+				thinking,
+				identity: identityChannel,
+				promptMode,
+			});
+		} else {
+			run.kiro = prepareKiroRun({
+				runDir,
+				processRun,
+				cwd: options.cwd,
+				markerFile,
+				tools: nativeTools,
+				identity: identityChannel,
+				resume: resume
+					? {
+							agentName: loadout!.kiroAgentName ?? "",
+							// SAFETY: verifyNativeSessionMarker requires a Kiro session ID.
+							sessionId: resume.marker.nativeSessionId!,
+						}
+					: undefined,
+				mcpServer: run.bridge?.server,
+			});
+			command = kiroCommand(run.kiro, tagged, { model, thinking });
+		}
+		if (!resume) {
+			writeSkillSnapshots(plan!.skills);
+			let lineage: NativeLoadout["lineage"];
+			if (plan!.lineage) {
+				lineage = {
+					mode: plan!.lineage.mode,
+					parentSessionFile: plan!.lineage.parentSessionFile,
+				};
+				const context = plan!.lineage.context;
+				if (context) {
+					const file = join(runDir, "inherited-context.md");
+					writePrivate(file, `${context.text}\n`);
+					lineage.context = {
+						file,
+						sha256: context.sha256,
+						bytes: context.bytes,
+						messages: context.messages,
+						omittedMessages: context.omittedMessages,
+					};
+				}
+			}
+			const newLoadout: NativeLoadout = {
+				tools,
+				nativeTools,
+				model,
+				thinking,
+				promptMode,
+				identitySha256: identity ? sha256(identity) : null,
+				mode,
+				sessionMode: spec!.sessionMode,
+				skills: plan!.skills.map((skill) => {
+					const record: NativeLoadout["skills"][number] = {
+						name: skill.name,
+						filePath: skill.filePath,
+						sha256: skill.sha256,
+						bytes: skill.bytes,
+					};
+					if (skill.snapshot)
+						record.snapshot = {
+							dir: skill.snapshot.dir,
+							sha256: skill.snapshot.sha256,
+						};
+					return record;
+				}),
+				spawnAgents,
+			};
+			if (run.kiro) newLoadout.kiroAgentName = run.kiro.profileName;
+			if (lineage) newLoadout.lineage = lineage;
+			if (options.worktree) newLoadout.worktree = options.worktree;
+			// A marker, not a fabricated Pi transcript: it anchors identity,
+			// loadout, and result references without native history.
+			const marker: NativeSessionMarker = {
+				version: 2,
+				type: "native_session",
+				harness,
+				nativeSessionId: run.claude?.sessionId ?? null,
+				sessionKey,
+				runId: options.id,
+				name: options.name,
+				cwd: run.claude?.cwd ?? run.kiro!.cwd,
+				createdAt: options.now ?? Date.now(),
+				loadout: newLoadout,
+				loadoutSha256: loadoutSha256(newLoadout),
+			};
+			if (options.agent) marker.agent = options.agent;
+			if (identityFile) marker.identityFile = identityFile;
+			writeNativeSessionMarker(markerFile, marker);
+			run.loadoutSha256 = marker.loadoutSha256;
+			acquireNativeSessionLease(markerFile, sessionKey, processRun);
+			leaseHeld = true;
+		}
+		appendNativeRunRecord(markerFile, {
+			runId: options.id,
+			kind: run.kind,
+			event: "started",
+			model,
 		});
+		return { run, command };
 	} catch (error) {
 		// No process can exist yet: the command has not been produced.
-		cleanupNativeRun(run);
+		if (run.kiro) cleanupKiroRun(run.kiro);
+		if (leaseHeld) releaseNativeSessionLease(markerFile, options.id);
+		// A handed-off lease stays with this (never-started) run's parent
+		// reservation; the fallback sequence releases it at final settlement.
+		if (run.worktreeLease && !options.worktreeLeaseFrom)
+			releaseRunLease(run.worktreeLease, options.id);
 		throw error;
 	}
-	return { run, command };
+}
+
+export type NativeResumeCheck =
+	| { ok: true; marker: NativeSessionMarker }
+	| { ok: false; error: string };
+
+/**
+ * Verify a native marker can be resumed with exactly its recorded loadout,
+ * before any Herdr resource exists. Persistent specialists never revive.
+ */
+export function checkNativeResume(
+	marker: AnyNativeSessionMarker,
+	markerFile: string,
+	inspector: ProcessInspector = defaultProcessInspector,
+): NativeResumeCheck {
+	const reason = verifyNativeSessionMarker(marker, markerFile);
+	if (reason) return { ok: false, error: `the session ${reason}` };
+	// SAFETY: verifyNativeSessionMarker rejects every non-v2 marker.
+	const current = marker as NativeSessionMarker;
+	if (current.loadout.mode === "persistent")
+		return {
+			ok: false,
+			error:
+				"it belongs to a persistent specialist; stopped or crashed specialists do not revive. Spawn a new specialist",
+		};
+	if (current.loadout.spawnAgents && !inspector.procRoot)
+		return {
+			ok: false,
+			error:
+				"its nested-spawn grant needs verified process ownership (Linux /proc)",
+		};
+	const lease = inspectNativeSessionLease(markerFile, inspector);
+	if (lease.kind === "held" || lease.kind === "invalid")
+		return {
+			ok: false,
+			error: `the native session is still leased: ${lease.reason}`,
+		};
+	return { ok: true, marker: current };
 }
 
 /** Native session identity, from the parent choice (Claude) or owned hook (Kiro). */
 export function nativeSessionId(run: NativeRun): string | undefined {
 	if (run.claude) return run.claude.sessionId;
 	if (run.kiro?.nativeSessionId) return run.kiro.nativeSessionId;
-	return readNativeSessionMarker(run.markerFile)?.nativeSessionId ?? undefined;
+	try {
+		const data = JSON.parse(readFileSync(run.markerFile, "utf8"));
+		return isNonEmptyString(data?.nativeSessionId)
+			? data.nativeSessionId
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function nativeTurnAdapter(run: NativeRun): NativeTurnAdapter {
+	if (run.claude) return claudeAdapter(run.claude);
+	if (run.kiro) return kiroAdapter(run.kiro);
+	throw new Error("Native harness state is missing.");
 }
 
 /** Correlated native turn phase for widget projection only, never completion. */
 export function nativeTurnPhase(run: NativeRun): string | undefined {
-	const state = run.claude
-		? readClaudeState(run.claude)
-		: run.kiro
-			? readKiroState(run.kiro)
-			: null;
-	return state?.phase;
+	return nativeTurnAdapter(run).readState()?.phase;
 }
 
 /** Start acknowledgement deadlines when the process is actually launched. */
 export function markNativeSubmitted(run: NativeRun, now = Date.now()): void {
-	if (run.claude) run.claude.submittedAt = now;
-	if (run.kiro) run.kiro.submittedAt = now;
+	run.driver.turns[0].submittedAt ??= now;
 }
 
 export function tickNativeRun(
 	run: NativeRun,
 	send: (text: string) => void,
 	now = Date.now(),
+	onSettled?: (turn: NativeTurn) => void,
 ): void {
-	if (run.claude) tickClaudeRun(run.claude, send, now);
-	else if (run.kiro) tickKiroRun(run.kiro, send, now);
+	tickNativeDriver(run.driver, nativeTurnAdapter(run), send, now, onSettled);
 }
 
 export function nativeOutcome(
 	run: NativeRun,
 	exit: { reason: string; exitCode: number; errorMessage?: string },
-): NativeTurnOutcome {
-	if (run.claude) return claudeOutcome(run.claude, exit);
-	if (run.kiro) return kiroOutcome(run.kiro, exit);
-	return { completed: false, summary: "Native harness state is missing." };
+	onSettled?: (turn: NativeTurn) => void,
+): NativeRunOutcome {
+	const outcome = nativeDriverOutcome(
+		run.driver,
+		nativeTurnAdapter(run),
+		exit,
+		onSettled,
+	);
+	// A hook error means some receipt may be missing: no-work is unprovable.
+	if (readHookError(run.processRun)) outcome.neverStarted = false;
+	return outcome;
 }
 
 /** Remove only owned, unchanged transient files that live outside artifacts. */
@@ -456,13 +950,22 @@ function cleanupNativeRun(run: NativeRun): void {
 }
 
 /**
- * Remove owned transient files only after the owned native process is proven
- * gone. With an unconfirmed exit the Kiro profile and all evidence are
- * retained, because a live Kiro process still depends on its profile.
+ * Remove owned transient files and release the session lease only after the
+ * owned native process is proven gone. With an unconfirmed exit the Kiro
+ * profile, the lease, and all evidence are retained, because a live native
+ * process still depends on them.
  */
 export function releaseNativeRun(
 	run: NativeRun,
 	exit: ExitConfirmation = confirmProcessExit(run.processRun),
+	outcome?: string,
+	options: {
+		/**
+		 * Keep the parent-reserved worktree lease: a fallback attempt may
+		 * follow, and the sequence releases it at final settlement.
+		 */
+		keepWorktreeLease?: boolean;
+	} = {},
 ): ExitConfirmation {
 	if (exit.kind === "confirmed") {
 		try {
@@ -470,6 +973,16 @@ export function releaseNativeRun(
 		} catch {
 			// Retained owned files are safer than deleting uncertain state.
 		}
+		releaseNativeSessionLease(run.markerFile, run.processRun.id);
+		if (run.worktreeLease && !options.keepWorktreeLease)
+			releaseRunLease(run.worktreeLease, run.processRun.id);
+		if (outcome)
+			appendNativeRunRecord(run.markerFile, {
+				runId: run.processRun.id,
+				kind: run.kind,
+				event: "settled",
+				outcome,
+			});
 	}
 	return exit;
 }
@@ -530,6 +1043,8 @@ export interface NativeCompletionResult {
 	reason: "done" | "error";
 	exitCode: number;
 	errorMessage?: string;
+	/** Set when the run ended because a parent interrupt could not settle. */
+	interrupted?: boolean;
 	/**
 	 * Whether the owned native process is proven gone. Only a confirmed exit
 	 * permits owned-file cleanup or a reviewable worktree handoff.
@@ -553,6 +1068,8 @@ export interface NativeCompletionOptions {
 	onPaneInspection?: (inspection: PaneInspection, observedAt: number) => void;
 	onStarted?: (observedAt: number) => void;
 	onTick?: () => void;
+	/** A tagged turn reached a terminal outcome (persistent task delivery). */
+	onTurnSettled?: (turn: NativeTurn) => void;
 	now?: () => number;
 	delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 }
@@ -588,7 +1105,7 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Wait for a native child's durable process exit. Success still requires the
- * harness outcome's correlated turn evidence; this loop never parses screen
+ * driver outcome's correlated turn evidence; this loop never parses screen
  * text and never treats Herdr idle/done status as completion.
  */
 export async function waitForNativeCompletion(
@@ -608,16 +1125,28 @@ export async function waitForNativeCompletion(
 	let missing = 0;
 	let ticks = 0;
 	let failure: string | undefined;
+	let interrupted = false;
 	let terminatedAt: number | undefined;
 	let termination: TerminationResult | void = undefined;
+	let wrapperExitedAt: number | undefined;
 
 	for (;;) {
 		if (signal.aborted) throw new Error(ABORT_MESSAGE);
 		const state = readProcessRunState(run.processRun, inspector);
 		if (state.kind === "exited") {
-			const error = failure ?? readHookError(run.processRun);
 			const exit = confirmProcessExit(run.processRun, inspector);
-			return error
+			// Owned descendants that outlive the wrapper keep the run alive.
+			// Wait a bounded time for them; never signal or finalize early.
+			wrapperExitedAt ??= now();
+			if (
+				exit.kind === "unconfirmed" &&
+				now() - wrapperExitedAt <= terminationGraceMs
+			) {
+				await delay(intervalMs, signal);
+				continue;
+			}
+			const error = failure ?? readHookError(run.processRun);
+			const result: NativeCompletionResult = error
 				? {
 						reason: "error",
 						exitCode: state.exitCode || 1,
@@ -625,6 +1154,8 @@ export async function waitForNativeCompletion(
 						exit,
 					}
 				: { reason: "done", exitCode: state.exitCode, exit };
+			if (interrupted) result.interrupted = true;
+			return result;
 		}
 		if (state.kind !== "not-started" && !started) {
 			started = true;
@@ -654,24 +1185,29 @@ export async function waitForNativeCompletion(
 				}
 			}
 			const exit = confirmProcessExit(run.processRun, inspector);
+			let settled: NativeCompletionResult | undefined;
 			if (exit.kind === "confirmed")
-				return {
+				settled = {
 					reason: "error",
 					exitCode: exit.exitCode || 1,
 					errorMessage: failure,
 					exit,
 				};
-			if (now() - terminatedAt > terminationGraceMs) {
+			else if (now() - terminatedAt > terminationGraceMs) {
 				const signalled =
 					termination?.kind === "unverifiable"
 						? ` Termination was refused because ownership could not be verified (${termination.reason}).`
 						: "";
-				return {
+				settled = {
 					reason: "error",
 					exitCode: 1,
 					errorMessage: `${failure} Native process exit is unconfirmed: ${exit.reason}.${signalled}`,
 					exit,
 				};
+			}
+			if (settled) {
+				if (interrupted) settled.interrupted = true;
+				return settled;
 			}
 		} else if (started) {
 			failure = readHookError(run.processRun) ?? undefined;
@@ -685,9 +1221,12 @@ export async function waitForNativeCompletion(
 							options.send(text);
 						},
 						now(),
+						options.onTurnSettled,
 					);
 				} catch (error) {
 					failure = error instanceof Error ? error.message : String(error);
+					interrupted =
+						error instanceof NativeTurnFailure && error.kind === "interrupted";
 				}
 			}
 		}
@@ -706,3 +1245,5 @@ export async function waitForNativeCompletion(
 		await delay(intervalMs, signal);
 	}
 }
+
+export { currentNativeTurn };

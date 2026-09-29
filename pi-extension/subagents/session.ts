@@ -102,7 +102,14 @@ export interface PersistentTaskEvent {
 
 export interface PersistentDeliveryLedgerEntry {
 	task: string;
+	/**
+	 * `planned`: a native specialist's first task, recorded before its process
+	 * is dispatched; it is not active until `dispatched` commits it, and
+	 * `abandoned` records that its launch provably never started.
+	 */
 	outcome:
+		| "planned"
+		| "abandoned"
 		| "dispatched"
 		| "delivered"
 		| "rejected-busy"
@@ -451,6 +458,8 @@ export function appendPersistentDeliveryLedger(
 function parsePersistentLedgerOutcome(
 	value: JsonValue | undefined,
 ): PersistentDeliveryLedgerEntry["outcome"] | null {
+	if (value === "planned") return value;
+	if (value === "abandoned") return value;
 	if (value === "dispatched") return value;
 	if (value === "delivered") return value;
 	if (value === "rejected-busy") return value;

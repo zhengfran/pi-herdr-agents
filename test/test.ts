@@ -4124,11 +4124,19 @@ describe("subagent discovery", () => {
 					projectAgentsDir,
 					"interactive-native",
 					[
-						"description: Interactive native role",
+						"description: Delegating native role without an allowlist",
 						"cli: kiro",
 						"auto-exit: true",
-						"interactive: true",
+						"spawning: true",
 						"tools: read",
+					].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"pi-delegator",
+					[
+						"description: Pi role misusing a native-only field",
+						"spawn-agents: scout",
 					].join("\n"),
 				);
 				writeAgentFile(
@@ -4181,14 +4189,21 @@ describe("subagent discovery", () => {
 				);
 				assert.match(
 					result.content[0].text,
-					/"interactive-native"[^\n]*interactive: true is not supported/,
+					/"interactive-native"[^\n]*explicit spawn-agents allowlist/,
+				);
+				assert.equal(
+					diagnosticCode("pi-delegator"),
+					"native-harness-unsupported",
+				);
+				assert.match(
+					result.content[0].text,
+					/"pi-delegator"[^\n]*applies only to native roles/,
 				);
 				assert.match(
 					result.content[0].text,
 					/unsupported external CLI "codex"/,
 				);
 				assert.match(result.content[0].text, /cli: claude and cli: kiro/);
-				assert.match(result.content[0].text, /auto-exit: true/);
 				assert.match(result.content[0].text, /cli-model.*Put the native/);
 				assert.equal(testApi.loadAgentDefaults("external-cli-reviewer"), null);
 
@@ -4306,16 +4321,15 @@ describe("subagent discovery", () => {
 			delete process.env.HERDR_ENV;
 			try {
 				for (const [override, pattern] of [
-					[{ persistent: true }, /persistent specialists/],
-					[{ interactive: true }, /interactive: true is not supported/],
-					[{ fork: true }, /standalone sessions/],
-					[{ skills: "tdd" }, /Pi skills/],
+					[{ skills: "not-installed-skill" }, /not an installed Pi skill/],
 					[{ tools: "read,caller_ping" }, /caller_ping/],
-					[{ tools: "read,subagent" }, /nested subagents/],
-					[{ model: "task:coding" }, /task-category/],
-					[{ model: "a/b, c/d" }, /fallback lists/],
+					[{ tools: "read,subagent" }, /Pi orchestration tools/],
+					[{ model: "task:coding" }, /no native claude candidates/],
+					[{ model: "task:bogus" }, /supported task categories/],
+					[{ model: "opus, opus" }, /duplicate/],
 					[{ thinking: "off" }, /thinking level off/],
 					[{ tools: "read,web_search" }, /cannot safely map/],
+					[{ fork: true }, /without a persisted parent session/],
 				] as const) {
 					const launch = await subagentTool.execute(
 						"call-1",
@@ -4337,14 +4351,33 @@ describe("subagent discovery", () => {
 					);
 					assert.match(launch.content[0].text, pattern);
 				}
-				const accepted = await subagentTool.execute(
-					"call-2",
-					{ name: "Native", task: "Inspect", agent: "claude-worker" },
-					new AbortController().signal,
-					() => {},
+				// Second-stage capabilities pass validation and reach the Herdr check.
+				for (const override of [
 					{},
-				);
-				assert.equal(accepted.details.error, "herdr not available");
+					{ persistent: true },
+					{ interactive: true },
+					{ fork: false },
+					{ model: "opus, sonnet" },
+					{ thinking: "high" },
+				]) {
+					const accepted = await subagentTool.execute(
+						"call-2",
+						{
+							name: "Native",
+							task: "Inspect",
+							agent: "claude-worker",
+							...override,
+						},
+						new AbortController().signal,
+						() => {},
+						{},
+					);
+					assert.equal(
+						accepted.details.error,
+						"herdr not available",
+						JSON.stringify(override),
+					);
+				}
 			} finally {
 				restoreEnvVar("HERDR_ENV", previousHerdrEnv);
 			}

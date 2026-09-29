@@ -21,7 +21,8 @@ import {
 	markNativeSubmitted,
 	prepareNativeRun,
 	type NativeHarnessOperations,
-	type NativeLaunchSpec,
+	type NativeLaunchPlan,
+	type NativeResumeRequest,
 	type NativeRun,
 } from "./native-harness.ts";
 import { supervisedCommand } from "./process-run.ts";
@@ -169,6 +170,8 @@ export interface PiRunningChild {
 	stopState?: "requested" | "pending" | "failed";
 	stopFailure?: string;
 	crashNotified?: boolean;
+	/** Why the first task's durable dispatch record could not be written. */
+	dispatchWarning?: string;
 }
 
 export interface PiLaunchOperations {
@@ -342,8 +345,39 @@ export interface FreshNativeLaunchRequest {
 	surface?: string;
 	parent: FreshPiLaunchRequest["parent"];
 	behavior: { interactive: boolean; cwd?: string };
-	/** Pre-validated native capability plan; see resolveNativeLaunchSpec. */
-	native: NativeLaunchSpec;
+	/** Pre-validated launch plan (fresh runs); see planNativeLaunch. */
+	plan?: NativeLaunchPlan;
+	/** Native model for this attempt; defaults to the plan's first candidate. */
+	model?: string | null;
+	/** Reopen a verified native session instead of creating one. */
+	resume?: NativeResumeRequest;
+	/**
+	 * Fallback attempt only: reuse this retained managed worktree and its
+	 * root pane after the previous attempt's exit was confirmed.
+	 */
+	reuseWorktree?: WorktreeLaunch;
+	/**
+	 * Fallback attempt: the run whose parent-reserved worktree lease this
+	 * attempt takes over by atomic handoff.
+	 */
+	worktreeLeaseFrom?: string;
+	/**
+	 * Parent abort (shutdown or a cancelled call). Checked before any
+	 * resource exists and immediately before the process is dispatched; a
+	 * pending shell-readiness wait ends as soon as it aborts.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Runs once the run is prepared (marker and loadout hash exist) and
+	 * immediately before its process is dispatched. A throw fails the launch
+	 * with nothing started, so the failure path proves that and cleans up.
+	 */
+	beforeDispatch?: (run: NativeRun) => void;
+	/**
+	 * Resume of a worktree-bound session: run in a new ordinary pane at the
+	 * retained worktree path, holding its lease for the run's lifetime.
+	 */
+	boundWorktree?: WorktreeLaunch;
 }
 
 export interface NativeRunningChild {
@@ -374,39 +408,58 @@ export async function launchNativeSubagent(
 	nativeOperations: NativeHarnessOperations = createNativeHarnessOperations(),
 ): Promise<NativeRunningChild> {
 	const location = resolveLaunchLocation(request);
+	const harness = request.resume?.marker.harness ?? request.plan?.spec.harness;
+	if (!harness) throw new Error("A native launch needs a plan or resume.");
 	// Prerequisites fail before any pane, workspace, or worktree exists.
-	nativeOperations.assertAvailable(request.native.harness);
+	nativeOperations.assertAvailable(harness);
+	throwIfLaunchAborted(request.signal);
 	let surface: PreparedSurface | undefined;
 	let run: NativeRun | undefined;
 	try {
-		surface = prepareLaunchSurface({ ...location, request }, operations);
+		surface = prepareNativeSurface(request, location, operations);
+		const binding = surface.worktree ?? request.boundWorktree;
 		const prepared = prepareNativeRun({
 			id: location.id,
 			artifactDir: location.artifactDir,
 			cwd: surface.targetCwd,
 			name: request.name,
 			agent: request.agent,
-			task: request.task,
-			spec: request.native,
-			worktree: surface.worktree
+			plan: request.plan,
+			model: request.model,
+			resume: request.resume,
+			worktreeLeaseFrom: request.worktreeLeaseFrom,
+			worktree: binding
 				? {
-						path: surface.worktree.path,
-						workspaceId: surface.worktree.workspaceId,
-						branch: surface.worktree.branch,
-						baseSha: surface.worktree.baseSha,
+						path: binding.path,
+						workspaceId: binding.workspaceId,
+						branch: binding.branch,
+						baseSha: binding.baseSha,
+						manifestFile: binding.manifestFile,
 					}
 				: undefined,
 		});
 		run = prepared.run;
 		if (surface.worktree) {
 			surface.worktree.sessionFile = run.markerFile;
-			writeWorktreeManifest(surface.worktree.manifestFile, {
+			const update: JsonObject = {
 				sessionFile: run.markerFile,
 				harness: run.harness,
-			});
+			};
+			if (request.reuseWorktree) {
+				update.fallbackAttempt = location.id;
+				update.nativeModel = run.model;
+			}
+			writeWorktreeManifest(surface.worktree.manifestFile, update);
 		}
 		nativeOperations.validate(run);
-		await operations.waitForShellReady(surface.surface);
+		await readyUnlessAborted(
+			operations.waitForShellReady(surface.surface),
+			request.signal,
+		);
+		// Last check before dispatch: an abort here leaves nothing started, so
+		// the failure path below can prove the run never began and clean up.
+		throwIfLaunchAborted(request.signal);
+		request.beforeDispatch?.(run);
 		if (surface.worktree) persistWorktreeResult(surface.worktree, "running");
 		const launchScriptFile = operations.runScript(
 			surface.surface,
@@ -428,6 +481,8 @@ export async function launchNativeSubagent(
 			},
 		);
 		markNativeSubmitted(run);
+		if (request.boundWorktree)
+			persistWorktreeResult(request.boundWorktree, "running");
 		return {
 			id: location.id,
 			name: request.name,
@@ -439,23 +494,161 @@ export async function launchNativeSubagent(
 			launchScriptFile,
 			interactive: request.behavior.interactive,
 			runtimePlan: undefined,
-			worktree: surface.worktree,
+			worktree: surface.worktree ?? request.boundWorktree,
 			lifecycle: createLifecycle(location.startTime),
 			native: run,
 		};
 	} catch (error) {
-		let failure = error;
-		if (run) {
+		if (run && surface) {
 			// The cancel marker stops a late-starting wrapper; owned files are
 			// removed only when no owned process can be running.
 			const exit = releaseNativeRun(run);
-			if (exit.kind === "unconfirmed")
-				failure = new Error(
-					`${errorMessage(error)} Native process exit is unconfirmed (${exit.reason}); owned run files were retained at ${run.runDir}.`,
+			if (exit.kind === "unconfirmed") {
+				// An owned process may be running: never close its pane, capture
+				// Git state, or release its profile, marker, or leases.
+				const worktree = surface.worktree ?? request.boundWorktree;
+				if (worktree) retainUnresolvedWorktree(worktree, exit.reason);
+				throw new NativeLaunchUnresolvedError(
+					`${errorMessage(error)} Native process exit is unconfirmed (${exit.reason}); its pane ${surface.surface}, owned run files at ${run.runDir}, and session lease${worktree ? `, and the worktree ${worktree.path} with its lease,` : ""} are retained until exit is confirmed.`,
+					run,
+					surface.surface,
+					worktree,
 				);
+			}
 		}
-		rethrowLaunchFailure(request.surface, surface, failure, operations);
+		rethrowLaunchFailure(request.surface, surface, error, operations);
 	}
+}
+
+/** The parent aborted a native launch before its process was dispatched. */
+export class NativeLaunchAbortedError extends Error {
+	constructor() {
+		super("Native launch cancelled before its process was dispatched.");
+		this.name = "NativeLaunchAbortedError";
+	}
+}
+
+function throwIfLaunchAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new NativeLaunchAbortedError();
+}
+
+/** Resolve with `ready`, or reject as soon as the launch is aborted. */
+function readyUnlessAborted(
+	ready: Promise<void>,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (!signal) return ready;
+	throwIfLaunchAborted(signal);
+	return new Promise((resolve, reject) => {
+		const onAbort = () => reject(new NativeLaunchAbortedError());
+		signal.addEventListener("abort", onAbort, { once: true });
+		ready.then(
+			() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			},
+			(error) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
+/**
+ * A native launch failed after its process may have been dispatched, and the
+ * owned process exit is unconfirmed. The caller must track the run as
+ * unresolved so its pane, owned files, and leases stay retained.
+ */
+export class NativeLaunchUnresolvedError extends Error {
+	readonly run: NativeRun;
+	readonly surface: string;
+	readonly worktree: WorktreeLaunch | undefined;
+	constructor(
+		message: string,
+		run: NativeRun,
+		surface: string,
+		worktree: WorktreeLaunch | undefined,
+	) {
+		super(message);
+		this.name = "NativeLaunchUnresolvedError";
+		this.run = run;
+		this.surface = surface;
+		this.worktree = worktree;
+	}
+}
+
+/** A handoff whose Git state is unknown because a process may still write it. */
+export function unknownWorktreeHandoff(
+	worktree: WorktreeLaunch,
+	reason: string,
+): WorktreeHandoff {
+	return {
+		...worktree,
+		headSha: null,
+		commitsAhead: null,
+		clean: null,
+		conflicted: null,
+		changedFiles: null,
+		untrackedFiles: null,
+		gitError: `Git state not captured: native process exit is unconfirmed (${reason}).`,
+	};
+}
+
+/** Mark a worktree failed and unresolved without capturing its Git state. */
+export function retainUnresolvedWorktree(
+	worktree: WorktreeLaunch,
+	reason: string,
+): WorktreeHandoff {
+	const handoff = unknownWorktreeHandoff(worktree, reason);
+	try {
+		persistWorktreeResult(worktree, "failed", handoff);
+		writeWorktreeManifest(worktree.manifestFile, {
+			processExit: "unconfirmed",
+		});
+	} catch (error) {
+		handoff.gitError = `${handoff.gitError} Manifest update failed: ${errorMessage(error)}`;
+	}
+	return handoff;
+}
+
+/**
+ * Select the Herdr surface for a native run. Fresh runs share Pi's surface
+ * provisioning; fallback attempts reuse the retained worktree root pane;
+ * resumes open an ordinary pane at the session's recorded cwd.
+ */
+function prepareNativeSurface(
+	request: FreshNativeLaunchRequest,
+	location: LaunchLocation,
+	operations: PiLaunchOperations,
+): PreparedSurface {
+	if (request.reuseWorktree) {
+		if (request.resume || request.worktree || request.surface)
+			throw new Error("A fallback attempt reuses only its retained worktree.");
+		return {
+			surface: request.reuseWorktree.paneId,
+			targetCwd: request.reuseWorktree.path,
+			effectiveAgentDir: location.agentDir,
+			localAgentDir: null,
+			worktree: request.reuseWorktree,
+		};
+	}
+	if (request.resume) {
+		if (request.worktree)
+			throw new Error("Native resume cannot create a new worktree.");
+		const cwd = request.resume.marker.cwd;
+		if (request.boundWorktree && request.boundWorktree.path !== cwd)
+			throw new Error(
+				"Native resume worktree binding does not match the session cwd.",
+			);
+		return {
+			surface: request.surface ?? operations.createPane(request.name, cwd),
+			targetCwd: cwd,
+			effectiveAgentDir: location.agentDir,
+			localAgentDir: null,
+		};
+	}
+	return prepareLaunchSurface({ ...location, request }, operations);
 }
 
 /**
@@ -489,6 +682,20 @@ function rethrowLaunchFailure(
 	throw new Error(
 		`Failed to launch subagent; worktree retained at ${surface.worktree.path} ` +
 			`(workspace ${surface.worktree.workspaceId}): ${errorMessage(error)}`,
+	);
+}
+
+/** The native session marker a launch with this ID and parent will write. */
+export function nativeSessionMarkerPath(
+	parent: Pick<FreshPiLaunchRequest["parent"], "sessionDir" | "sessionId">,
+	id: string,
+): string {
+	return join(
+		parent.sessionDir,
+		"artifacts",
+		parent.sessionId,
+		"native-sessions",
+		`${id}.json`,
 	);
 }
 
