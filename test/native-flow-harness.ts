@@ -36,6 +36,10 @@ export function writeRole(name: string, lines: string[]) {
 
 export const sent: any[] = [];
 export const registered: any[] = [];
+/** Slash commands registered by the extension, by name. */
+export const commands = new Map<string, any>();
+/** Messages the extension dispatched through sendUserMessage. */
+export const userMessages: string[] = [];
 const handlers = new Map<string, Function[]>();
 interface SendFailures {
 	match?: (message: any) => boolean;
@@ -60,7 +64,9 @@ export function createApi(sink: any[] = sent): any {
 		registerTool(tool: any) {
 			registered.push(tool);
 		},
-		registerCommand() {},
+		registerCommand(name: string, command: any) {
+			commands.set(name, command);
+		},
 		registerMessageRenderer() {},
 		registerShortcut() {},
 		events: { on() {}, emit() {} },
@@ -72,7 +78,9 @@ export function createApi(sink: any[] = sent): any {
 			}
 			sink.push(message);
 		},
-		sendUserMessage() {},
+		sendUserMessage(message: string) {
+			userMessages.push(message);
+		},
 		getAllTools: () => [],
 		getCommands: () => skillCommands,
 	};

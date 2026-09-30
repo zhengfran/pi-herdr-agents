@@ -177,6 +177,26 @@ warning, never untracked. A plan left by a parent crash is resolved at the next
 session start from the run's start receipt, after its cancel marker forbids a
 late start.
 
+**Spawn-time harness selection.** A spawn may select a named role's harness
+with `harness: pi|claude|kiro` (or `/subagent <role> --harness`). The
+effective harness is the explicit request, else the role's `cli`, else Pi;
+omitting `harness` leaves every Pi and native path unchanged. `harness`
+requires a named role, and an unresolved role fails before any resource.
+Selecting a harness other than the role's own is a validated projection: the
+destination harness validates the role's tools, thinking, skills, prompt mode,
+mode, and session mode with its ordinary rules, and anything it cannot
+represent fails before Herdr creates resources. A role's frontmatter `model`
+belongs to its declared harness; when the role runs elsewhere it is dropped
+and an explicit destination model is required. Pi defaults (`models.default`,
+`models.agents`, the parent model) never reach a native launch, and native IDs
+or `models.native` never reach Pi. Native `spawn-agents` projected to Pi is
+rejected until an equivalent bounded Pi policy exists. Model fallback stays
+within the selected harness; there is no cross-harness fallback. The role is
+resolved and projected once per spawn and every fallback attempt and
+persistent generation keeps that snapshot and its selection record (effective
+harness, its source, and role provenance). Resume never re-resolves a role or
+harness: native markers keep replaying their recorded immutable loadout.
+
 ## Why
 
 The first stage proved that correlated hook receipts plus owner-token process
@@ -184,6 +204,13 @@ receipts make native completion verifiable. Each second-stage capability reuses
 those receipts rather than terminal text, so the fail-closed properties carry
 over. A shared driver replaces duplicated per-CLI turn logic now that follow-up,
 interactive, persistent, interrupt, and resume turns exist for both CLIs.
+
+Spawn-time harness selection lets one role definition serve several runtimes
+without duplicating files, while keeping the fail-closed guarantee: a
+projection that cannot be represented is rejected, never approximated.
+Separating a role's declared harness from the effective harness keeps model
+ownership unambiguous, so a pinned model is never interpreted in a foreign
+namespace.
 
 ## Consequences
 
@@ -207,4 +234,7 @@ descendant running as another user. Native model
 fallback rarely applies: most model failures surface after the prompt was
 submitted, where no-work cannot be proven. A prompt-submit hook killed before
 writing any receipt could still look like "never started"; hooks are short,
-locked, and synchronous, so this is accepted and disclosed.
+locked, and synchronous, so this is accepted and disclosed. A role projected
+to another harness must be portable (an explicit mappable `tools` allowlist, no
+pinned model or an explicit replacement, and no `spawn-agents` on Pi); roles
+that are not stay bound to their own harness.

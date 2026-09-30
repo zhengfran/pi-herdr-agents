@@ -4,7 +4,7 @@ These instructions apply to humans and coding agents changing `pi-herdr-agents`.
 
 ## What this package is
 
-`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` in autonomous, interactive, or persistent mode, with exact-loadout resume, queued follow-ups, verified interrupts, fork/lineage context, Pi skills, native model fallback, and allowlisted nested delegation (ADR-0013). Unknown CLIs and unrepresentable native capabilities fail before Herdr creates resources.
+`pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` in autonomous, interactive, or persistent mode, with exact-loadout resume, queued follow-ups, verified interrupts, fork/lineage context, Pi skills, native model fallback, and allowlisted nested delegation (ADR-0013). A spawn may run a named role on another harness with `harness: pi|claude|kiro` as a strictly validated role projection (explicit request → role `cli` → Pi). Unknown CLIs, unrepresentable native capabilities, and unrepresentable projections fail before Herdr creates resources.
 
 The extension is fire-and-forget: `subagent` returns an acknowledgement, and completion is delivered to the parent automatically. Never add polling guidance that tells callers to sleep, tail sessions, or repeatedly check status.
 
@@ -38,6 +38,7 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `docs/research/` — evidence and alternatives, never the shipped contract
 - `test/test.ts` — unit tests for public subagent extension seams
 - `test/native-harness.test.ts`, `test/native-stage2.test.ts`, `test/native-flows.test.ts`, `test/native-regressions.test.ts` — native harness unit, end-to-end, and review-regression tests using offline `test/fixtures/native-bin/` CLI stand-ins, `test/native-fixtures.ts`, and `test/native-flow-harness.ts` (flows run through the extension's tool handlers with a fake Herdr test seam)
+- `test/harness-selection.test.ts` — spawn-time harness selection and role projection through the public `subagent`/`subagent_resume` tools, `startSubagentRun`, and the registered `/subagent` command, using the fake Herdr seam and offline native fixtures
 - `test/package-skill.test.js` — bundled skill and package manifest contract test
 - `test/integration/` — real Herdr and Pi lifecycle tests using the deterministic provider by default
 - `test/bench/supervision-bench.mjs` — manual isolated-Herdr supervision transport benchmark; raw samples stay in `/tmp/issue29-bench/`
@@ -68,6 +69,7 @@ Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing 
 - Tell worktree workers whether to commit. A good default is: edit, test, commit, report the SHA, and do not push/merge/remove.
 - The parent owns review, integration, publication, and cleanup.
 - Do not use `subagent_resume` as if it reattached worktree ownership; v1 resumes into an ordinary pane. A worktree-bound native marker resumes in an ordinary pane at the verified retained checkout and holds only its lease, never workspace ownership.
+- Use `harness` only to run a portable named role on another runtime; a role that pins `model` needs an explicit destination model, and Pi and native model IDs never mix. Do not expect cross-harness fallback.
 - Native (`cli: claude|kiro`) follow-ups go through `subagent_send` and are typed only at verified idle points; never type into a native pane yourself on the parent's behalf. Native resume replays the recorded loadout and cannot widen it.
 
 ## Documentation synchronization

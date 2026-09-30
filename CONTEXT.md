@@ -32,6 +32,26 @@ requires correlated native turn evidence plus process exit, and the result is
 delivered through the normal child result path.
 _Avoid_: Screen-scraped completion, fake Pi transcript, Pi model routing
 
+**Spawn-time harness selection**:
+The per-spawn choice of runtime harness (`pi`, `claude`, or `kiro`) for a
+named role. The effective harness is the explicit `harness` request, else the
+role's `cli`, else Pi. It is resolved once, before any Herdr resource, and
+recorded as the spawn's selection with its source and role provenance. It
+requires a named role, never changes role discovery or precedence, and is never
+re-resolved by fallback attempts, persistent tasks, or resume.
+_Avoid_: Bare harness override, role rewrite, resume-time re-selection
+
+**Validated role projection**:
+Running a role on a harness other than the one it declares by interpreting its
+capabilities under the destination harness's rules, and rejecting before any
+resource whatever that harness cannot represent faithfully (tools, thinking,
+skills, prompt mode, delegation). A role's pinned model belongs to its own
+harness and is replaced only by an explicit destination model. It is not a
+transparent conversion: nothing is dropped, mapped, widened, or retried on
+another harness, and Pi and native model namespaces never mix.
+_Avoid_: Transparent conversion, tool translation, cross-harness fallback,
+reusing a pinned model
+
 **Tagged turn**:
 One orchestrator-submitted native prompt carrying its own
 `[pi-subagent-turn:<token>]` tag. Only that token's correlated `Stop` or

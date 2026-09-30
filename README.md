@@ -20,6 +20,7 @@ Delegate investigation, implementation, and review without blocking the parent s
 - **Reusable roles** — use bundled agents, project or global definitions, and installable role packs.
 - **Persistent specialists** — retain one policy-bound Pi or native session for sequential, turn-based tasks.
 - **Native Claude Code and Kiro roles** — run `cli: claude|kiro` roles with correlated turn receipts, exact-loadout resume, queued follow-ups, verified interrupts, interactive sessions, fork context, skills, native model fallback, and allowlisted nested delegation.
+- **Spawn-time harness selection** — run a named role on `pi`, `claude`, or `kiro` for one spawn with `harness` or `/subagent <role> --harness`, as a strictly validated projection of the role.
 
 ## Requirements
 
@@ -61,10 +62,11 @@ Ask Pi to delegate naturally:
 Use two scouts in parallel to map the authentication flow, then summarize their findings.
 ```
 
-Or launch a named role directly:
+Or launch a named role directly, optionally on another harness:
 
 ```text
 /subagent scout Analyze the authentication module and report relevant files and risks
+/subagent scout --harness claude --model sonnet Analyze the authentication module
 ```
 
 For an isolated writing task:
@@ -149,7 +151,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `/btw <question>`          | Open an ephemeral side-question session in a background tab |
 | `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
-| `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
+| `/subagent <agent> [--harness pi\|claude\|kiro] [--model <value>] [--thinking <level>] [--] [task]` | Spawn a named agent directly, optionally on another harness (`/subagent list` lists available agents); see [Spawn-time harness selection](#spawn-time-harness-selection) |
 | `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
 
 ### Taxonomy and discovery
@@ -188,6 +190,8 @@ Subagents execute through Pi by default, and Claude models remain available
 through normal Pi provider/model routing. A role may instead declare
 `cli: claude` or `cli: kiro` to run the native Claude Code or Kiro CLI in its
 Herdr pane; see [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles).
+One spawn may also select another harness for a named role with `harness`; see
+[Spawn-time harness selection](#spawn-time-harness-selection).
 Any other `cli` value, and the removed `cli-model` field, fail before Herdr
 creates a pane or worktree.
 
@@ -567,6 +571,9 @@ subagent({ name: "Iterate", fork: true, model: "<provider>/<mid-tier-id>", think
 // Explicit frontier-tier runtime for architecture work
 subagent({ name: "Planner", agent: "planner", model: "<provider>/<frontier-tier-id>", thinking: "high", task: "Work through the design with me" });
 
+// A named Pi role run once on native Kiro; the model is a native Kiro ID
+subagent({ name: "Kiro scout", agent: "scout", harness: "kiro", model: "<kiro-model-id>", thinking: "low", task: "Map the flow" });
+
 // Explicit mid-tier runtime with a custom working directory
 subagent({ name: "Designer", agent: "game-designer", model: "<provider>/<mid-tier-id>", thinking: "medium", cwd: "agents/game-designer", task: "..." });
 
@@ -588,10 +595,11 @@ subagent({
 | `name`                 | string  | required       | Short stable child label; coordinated groups use `<task>-<role>[-n]` (widget and pane title)      |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
+| `harness`              | `"pi"` \| `"claude"` \| `"kiro"` | role `cli`, else `pi` | Run the named role on this harness for this spawn; requires `agent`. Effective harness: `harness` → role `cli` → `pi`. A different harness than the role's own is a validated projection; see [Spawn-time harness selection](#spawn-time-harness-selection) |
 | `fork`                 | boolean | —              | Override the child session mode: `true` forces fork, `false` forces standalone. Omit to inherit the agent `session-mode` frontmatter |
 | `persistent`           | boolean | `false`        | Keep one specialist session alive for sequential tasks; follow-ups use `subagent_send` only       |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent. Native roles take native CLI model IDs instead (see [Native models and fallback](#native-models-and-fallback)) |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent. When the effective harness is `claude` or `kiro`, the value is native CLI model IDs instead (see [Native models and fallback](#native-models-and-fallback)); a role's frontmatter model applies only on its own harness |
 | `thinking`             | string  | parent level   | Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; this is a discouraged fallback for orchestrated children. |
 | `systemPrompt`         | string  | —              | Role/system-prompt text for a bare spawn; named agents keep their definition body                  |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
@@ -962,7 +970,7 @@ Compare definitions against the reference below and verify them with
 | `persistent` | boolean | Keep this role's specialist session open between tasks. Follow-up work uses `subagent_send`; persistent specialists cannot be resumed in v1. |
 | `cwd`         | string  | Default working directory. Absolute paths are unambiguous; relative agent-frontmatter paths resolve from Pi's agent config directory (`PI_CODING_AGENT_DIR` or `~/.pi/agent`), not the project root                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide a role from discovery surfaces like `subagents_list`. The definition remains directly invocable by exact name via `subagent({ agent: "name", ... })`. |
-| `cli`         | string  | Optional native harness: `claude` or `kiro`. Omit for Pi-backed roles. Other values fail closed. See [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles). |
+| `cli`         | string  | Optional native harness: `claude` or `kiro`. Omit for Pi-backed roles. Other values fail closed. It is the role's default harness; a spawn's `harness` can select another one. See [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles) and [Spawn-time harness selection](#spawn-time-harness-selection). |
 | `spawn-agents` | string | Native roles only: one inline comma-separated allowlist of roles the native child may delegate to through its owned bridge (see [Nested delegation](#nested-delegation)). Pi-backed roles declaring it are rejected. |
 
 ---
@@ -1083,6 +1091,93 @@ You are a worker agent. ...
 - Prerequisites: `claude` or `kiro-cli` 2.24.x on `PATH`, and `python3`
   (the lifecycle hooks use `fcntl`; the delegation bridge is a stdio MCP
   server in Python).
+
+### Spawn-time harness selection
+
+A spawn can run a named role on a harness other than the one it declares:
+
+```typescript
+subagent({ name: "Claude scout", agent: "scout", harness: "claude", model: "sonnet", task: "Map the flow" });
+subagent({ name: "Pi reviewer", agent: "native-reviewer", harness: "pi", model: "<provider>/<model-id>", task: "Review the diff" });
+```
+
+```text
+/subagent <role> [--harness pi|claude|kiro] [--model <value>] [--thinking <level>] [--] [task]
+/subagent scout --harness kiro --model "kiro-a, kiro-b" --thinking high -- --literal task text
+```
+
+The effective harness is the explicit `harness`, else the role's `cli`, else
+`pi`. `harness` requires a named `agent`, and an unresolved role fails before
+any resource. Omitting `harness` keeps every existing path unchanged: Pi roles
+run on Pi and `cli: claude|kiro` roles run natively, with the same models,
+acknowledgement text, and results as before.
+
+Selecting another harness is a **validated role projection**, not a
+conversion. The role's tools, thinking, skills, prompt mode, mode, session mode,
+and body are interpreted under the destination harness's rules, and anything
+that harness cannot represent faithfully fails before Herdr creates a pane or
+worktree. Nothing is silently dropped, mapped, or widened:
+
+- Pi → native uses every native rule above: an explicit mappable `tools`
+  allowlist without Pi orchestration tools, a native thinking level, installed
+  portable skills, no `system-prompt: replace` on Kiro, and no `spawning: true`
+  without `spawn-agents`.
+- Native → Pi rejects `spawn-agents`: native nested delegation has no
+  equivalent bounded Pi policy. Otherwise the role's explicit `tools` allowlist
+  bounds the Pi child as usual.
+- A frontmatter `model` belongs to the role's own harness. When the role runs
+  elsewhere, the pinned model is dropped and an explicit destination `model` is
+  required; it is never reused, translated, or used as a fallback. Pi → native
+  and native → Pi are switches, and so are Claude → Kiro and Kiro → Claude.
+- Model namespaces never cross. On Pi, `model` is an exact authenticated
+  `provider/model-id`, fallback list, or `task:<category>` from
+  `models.tasks`, and a model-less role uses `models.agents`, `models.default`,
+  then the parent model. On a native harness it is native CLI model IDs or
+  `task:<category>` from `models.native.<cli>.tasks`; Pi provider/model refs
+  are rejected, and Pi defaults (`models.default`, `models.agents`, the parent
+  model) never apply, so a model-less role uses the native CLI default.
+- Fallback stays within the selected harness. There is no cross-harness
+  fallback: a failed native attempt never retries on Pi, or the reverse.
+
+Write portable custom roles by declaring an explicit, strictly mappable
+`tools` allowlist, omitting `model` (choose it per spawn), and using thinking
+levels from `low` through `max`. A role that pins `model`, uses `spawn-agents`,
+or depends on Pi-only tools remains bound to its own harness. Role discovery,
+precedence, hidden roles, and diagnostics are unchanged: the harness applies to
+the definition that exact-name lookup resolves.
+
+The role is resolved and projected once per spawn. The acknowledgement,
+completion and error, help-request, persistent task-result, and persistent
+stop, stop-failure, and crash notice details carry a `selection` record:
+
+```json
+{
+  "harness": "claude",
+  "harnessSource": "request",
+  "projected": true,
+  "role": { "name": "scout", "source": "project", "harness": "pi" }
+}
+```
+
+`harnessSource` is `request`, `role`, or `default`; `role.source` is
+`project`, `global`, or `package`, with `provider` and `providerVersion` for
+role packs. Selected models and thinking stay in the existing fields
+(`runtimePlan` for Pi; `model`, `nativeModels`, `nativeThinking`, and
+`native.model` for native runs). Every fallback attempt and persistent session
+generation keeps the same selection and role snapshot, even if the role file
+changes. An explicit `harness` also adds a `Harness:` line to the
+acknowledgement text. Resume never re-resolves the role or harness: a native
+marker replays its recorded loadout (including its harness) even if the role
+changed or no longer exists, and resumed runs carry no `selection`.
+
+`/subagent` options precede the task. A value is one word, or a quoted
+string; single quotes are literal, and double quotes accept only `\"` and `\\`
+escapes. Quote a fallback list that contains spaces. Empty, unclosed, missing,
+duplicate, and unknown options, and invalid harness or thinking values, are
+rejected without dispatching. Task text starts at the first word that does not
+begin with `--`, or after a lone `--`, and is kept verbatim, including quotes,
+backslashes, tabs, newlines, and later `--`. `/subagent <role>` without a task
+still asks the role to wait for instructions.
 
 ### Native modes
 
@@ -1268,7 +1363,10 @@ levels; `system-prompt: replace` for Kiro; `spawning: true` without
 unknown task categories or missing native candidates; Pi provider/model refs;
 uninstalled or non-portable skills; fork without a persisted parent session;
 and initial prompts over 120 KiB. `deny-tools` has no effect because the native
-tool set is exactly the mapped allowlist.
+tool set is exactly the mapped allowlist. Spawn-time harness selection adds:
+`harness` without `agent`; an unresolved role; switching a role with a pinned
+`model` without an explicit destination model; and a role with `spawn-agents`
+projected to Pi.
 
 ### Receipts, ownership, and cleanup
 

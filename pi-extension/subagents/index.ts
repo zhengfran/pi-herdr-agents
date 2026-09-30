@@ -321,6 +321,15 @@ const SubagentParams = Type.Object({
 				"Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Discovery precedence is project .pi/agents, global ~/.pi/agent/agents, then package-bundled agents.",
 		}),
 	),
+	harness: Type.Optional(
+		Type.Union(
+			[Type.Literal("pi"), Type.Literal("claude"), Type.Literal("kiro")],
+			{
+				description:
+					"Runtime harness for a named role (requires agent). Effective harness: this value, else the role's cli frontmatter, else pi. Selecting a harness other than the role's own is a strict validated projection, not a conversion: incompatible tools, thinking, skills, prompt mode, or delegation are rejected before any pane exists; a role-pinned model belongs to its own harness, so switching requires an explicit destination model. pi takes Pi provider/model refs; claude and kiro take native CLI model IDs or task:<category> from models.native.<cli>.tasks. Omit to keep the role's own harness.",
+			},
+		),
+	),
 	systemPrompt: Type.Optional(
 		Type.String({
 			description:
@@ -330,7 +339,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees. Native roles (cli: claude|kiro) instead take native CLI model IDs, an ordered native fallback list, or task:<category> resolved from models.native.<cli>.tasks, never Pi provider/model refs.",
+				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees. When the effective harness is claude or kiro (role cli or the harness parameter), model instead takes native CLI model IDs, an ordered native fallback list, or task:<category> resolved from models.native.<cli>.tasks, never Pi provider/model refs.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
@@ -484,6 +493,122 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 	}
 
 	return denied;
+}
+
+/** Runtime harness of one spawn: Pi, or a native CLI. */
+type SubagentHarness = "pi" | NativeHarnessName;
+
+const SUBAGENT_HARNESSES: readonly SubagentHarness[] = ["pi", "claude", "kiro"];
+
+function isSubagentHarness(value: string): value is SubagentHarness {
+	return SUBAGENT_HARNESSES.some((harness) => harness === value);
+}
+
+/**
+ * Effective harness selection for one fresh spawn. It is resolved once,
+ * before any Herdr resource, and carried unchanged through the launch
+ * acknowledgement, every model fallback attempt, persistent task results,
+ * and completion. Resume never re-resolves it: a native marker's recorded
+ * loadout governs, and Pi resume restores its recorded launch policy.
+ * Selected model and thinking stay in the existing runtime/native fields.
+ */
+interface SubagentSelection {
+	harness: SubagentHarness;
+	/** `request`: the spawn's `harness`; `role`: the role's `cli`; `default`: Pi. */
+	harnessSource: "request" | "role" | "default";
+	/** A named role running outside the harness it declares. */
+	projected: boolean;
+	/** Named roles only: the resolved definition's provenance. */
+	role?: {
+		name: string;
+		source: AgentSource;
+		provider?: string;
+		providerVersion?: string;
+		/** The harness the role declares: its `cli`, otherwise Pi. */
+		harness: SubagentHarness;
+	};
+}
+
+type RoleProjection =
+	| {
+			ok: true;
+			selection: SubagentSelection;
+			/** The role as the effective harness sees it; null for bare spawns. */
+			agentDefs: ListedAgentDefinition | null;
+	  }
+	| { ok: false; error: string; message: string };
+
+/**
+ * Resolve the effective harness (explicit request → role `cli` → Pi) and
+ * project a named role onto it. Projection is a strict validated view, not
+ * a conversion: a role's frontmatter `model` belongs to the harness the role
+ * declares and is dropped when the role runs elsewhere, so a pinned model
+ * requires an explicit destination model. Native `spawn-agents` has no
+ * bounded Pi equivalent and cannot be projected to Pi. The destination
+ * harness then validates every remaining capability before any resource.
+ */
+function resolveRoleProjection(
+	params: Pick<Static<typeof SubagentParams>, "agent" | "harness" | "model">,
+	role: ListedAgentDefinition | null,
+): RoleProjection {
+	if (params.harness && !params.agent)
+		return {
+			ok: false,
+			error: "harness-requires-agent",
+			message:
+				"harness selects the runtime for a named role and requires agent. Remove harness for a bare Pi spawn, or supply agent.",
+		};
+	if (params.agent && !role)
+		return {
+			ok: false,
+			error: "agent-not-found",
+			message: `Agent "${params.agent}" was not found.`,
+		};
+	const roleHarness: SubagentHarness | undefined = role
+		? (role.cli ?? "pi")
+		: undefined;
+	const harness: SubagentHarness = params.harness ?? role?.cli ?? "pi";
+	const selection: SubagentSelection = {
+		harness,
+		harnessSource: params.harness ? "request" : role?.cli ? "role" : "default",
+		projected: !!roleHarness && roleHarness !== harness,
+	};
+	if (!role || !roleHarness) return { ok: true, selection, agentDefs: null };
+	selection.role = {
+		name: role.name,
+		source: role.source,
+		harness: roleHarness,
+	};
+	if (role.provider) selection.role.provider = role.provider;
+	if (role.providerVersion)
+		selection.role.providerVersion = role.providerVersion;
+	if (!selection.projected) return { ok: true, selection, agentDefs: role };
+
+	if (role.model && !params.model?.trim())
+		return {
+			ok: false,
+			error: "harness-switch-requires-model",
+			message: `Role "${role.name}" pins model ${JSON.stringify(role.model)} for its ${roleHarness} harness; running it on ${harness} requires an explicit ${harness === "pi" ? "Pi provider/model-id" : `native ${harness} model ID`} in model. A pinned model is never reused across harnesses.`,
+		};
+	if (harness === "pi" && role.spawnAgents)
+		return {
+			ok: false,
+			error: "harness-projection-unsupported",
+			message: `Role "${role.name}" declares spawn-agents (native nested delegation), which has no equivalent bounded Pi policy. Run it on its ${roleHarness} harness, or use a role without spawn-agents.`,
+		};
+	const projected: ListedAgentDefinition = { ...role, model: undefined };
+	if (harness === "pi") delete projected.cli;
+	else projected.cli = harness;
+	return { ok: true, selection, agentDefs: projected };
+}
+
+/** One-line model-facing disclosure of an explicitly requested harness. */
+function formatSubagentSelection(selection: SubagentSelection): string {
+	const role = selection.role;
+	if (!role)
+		return `Harness: ${selection.harness} (${selection.harnessSource}).`;
+	const origin = role.provider ? `package:${role.provider}` : role.source;
+	return `Harness: ${selection.harness} (${selection.harnessSource}; role ${role.name} from ${origin} declares ${role.harness}${selection.projected ? ", projected" : ""}).`;
 }
 
 function getBundledAgentsDir(): string {
@@ -1421,6 +1546,8 @@ interface SubagentResultDetails {
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
 	native?: NativeResultReference;
+	/** Effective harness selection and role provenance (fresh spawns). */
+	selection?: SubagentSelection;
 }
 
 interface SubagentPingDetails {
@@ -1429,6 +1556,7 @@ interface SubagentPingDetails {
 	agent?: string;
 	sessionFile: string;
 	worktree?: WorktreeHandoff;
+	selection?: SubagentSelection;
 }
 
 interface SubagentStartedDetails {
@@ -1447,6 +1575,8 @@ interface SubagentStartedDetails {
 	nativeThinking?: string;
 	nativeModels?: string[];
 	nativeMode?: "autonomous" | "interactive" | "persistent";
+	/** Effective harness selection and role provenance. */
+	selection?: SubagentSelection;
 	status: "started";
 }
 
@@ -1670,6 +1800,11 @@ interface RunningSubagent {
 	interactive: boolean;
 	/** Parent-resolved model/thinking selection and provenance. */
 	runtimePlan: ResolvedRuntimePlan | undefined;
+	/**
+	 * Effective harness selection, fixed at the fresh spawn and copied to
+	 * every fallback attempt; absent for resumed sessions.
+	 */
+	selection?: SubagentSelection;
 	worktree?: WorktreeLaunch;
 	persistent?: boolean;
 	logicalId?: string;
@@ -1752,6 +1887,11 @@ interface NativeTestSeam {
 	deliveryRetryMs?: number;
 	/** Final persistent delivery attempts before the notice carries results. */
 	deliveryAttempts?: number;
+	/** Replaces Herdr/session supervision of Pi-backed children. */
+	piWatch?: (
+		running: RunningSubagent,
+		signal: AbortSignal,
+	) => Promise<SubagentResult>;
 }
 
 interface SubagentRuntime {
@@ -2394,6 +2534,33 @@ function persistentCapacityError(
 	return `Persistent specialist cap (${config.maxAgents}) reached. Current specialists: ${specialists.map((running) => `${running.name} (${persistentSpecialistState(running)}, ${running.tasksCompleted ?? 0} completed)`).join(", ")}.`;
 }
 
+/** Help-request details for a persistent specialist's task. */
+interface PersistentHelpDetails {
+	name: string;
+	task: string;
+	sessionFile: string;
+	/** The fresh spawn's immutable harness selection, when it has one. */
+	selection?: SubagentSelection;
+}
+
+/** Terminal notice details for a persistent specialist. */
+interface PersistentNoticeDetails {
+	status?: "failed" | "stopped";
+	error?: "persistent-crash";
+	facts: PersistentSpecialistFacts;
+	/** The fresh spawn's immutable harness selection, when it has one. */
+	selection?: SubagentSelection;
+}
+
+function persistentNoticeDetails(
+	running: RunningSubagent,
+	base: Omit<PersistentNoticeDetails, "selection">,
+): PersistentNoticeDetails {
+	const details: PersistentNoticeDetails = { ...base };
+	if (running.selection) details.selection = running.selection;
+	return details;
+}
+
 function sendPersistentStopFailure(
 	api: Pick<ExtensionAPI, "sendMessage">,
 	running: RunningSubagent,
@@ -2404,7 +2571,7 @@ function sendPersistentStopFailure(
 			customType: "subagent_stop",
 			content: `Persistent specialist stop failed: process exit was not confirmed. Evidence is retained.\n\n${formatPersistentSpecialistFacts(facts)}`,
 			display: true,
-			details: { status: "failed", facts },
+			details: persistentNoticeDetails(running, { status: "failed", facts }),
 		},
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
@@ -2918,6 +3085,160 @@ function buildBtwLaunchCommand(params: {
 	return `cd ${shellQuote(params.cwd)} && ${envPrefix}${parts.join(" ")}`;
 }
 
+const SUBAGENT_COMMAND_USAGE =
+	"Usage: /subagent <agent> [--harness pi|claude|kiro] [--model <value>] [--thinking <level>] [--] [task] | /subagent list";
+
+interface ParsedSubagentCommand {
+	ok: true;
+	agent: string;
+	/** Verbatim task text; empty when none was given. */
+	task: string;
+	harness?: SubagentHarness;
+	model?: string;
+	thinking?: ThinkingLevel;
+}
+
+/**
+ * Parse `/subagent <agent> [--harness h] [--model v] [--thinking t] [--] [task]`.
+ *
+ * Options precede the task. An option value is one whitespace-free word, or
+ * a single- or double-quoted string (single quotes are literal; in double
+ * quotes only `\"` and `\\` are escapes), so a fallback list with spaces
+ * can be quoted. Empty, unclosed, missing, duplicate, and unknown options
+ * are rejected. Task mode begins at the first word that does not start with
+ * `--`, or after a lone `--`; from there the text is returned verbatim,
+ * including quotes, backslashes, tabs, newlines, and later `--` words.
+ */
+function parseSubagentCommand(
+	args: string,
+): ParsedSubagentCommand | { ok: false; error: string } {
+	const input = args.trim();
+	const isSpace = (char: string | undefined) =>
+		char !== undefined && /\s/.test(char);
+	let i = 0;
+	const skipSpace = () => {
+		while (isSpace(input[i])) i++;
+	};
+	const readWord = () => {
+		const begin = i;
+		while (i < input.length && !isSpace(input[i])) i++;
+		return input.slice(begin, i);
+	};
+	const fail = (error: string) => ({ ok: false as const, error });
+
+	const agent = readWord();
+	if (!agent) return fail(SUBAGENT_COMMAND_USAGE);
+	if (agent.startsWith("-"))
+		return fail(`The agent name must come first. ${SUBAGENT_COMMAND_USAGE}`);
+
+	const readValue = (flag: string): { value: string } | { error: string } => {
+		skipSpace();
+		const open = input[i];
+		if (open === undefined) return { error: `${flag} requires a value.` };
+		let value = "";
+		if (open === '"' || open === "'") {
+			i++;
+			let closed = false;
+			while (i < input.length) {
+				const char = input[i];
+				if (char === open) {
+					closed = true;
+					i++;
+					break;
+				}
+				if (
+					open === '"' &&
+					char === "\\" &&
+					(input[i + 1] === '"' || input[i + 1] === "\\")
+				) {
+					value += input[i + 1];
+					i += 2;
+					continue;
+				}
+				value += char;
+				i++;
+			}
+			if (!closed) return { error: `${flag} has an unclosed ${open} quote.` };
+			if (i < input.length && !isSpace(input[i]))
+				return {
+					error: `${flag} value must be followed by whitespace after its closing quote.`,
+				};
+		} else {
+			value = readWord();
+			if (value.startsWith("--")) return { error: `${flag} requires a value.` };
+			if (/["']/.test(value))
+				return {
+					error: `${flag} value must be quoted as a whole; quotes inside a bare word are not allowed.`,
+				};
+		}
+		if (!value.trim()) return { error: `${flag} value cannot be empty.` };
+		return { value };
+	};
+
+	const options: Omit<ParsedSubagentCommand, "ok" | "agent" | "task"> = {};
+	const seen = new Set<string>();
+	let task = "";
+	for (;;) {
+		skipSpace();
+		if (i >= input.length) break;
+		if (!input.startsWith("--", i)) {
+			task = input.slice(i);
+			break;
+		}
+		const flag = readWord();
+		if (flag === "--") {
+			skipSpace();
+			task = input.slice(i);
+			break;
+		}
+		if (flag !== "--harness" && flag !== "--model" && flag !== "--thinking")
+			return fail(
+				`Unknown option ${flag}; use -- before a task that starts with --. ${SUBAGENT_COMMAND_USAGE}`,
+			);
+		if (seen.has(flag)) return fail(`Duplicate option ${flag}.`);
+		seen.add(flag);
+		const parsed = readValue(flag);
+		if ("error" in parsed) return fail(parsed.error);
+		const { value } = parsed;
+		if (flag === "--harness") {
+			if (!isSubagentHarness(value))
+				return fail(
+					`--harness must be one of ${SUBAGENT_HARNESSES.join(", ")}; got ${JSON.stringify(value)}.`,
+				);
+			options.harness = value;
+		} else if (flag === "--thinking") {
+			if (!isThinkingLevel(value))
+				return fail(
+					`--thinking must be one of ${THINKING_LEVELS.join(", ")}; got ${JSON.stringify(value)}.`,
+				);
+			options.thinking = value;
+		} else options.model = value;
+	}
+	return { ok: true, agent, task, ...options };
+}
+
+/**
+ * The model-facing instruction a `/subagent` command dispatches: every
+ * parsed argument JSON-serialized exactly, with the legacy default task.
+ */
+function buildSubagentCommandMessage(command: ParsedSubagentCommand): string {
+	const displayName = command.agent[0].toUpperCase() + command.agent.slice(1);
+	const task =
+		command.task ||
+		`You are the ${command.agent} agent. Wait for instructions.`;
+	const parts = [
+		`agent: ${JSON.stringify(command.agent)}`,
+		`name: ${JSON.stringify(displayName)}`,
+		`task: ${JSON.stringify(task)}`,
+	];
+	if (command.harness)
+		parts.push(`harness: ${JSON.stringify(command.harness)}`);
+	if (command.model) parts.push(`model: ${JSON.stringify(command.model)}`);
+	if (command.thinking)
+		parts.push(`thinking: ${JSON.stringify(command.thinking)}`);
+	return `Use subagent with ${parts.join(", ")}`;
+}
+
 export const __test__ = {
 	borderLine,
 	renderSubagentWidgetLines,
@@ -2936,6 +3257,9 @@ export const __test__ = {
 	evaluateNoProgressAdvisory,
 	formatNoProgressAdvisoryLine,
 	resolveDenyTools,
+	resolveRoleProjection,
+	parseSubagentCommand,
+	buildSubagentCommandMessage,
 	buildSubagentRoutingGuidelines,
 	resolveInterruptTarget,
 	requestSubagentInterrupt,
@@ -2992,6 +3316,29 @@ function startWidgetRefresh() {
 }
 
 /**
+ * The role definition a Pi launch uses: the snapshot resolved (and projected)
+ * once by startSubagentRun, or a fresh lookup when none was supplied.
+ */
+function resolveLaunchAgentDefs(
+	params: Pick<typeof SubagentParams.static, "agent">,
+	supplied: AgentDefaults | null | undefined,
+): AgentDefaults | null {
+	if (supplied !== undefined) return supplied;
+	const agentDefs = params.agent
+		? loadAgentDefaults(params.agent, runtime.pi)
+		: null;
+	if (params.agent && !agentDefs) {
+		const diagnostic = discoverAgentCatalog(runtime.pi).diagnostics.find(
+			(candidate) => candidate.agentName === params.agent,
+		);
+		throw new Error(
+			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
+		);
+	}
+	return agentDefs;
+}
+
+/**
  * Launch a subagent: creates the herdr pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -3021,19 +3368,11 @@ async function launchSubagent(
 		id?: string;
 		/** Deny every spawning tool regardless of the role (nested leaves). */
 		forceLeaf?: boolean;
+		/** The role as resolved and projected once for this spawn. */
+		agentDefs?: AgentDefaults | null;
 	},
 ): Promise<RunningSubagent> {
-	const agentDefs = params.agent
-		? loadAgentDefaults(params.agent, runtime.pi)
-		: null;
-	if (params.agent && !agentDefs) {
-		const diagnostic = discoverAgentCatalog(runtime.pi).diagnostics.find(
-			(candidate) => candidate.agentName === params.agent,
-		);
-		throw new Error(
-			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
-		);
-	}
+	const agentDefs = resolveLaunchAgentDefs(params, options?.agentDefs);
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
 	const runtimePlan =
@@ -3062,46 +3401,49 @@ async function launchSubagent(
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
 
-	const running = await launchPiSubagent({
-		kind: "fresh",
-		id: logicalId,
-		name: params.name,
-		task: params.task,
-		agent: params.agent,
-		cwd: params.cwd,
-		worktree: params.worktree,
-		fork: params.fork,
-		surface: options?.surface,
-		parent: {
-			cwd: ctx.cwd,
-			invocationCwd: process.cwd(),
-			sessionFile: parentSessionFile,
-			sessionId: ctx.sessionManager.getSessionId(),
-			sessionDir: ctx.sessionManager.getSessionDir(),
-			agentDir: getAgentConfigDir(),
+	const running = await launchPiSubagent(
+		{
+			kind: "fresh",
+			id: logicalId,
+			name: params.name,
+			task: params.task,
+			agent: params.agent,
+			cwd: params.cwd,
+			worktree: params.worktree,
+			fork: params.fork,
+			surface: options?.surface,
+			parent: {
+				cwd: ctx.cwd,
+				invocationCwd: process.cwd(),
+				sessionFile: parentSessionFile,
+				sessionId: ctx.sessionManager.getSessionId(),
+				sessionDir: ctx.sessionManager.getSessionDir(),
+				agentDir: getAgentConfigDir(),
+			},
+			runtimePlan,
+			behavior: {
+				tools: effectiveTools,
+				skills: effectiveSkills,
+				deniedTools: [
+					...new Set([
+						...resolveDenyTools(agentDefs),
+						...(options?.forceLeaf ? SPAWNING_TOOLS : []),
+					]),
+				],
+				autoExit: effectiveAutoExit,
+				interactive: effectiveInteractive,
+				persistent,
+				logicalId,
+				generationId,
+				taskId,
+				identity: agentDefs?.body ?? params.systemPrompt,
+				systemPromptMode: agentDefs?.systemPromptMode,
+				sessionMode: resolveEffectiveSessionMode(params, agentDefs),
+				cwd: agentDefs?.cwd,
+			},
 		},
-		runtimePlan,
-		behavior: {
-			tools: effectiveTools,
-			skills: effectiveSkills,
-			deniedTools: [
-				...new Set([
-					...resolveDenyTools(agentDefs),
-					...(options?.forceLeaf ? SPAWNING_TOOLS : []),
-				]),
-			],
-			autoExit: effectiveAutoExit,
-			interactive: effectiveInteractive,
-			persistent,
-			logicalId,
-			generationId,
-			taskId,
-			identity: agentDefs?.body ?? params.systemPrompt,
-			systemPromptMode: agentDefs?.systemPromptMode,
-			sessionMode: resolveEffectiveSessionMode(params, agentDefs),
-			cwd: agentDefs?.cwd,
-		},
-	});
+		runtime.nativeTestSeam?.operations,
+	);
 	if (persistent) {
 		const policy = readSubagentSessionPolicy(running.sessionFile);
 		if (policy.version !== 2)
@@ -3611,6 +3953,7 @@ async function watchNativeWithFallbacks(
 			// Every attempt keeps the logical child's routing: a nested child's
 			// result is owed to its requester, never to the ordinary parent.
 			if (previous.nestedOf) running.nestedOf = previous.nestedOf;
+			running.selection = previous.selection;
 			startWidgetRefresh();
 			if (runtime.pi) startStatusRefresh(runtime.pi);
 		} catch (error) {
@@ -3833,6 +4176,7 @@ function deliverNestedResult(
 		sessionFile: result.sessionFile,
 	};
 	if (result.errorMessage) details.errorMessage = result.errorMessage;
+	if (child.selection) details.selection = child.selection;
 	sendSubagentResult(
 		selectCompletionApi(pi, runtime.pi),
 		`Nested subagent "${origin.name}" (${origin.agent}) ${outcome}; its requesting native child "${origin.requesterName}" could not accept the result, so it is delivered here.\n\n${resolveResultPresentation(result, child.name)}`,
@@ -3849,18 +4193,9 @@ function resolveSubagentRuntimePlans(
 	params: typeof SubagentParams.static,
 	ctx: Parameters<typeof launchSubagent>[1],
 	parentThinking: ThinkingLevel,
+	suppliedAgentDefs?: AgentDefaults | null,
 ): ResolvedRuntimePlan[] {
-	const agentDefs = params.agent
-		? loadAgentDefaults(params.agent, runtime.pi)
-		: null;
-	if (params.agent && !agentDefs) {
-		const diagnostic = discoverAgentCatalog(runtime.pi).diagnostics.find(
-			(candidate) => candidate.agentName === params.agent,
-		);
-		throw new Error(
-			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
-		);
-	}
+	const agentDefs = resolveLaunchAgentDefs(params, suppliedAgentDefs);
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
 	const plans = resolveRuntimePlans(
@@ -3891,7 +4226,7 @@ async function launchSubagentWithFallbacks(
 	ctx: Parameters<typeof launchSubagent>[1],
 	parentThinking: ThinkingLevel,
 	plans: ResolvedRuntimePlan[],
-	extra: { forceLeaf?: boolean } = {},
+	extra: { forceLeaf?: boolean; agentDefs?: AgentDefaults | null } = {},
 ): Promise<{
 	running: RunningSubagent;
 	index: number;
@@ -3904,6 +4239,7 @@ async function launchSubagentWithFallbacks(
 				running: await launchSubagent(params, ctx, parentThinking, {
 					runtimePlan: plan,
 					forceLeaf: extra.forceLeaf,
+					agentDefs: extra.agentDefs,
 				}),
 				index,
 				launchFailures,
@@ -3942,17 +4278,19 @@ function deliverPersistentTaskEvent(
 		)
 			return;
 		inFlightPersistentTaskDeliveries.add(deliveryKey);
+		const details: PersistentHelpDetails = {
+			name: running.name,
+			task: event.task,
+			sessionFile: running.sessionFile,
+		};
+		if (running.selection) details.selection = running.selection;
 		try {
 			api.sendMessage(
 				{
 					customType: "subagent_ping",
 					content: `Persistent specialist "${running.name}" requests help for task ${event.task}:\n\n${event.message ?? ""}\n\nReply with subagent_send to ${running.name}.`,
 					display: true,
-					details: {
-						name: running.name,
-						task: event.task,
-						sessionFile: running.sessionFile,
-					},
+					details,
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
@@ -3984,18 +4322,20 @@ function deliverPersistentTaskEvent(
 			? (findLastAssistantMessage(getNewEntries(running.sessionFile, 0)) ??
 				"Persistent specialist completed without output.")
 			: "Persistent specialist session is unavailable.";
+		const details: SubagentResultDetails = {
+			name: running.name,
+			task: event.task,
+			agent: running.agent,
+			sessionFile: running.sessionFile,
+			logicalId: running.logicalId!,
+			generationId: running.generationId!,
+			policyHash: running.policyHash!,
+		};
+		if (running.selection) details.selection = running.selection;
 		sendSubagentResult(
 			api,
 			`Persistent specialist "${running.name}" completed task ${event.task} (${completed} tasks completed) and is idle and accepting subagent_send.\n\n${summary}`,
-			{
-				name: running.name,
-				task: event.task,
-				agent: running.agent,
-				sessionFile: running.sessionFile,
-				logicalId: running.logicalId!,
-				generationId: running.generationId!,
-				policyHash: running.policyHash!,
-			},
+			details,
 		);
 		ledger.push(
 			appendPersistentDeliveryLedger(running.sessionFile, {
@@ -4069,7 +4409,10 @@ function notifyPersistentCrash(
 			customType: "subagent_result",
 			content: `${headline} Evidence is retained. Persistent sessions cannot be resumed in v1; spawn a new specialist.\n\n${formatPersistentSpecialistFacts(facts)}`,
 			display: true,
-			details: { error: "persistent-crash", facts },
+			details: persistentNoticeDetails(running, {
+				error: "persistent-crash",
+				facts,
+			}),
 		},
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
@@ -4109,6 +4452,8 @@ async function watchSubagent(
 			...defaultNativeWatchDependencies,
 			...runtime.nativeTestSeam?.watch,
 		});
+	if (runtime.nativeTestSeam?.piWatch)
+		return runtime.nativeTestSeam.piWatch(running, signal);
 	const { name, task, surface, startTime, sessionFile } = running;
 	const supervision = getSupervisionCoordinator().register(
 		sessionFile,
@@ -4491,19 +4836,21 @@ function flushNativePersistentDeliveries(
 		const body = completed
 			? (entry.summary ?? "Persistent specialist completed without output.")
 			: `Task ${entry.outcome}: ${entry.error ?? "no correlated Stop receipt"}`;
+		const details: SubagentResultDetails = {
+			name: running.name,
+			task: entry.task,
+			agent: running.agent,
+			sessionFile: running.sessionFile,
+			logicalId: running.logicalId!,
+			generationId: running.generationId!,
+			policyHash: running.policyHash!,
+		};
+		if (running.selection) details.selection = running.selection;
 		try {
 			sendSubagentResult(
 				api,
 				`Persistent specialist "${running.name}" ${completed ? "completed" : `settled (${entry.outcome})`} task ${entry.task} (${settled} tasks settled). ${state}\n\n${body}`,
-				{
-					name: running.name,
-					task: entry.task,
-					agent: running.agent,
-					sessionFile: running.sessionFile,
-					logicalId: running.logicalId!,
-					generationId: running.generationId!,
-					policyHash: running.policyHash!,
-				},
+				details,
 			);
 		} catch {
 			// Retry later; the task stays owed and the specialist busy.
@@ -4858,7 +5205,7 @@ async function watchSubagentWithFallbacks(
 	signal: AbortSignal,
 	completedPanes: Set<string>,
 	initialLaunchFailures: ModelFailure[] = [],
-	extra: { forceLeaf?: boolean } = {},
+	extra: { forceLeaf?: boolean; agentDefs?: AgentDefaults | null } = {},
 ): Promise<{ running: RunningSubagent; result: SubagentResult }> {
 	let running = initial;
 	let nextPlan = initialPlanIndex + 1;
@@ -4904,8 +5251,11 @@ async function watchSubagentWithFallbacks(
 					runtimePlan: plan,
 					id: initial.id,
 					forceLeaf: extra.forceLeaf,
+					agentDefs: extra.agentDefs,
 				});
 				if (initial.nestedOf) running.nestedOf = initial.nestedOf;
+				// Every attempt keeps the spawn's one immutable selection.
+				running.selection = initial.selection;
 				running.abortController = initial.abortController;
 				launchedFallback = true;
 				startWidgetRefresh();
@@ -5265,7 +5615,10 @@ function sendPersistentTerminalNotice(
 				customType: "subagent_stop",
 				content: `Persistent specialist stopped.${formatUndeliveredTasks(undelivered)}\n\n${formatPersistentSpecialistFacts(facts)}`,
 				display: true,
-				details: { status: "stopped", facts },
+				details: persistentNoticeDetails(running, {
+					status: "stopped",
+					facts,
+				}),
 			},
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
@@ -5293,6 +5646,21 @@ interface StartSubagentOptions {
 	forceLeaf?: boolean;
 	/** Aborts a native launch before its process is dispatched. */
 	signal?: AbortSignal;
+}
+
+/** A native capability failure, attributed to its projection when switched. */
+function nativeProjectionError(
+	selection: SubagentSelection,
+	reason: string,
+): AgentToolResult<any> {
+	const text =
+		selection.projected && selection.role
+			? `Role "${selection.role.name}" cannot be projected from ${selection.role.harness} to ${selection.harness}: ${reason}`
+			: reason;
+	return {
+		content: [{ type: "text", text: `Error: ${text}` }],
+		details: { error: "native-harness-unsupported" },
+	};
 }
 
 /**
@@ -5324,27 +5692,48 @@ async function startSubagentRun(
 		};
 	}
 
-	const selectedDefs = params.agent
-		? loadAgentDefaults(params.agent, runtime.pi)
-		: null;
+	// The role is resolved once; every launch attempt uses this snapshot.
+	const role =
+		(params.agent &&
+			catalog?.agents.find((agent) => agent.name === params.agent)) ||
+		null;
+	if (params.agent && !role) {
+		// Unresolved roles fail before any resource, whatever the harness.
+		const diagnostic = catalog?.diagnostics.find(
+			(candidate) => candidate.agentName === params.agent,
+		);
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Error: ${diagnostic?.message ?? `Agent "${params.agent}" was not found.`}`,
+				},
+			],
+			details: { error: diagnostic?.code ?? "agent-not-found" },
+		};
+	}
+	const projection = resolveRoleProjection(params, role);
+	if (!projection.ok) {
+		return {
+			content: [{ type: "text", text: `Error: ${projection.message}` }],
+			details: { error: projection.error },
+		};
+	}
+	const { selection, agentDefs: selectedDefs } = projection;
+
 	// Native harness capability checks run before any Herdr resource.
 	let nativeSpec: NativeLaunchSpec | undefined;
-	if (selectedDefs?.cli) {
+	if (selection.harness !== "pi" && selectedDefs) {
 		try {
 			nativeSpec = resolveNativeSpecForParams(params, {
 				...selectedDefs,
-				cli: selectedDefs.cli,
+				cli: selection.harness,
 			});
 		} catch (error) {
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-					},
-				],
-				details: { error: "native-harness-unsupported" },
-			};
+			return nativeProjectionError(
+				selection,
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 	}
 
@@ -5374,15 +5763,10 @@ async function startSubagentRun(
 				isPiModelRef: (value) => isPiModelRef(ctx.modelRegistry, value),
 			});
 		} catch (error) {
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-					},
-				],
-				details: { error: "native-harness-unsupported" },
-			};
+			return nativeProjectionError(
+				selection,
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 	}
 
@@ -5417,10 +5801,10 @@ async function startSubagentRun(
 		throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
 	}
 	const noLaunchFailures: ModelFailure[] = [];
-	// Native roles pass their own model IDs through; Pi routing never applies.
+	// Native harnesses pass their own model IDs through; Pi routing never applies.
 	const runtimePlans = nativeSpec
 		? []
-		: resolveSubagentRuntimePlans(params, ctx, parentThinking);
+		: resolveSubagentRuntimePlans(params, ctx, parentThinking, selectedDefs);
 	const worktreeLaunchWarning = resolveWorktreeLaunchWarning(
 		params,
 		runtime.pi,
@@ -5444,10 +5828,11 @@ async function startSubagentRun(
 				ctx,
 				parentThinking,
 				runtimePlans,
-				{ forceLeaf: options.forceLeaf },
+				{ forceLeaf: options.forceLeaf, agentDefs: selectedDefs },
 			);
 
 	let running = initialRunning;
+	running.selection = selection;
 	if (options.nestedOf) running.nestedOf = options.nestedOf;
 
 	// Create a separate AbortController for the watcher
@@ -5484,7 +5869,7 @@ async function startSubagentRun(
 				watcherAbort.signal,
 				completedPanes,
 				initialLaunchFailures,
-				{ forceLeaf: options.forceLeaf },
+				{ forceLeaf: options.forceLeaf, agentDefs: selectedDefs },
 			)
 	)
 		.then(({ running: completedRunning, result }) => {
@@ -5577,6 +5962,8 @@ async function startSubagentRun(
 					sessionFile: result.sessionFile!,
 				};
 				if (result.worktree) pingDetails.worktree = result.worktree;
+				if (completedRunning.selection)
+					pingDetails.selection = completedRunning.selection;
 				completionApi.sendMessage(
 					{
 						customType: "subagent_ping",
@@ -5618,6 +6005,8 @@ async function startSubagentRun(
 			if (completedRunning.runtimePlan)
 				resultDetails.runtimePlan = completedRunning.runtimePlan;
 			if (result.native) resultDetails.native = result.native;
+			if (completedRunning.selection)
+				resultDetails.selection = completedRunning.selection;
 			sendSubagentResult(completionApi, presentation, resultDetails);
 			shouldCloseTemporaryPanes = true;
 		})
@@ -5672,6 +6061,7 @@ async function startSubagentRun(
 				error: err?.message,
 				sessionFile: running.sessionFile,
 			};
+			if (running.selection) errDetails.selection = running.selection;
 			if (nativeSettlement) {
 				errDetails.native = nativeSettlement.native;
 				if (nativeSettlement.worktree)
@@ -5709,6 +6099,7 @@ async function startSubagentRun(
 		model: running.runtimePlan?.model,
 		thinking: running.runtimePlan?.thinking,
 		runtimePlan: running.runtimePlan,
+		selection,
 		status: "started",
 	};
 	if (nativePlan) {
@@ -5737,6 +6128,9 @@ async function startSubagentRun(
 						? ` in worktree ${running.worktree.path} on branch ${running.worktree.branch}. `
 						: ". ") +
 					(startedWarning ? `Warning: ${startedWarning} ` : "") +
+					(selection.harnessSource === "request"
+						? `${formatSubagentSelection(selection)} `
+						: "") +
 					`Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
 					`The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
 					`Until then, move on to other work or tell the user you're waiting.`,
@@ -6823,7 +7217,7 @@ export default function subagentsExtension(
 	// /subagent command — spawn a subagent by name, or list available agents
 	pi.registerCommand("subagent", {
 		description:
-			"Spawn a subagent: /subagent <agent> <task>; list agents: /subagent list",
+			"Spawn a subagent: /subagent <agent> [--harness pi|claude|kiro] [--model <value>] [--thinking <level>] [--] [task]; list agents: /subagent list",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "list") {
@@ -6839,35 +7233,37 @@ export default function subagentsExtension(
 				return;
 			}
 			if (!trimmed) {
-				ctx.ui.notify(
-					"Usage: /subagent <agent> [task] | /subagent list",
-					"warning",
-				);
+				ctx.ui.notify(SUBAGENT_COMMAND_USAGE, "warning");
 				return;
 			}
 
-			const spaceIdx = trimmed.indexOf(" ");
-			const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-			const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+			const parsed = parseSubagentCommand(trimmed);
+			if (!parsed.ok) {
+				ctx.ui.notify(parsed.error, "error");
+				return;
+			}
 
 			const catalog = discoverAgentCatalog(pi);
-			const defs = catalog.agents.find((agent) => agent.name === agentName);
+			const defs = catalog.agents.find((agent) => agent.name === parsed.agent);
 			if (!defs) {
 				const diagnostic = catalog.diagnostics.find(
-					(candidate) => candidate.agentName === agentName,
+					(candidate) => candidate.agentName === parsed.agent,
 				);
 				ctx.ui.notify(
-					diagnostic?.message ?? `Agent "${agentName}" not found.`,
+					diagnostic?.message ?? `Agent "${parsed.agent}" not found.`,
 					"error",
 				);
 				return;
 			}
+			// Projection rules are checked early for feedback; the tool
+			// re-validates everything, including native capabilities.
+			const projection = resolveRoleProjection(parsed, defs);
+			if (!projection.ok) {
+				ctx.ui.notify(projection.message, "error");
+				return;
+			}
 
-			const taskText =
-				task || `You are the ${agentName} agent. Wait for instructions.`;
-			const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-			const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
-			pi.sendUserMessage(toolCall);
+			pi.sendUserMessage(buildSubagentCommandMessage(parsed));
 		},
 	});
 
