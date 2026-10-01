@@ -115,6 +115,7 @@ describe("bundled orchestration skill", () => {
 			"agents/researcher.md",
 			"agents/reviewer.md",
 			"agents/scout.md",
+			"agents/tester.md",
 			"agents/visual-tester.md",
 			"agents/worker.md",
 			"pi-extension/subagents/plan-skill.md",

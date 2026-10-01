@@ -3222,6 +3222,7 @@ describe("subagent discovery", () => {
 				planner: true,
 				"visual-tester": false,
 				researcher: false,
+				tester: false,
 			} as const;
 
 			for (const [name, interactive] of Object.entries(expectedInteraction)) {

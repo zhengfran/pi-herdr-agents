@@ -184,6 +184,7 @@ See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
 | **planner** | Coordinator agent role | Config, then parent | Clarifies requirements, explores approaches, and writes plans with ordered tasks. |
 | **scout** | Leaf agent role | Config, then parent | Maps relevant code, conventions, and verification paths. |
 | **worker** | Leaf agent role | Config, then parent | Implements bounded tasks and verifies the result. |
+| **tester** | Leaf agent role | Config, then parent | Writes or extends tests for a bounded behavior and reports what they prove. |
 | **reviewer** | Leaf agent role | Config, then parent | Reviews changes for correctness, security, and maintainability. |
 | **visual-tester** | Leaf agent role | Config, then parent | Performs visual QA through the `chrome-cdp` skill. |
 | **researcher** | Leaf agent role | Config, then parent | Searches the web and returns a sourced brief through `pi-web-access` tools. |
