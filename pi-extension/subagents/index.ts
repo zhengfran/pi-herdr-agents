@@ -7703,16 +7703,7 @@ export default function subagentsExtension(
 				"DO NOT fabricate, assume, or summarize results after calling this tool. " +
 				"After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
 			promptSnippet:
-				"Spawn a sub-agent in a dedicated terminal herdr pane, or in an isolated Herdr-managed Git worktree when worktree is provided. " +
-				"Use ordinary panes for read-only tasks; a single or sequential writer can work in the parent checkout without a worktree. " +
-				"Reserve unique worktree branches for parallel independent writers starting from committed state — the worktree base is committed HEAD, so uncommitted parent changes are not copied. " +
-				"Worktree runs retain their workspace after completion for parent review; they are not pushed, merged, or removed automatically. " +
-				"To inspect a retained worktree result, spawn read-only agents in an ordinary pane with cwd set to that worktree path — do not create a new worktree for them. " +
-				"This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-				"When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-				"DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-				"DO NOT fabricate, assume, or summarize results after calling this tool. " +
-				"After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+				"Spawn an async subagent in a Herdr pane or managed worktree; its result arrives automatically as a new turn",
 			promptGuidelines: subagentRoutingGuidelines,
 			parameters: SubagentParams,
 
@@ -7874,10 +7865,7 @@ export default function subagentsExtension(
 				"Send Escape to the active turn of a currently running subagent. " +
 				"Pi-backed children stay alive. Native (cli: claude|kiro) children are interrupted only when their process ownership is verified and a correlated receipt shows the tagged turn in progress; the turn is recorded as interrupted, never as a success. " +
 				"This returns only a local acknowledgement and does not emit a subagent_result solely because of this request.",
-			promptSnippet:
-				"Send Escape to the active turn of a currently running subagent. " +
-				"Pi-backed children stay alive. Native (cli: claude|kiro) children are interrupted only when their process ownership is verified and a correlated receipt shows the tagged turn in progress; the turn is recorded as interrupted, never as a success. " +
-				"This returns only a local acknowledgement and does not emit a subagent_result solely because of this request.",
+			promptSnippet: "Interrupt the active turn of a running subagent",
 			parameters: Type.Object({
 				id: Type.Optional(
 					Type.String({ description: "Exact running subagent id" }),
@@ -7935,8 +7923,7 @@ export default function subagentsExtension(
 				"List all available package, global, and project subagent definitions. " +
 				"Project agents override global definitions, which override package definitions.",
 			promptSnippet:
-				"List all available package, global, and project subagent definitions. " +
-				"Project agents override global definitions, which override package definitions.",
+				"List available package, global, and project subagent definitions",
 			parameters: Type.Object({}),
 
 			async execute() {
@@ -8019,13 +8006,7 @@ export default function subagentsExtension(
 				"DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
 				"Use when a sub-agent was cancelled or needs follow-up work.",
 			promptSnippet:
-				"Resume a previous sub-agent session in a new herdr pane. Pi sessions use their .jsonl file; native (cli: claude|kiro) sessions use their native-sessions/<id>.json marker, require a message, and restore exactly the recorded loadout (tools, model, thinking, identity, skill snapshots, nested-spawn grant, mode, cwd). " +
-				"A Pi resume does not reattach a retained managed worktree; continue worktree-bound follow-up in its existing workspace. A worktree-bound native resume runs in an ordinary pane at the verified retained worktree and holds its lease until exit is confirmed. Persistent specialists never resume. " +
-				"This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-				"When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-				"DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-				"DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-				"Use when a sub-agent was cancelled or needs follow-up work.",
+				"Resume a previous subagent session in a new Herdr pane; its result arrives automatically",
 			parameters: Type.Object({
 				sessionPath: Type.String({
 					description:
