@@ -157,6 +157,9 @@ export function parseStatusConfig(
 	source = "config.json",
 ): StatusConfig {
 	const config = requireObject(rawConfig, source, "root");
+	if (!Object.hasOwn(config, "status")) {
+		return { enabled: true, lineLimit: DEFAULT_STATUS_LINE_LIMIT };
+	}
 	const status = requireObject(config.status, source, "status");
 	rejectUnsupportedKeys(status, ["enabled"], source, "status");
 	const enabled = requireBoolean(status.enabled, source, "status.enabled");

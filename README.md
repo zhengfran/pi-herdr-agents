@@ -336,6 +336,7 @@ or re-run `/subagents-init`.
 ```
 
 If `config.json` is absent, status, role, pane, and persistent-specialist settings fall back to `config.json.example`.
+When `config.json` exists, an omitted section uses its default (status enabled, bundled roles, grouped panes, three persistent specialists, routing off).
 Model routing does not read the example: no model overrides apply until a real
 `config.json` exists.
 

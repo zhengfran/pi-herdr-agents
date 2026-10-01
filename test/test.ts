@@ -1469,6 +1469,13 @@ describe("status.ts", () => {
 		});
 	});
 
+	it("defaults to enabled when the status section is absent", () => {
+		assert.deepEqual(parseStatusConfig({ models: { agents: {} } }), {
+			enabled: true,
+			lineLimit: 4,
+		});
+	});
+
 	it("loads a valid config file", () => {
 		const examplePath = fileURLToPath(
 			new URL("../config.json.example", import.meta.url),
