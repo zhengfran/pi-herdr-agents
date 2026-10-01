@@ -109,6 +109,12 @@ import {
 	type TaskPreferencesMeta,
 } from "./model-config.ts";
 import {
+	formatRouteCandidate,
+	loadRouteConfig,
+	type RouteConfig,
+	selectRouteCandidate,
+} from "./route-config.ts";
+import {
 	getAgentConfigDir,
 	getSubagentsConfigExamplePath,
 	getSubagentsConfigPath,
@@ -316,11 +322,28 @@ function getFirstText(
 	}
 }
 
+function buildRouteGuidelines({ routes }: RouteConfig): string[] {
+	const names = Object.keys(routes);
+	if (names.length === 0) return [];
+	return [
+		"Prefer a configured route for delegated work: call subagent with route set to the route that fits the task, and omit agent, harness, model, and thinking — the route supplies all four, trying its candidates in order. Pass those fields yourself only when the user explicitly asks for a specific role or runtime.",
+		`Configured routes: ${names
+			.map((name) => {
+				const route = routes[name];
+				const label = route.description ? ` — ${route.description}` : "";
+				return `${name}${label} [${route.candidates.map(formatRouteCandidate).join("; ")}]`;
+			})
+			.join(". ")}.`,
+	];
+}
+
 function buildSubagentRoutingGuidelines(
 	catalog?: string,
 	authenticatedTaskPreferences?: TaskPreferences,
+	routes: RouteConfig = { routes: {} },
 ): string[] {
 	return [
+		...buildRouteGuidelines(routes),
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
 		...(Object.keys(authenticatedTaskPreferences ?? {}).length > 0
@@ -355,6 +378,12 @@ const SubagentParams = Type.Object({
 			"Short stable label for the subagent; for a new coordinated group use <task>-<role>[-n] (shown in the widget and pane title)",
 	}),
 	task: Type.String({ description: "Task/prompt for the sub-agent" }),
+	route: Type.Optional(
+		Type.String({
+			description:
+				"Configured route name. The route selects agent, harness, model, and thinking together from its first usable candidate; do not combine it with those fields.",
+		}),
+	),
 	agent: Type.Optional(
 		Type.String({
 			description:
@@ -1613,6 +1642,7 @@ function closeCompletedPanes(panes: Iterable<string>): void {
 
 const statusConfig = loadStatusConfig();
 const modelConfig = loadModelConfig();
+const routeConfig = loadRouteConfig();
 const bundledRoleConfig = loadRoleConfig();
 const persistentConfig = loadPersistentConfig();
 const supervisionConfig = loadSupervisionConfig();
@@ -6773,6 +6803,82 @@ function consumePreparedRun(
  * a pane, workspace, or worktree. Shared by the subagent tool, authenticated nested-spawn
  * requests, and the routing coordinator's bound automatic prepared run.
  */
+function routeError(error: string, text: string): AgentToolResult<any> {
+	return {
+		content: [{ type: "text", text: `Error: ${text}` }],
+		details: { error },
+	};
+}
+
+/**
+ * Expand a route into the first candidate whose ordinary preparation
+ * succeeds. Preparation is resource-free, so rejected candidates leave
+ * nothing behind; the launch then runs on the chosen candidate's fields.
+ */
+function prepareRoutedRun(
+	pi: ExtensionAPI,
+	params: Static<typeof SubagentParams>,
+	ctx: Parameters<typeof launchSubagent>[1],
+	forceLeaf: boolean | undefined,
+):
+	| {
+			ok: true;
+			params: Static<typeof SubagentParams>;
+			preparation: SubagentPreparation;
+	  }
+	| { ok: false; result: AgentToolResult<any> } {
+	const name = params.route ?? "";
+	const conflicting = (
+		["agent", "harness", "model", "thinking"] as const
+	).filter((field) => params[field] !== undefined);
+	if (conflicting.length > 0)
+		return {
+			ok: false,
+			result: routeError(
+				"route-conflict",
+				`route "${name}" selects agent, harness, model, and thinking; remove ${conflicting.join(", ")} from this call. Nothing was launched.`,
+			),
+		};
+	const route = Object.hasOwn(routeConfig.routes, name)
+		? routeConfig.routes[name]
+		: undefined;
+	if (!route) {
+		const known = Object.keys(routeConfig.routes);
+		return {
+			ok: false,
+			result: routeError(
+				"route-not-found",
+				`route "${name}" is not configured. ${known.length > 0 ? `Configured routes: ${known.join(", ")}.` : "No routes are configured in herdr-agents/config.json."} Nothing was launched.`,
+			),
+		};
+	}
+	const selection = selectRouteCandidate(route, (candidate) => {
+		const candidateParams = {
+			...params,
+			route: undefined,
+			agent: candidate.agent,
+			harness: candidate.harness,
+			model: candidate.model,
+			thinking: candidate.thinking,
+		};
+		const preparation = prepareSubagentRun(pi, candidateParams, ctx, {
+			forceLeaf,
+		});
+		return preparation.ok
+			? { ok: true, value: { params: candidateParams, preparation } }
+			: { ok: false, reason: getFirstText(preparation.result.content) };
+	});
+	if (!("candidate" in selection))
+		return {
+			ok: false,
+			result: routeError(
+				"route-unavailable",
+				`no candidate of route "${name}" can launch. ${selection.skipped.map(({ candidate, reason }) => `${formatRouteCandidate(candidate)}: ${reason}`).join("; ")}. Nothing was launched.`,
+			),
+		};
+	return { ok: true, ...selection.value };
+}
+
 async function startSubagentRun(
 	pi: ExtensionAPI,
 	params: Static<typeof SubagentParams>,
@@ -6796,12 +6902,20 @@ async function startSubagentRun(
 		(!options.prepared || !autoRunBindingAuthorizes(autoRun, options.prepared))
 	)
 		return invalidBinding;
-	const preparation = options.prepared
-		? consumePreparedRun(pi, params, ctx, options.prepared, options)
-		: prepareSubagentRun(pi, params, ctx, {
-				forceLeaf: options.forceLeaf,
-				auto: options.auto,
-			});
+	let preparation: SubagentPreparation;
+	if (params.route !== undefined && !options.prepared && !options.auto) {
+		const routed = prepareRoutedRun(pi, params, ctx, options.forceLeaf);
+		if (!routed.ok) return routed.result;
+		params = routed.params;
+		preparation = routed.preparation;
+	} else {
+		preparation = options.prepared
+			? consumePreparedRun(pi, params, ctx, options.prepared, options)
+			: prepareSubagentRun(pi, params, ctx, {
+					forceLeaf: options.forceLeaf,
+					auto: options.auto,
+				});
+	}
 	if (!preparation.ok) return preparation.result;
 	const {
 		selection,
@@ -7526,6 +7640,7 @@ export default function subagentsExtension(
 		const refreshedGuidelines = buildSubagentRoutingGuidelines(
 			runtime.modelCatalog,
 			authenticatedTaskPreferences,
+			routeConfig,
 		);
 		subagentRoutingGuidelines.splice(
 			0,

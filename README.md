@@ -397,6 +397,42 @@ authoring family is known; `task:review` does not establish independence. Family
 is the independence boundary; project policy may separately require a different
 provider. This is guidance, not extension enforcement.
 
+### Routes
+
+A route names one kind of delegated work and lists, in order, complete launch
+choices for it: role, harness, exact model, and thinking together. Define routes
+in the top-level `routes` section of `config.json`:
+
+```json
+{
+  "routes": {
+    "review": {
+      "description": "Code review of a finished change",
+      "candidates": [
+        { "agent": "reviewer", "harness": "pi", "model": "openai-codex/gpt-6-astra", "thinking": "high" },
+        { "agent": "reviewer", "harness": "claude", "model": "opus", "thinking": "high" }
+      ]
+    }
+  }
+}
+```
+
+Call `subagent({ route: "review", name, task })` without `agent`, `harness`,
+`model`, or `thinking`; combining them with `route` is rejected. Before any
+Herdr resource exists, each candidate goes through ordinary spawn preparation
+in order: role discovery, harness projection, native CLI availability, and Pi
+model resolution. The first candidate that prepares launches. When none can,
+the call fails and reports every candidate's reason. A route chooses only at
+launch; a launched child does not move to a later candidate.
+
+Route names match `^[a-z][a-z0-9-]{0,39}$`. Each route has 1–16 candidates and
+an optional description of at most 256 characters. A Pi candidate's `model` is
+one exact `provider/model-id`; a native candidate's is one native CLI model ID
+with thinking `low` through `max`. Lists and `task:` aliases are rejected.
+Configured routes, with their candidates, are added to the parent's `subagent`
+guidelines at session start. Routes are manual-launch choices only: they do not
+enable or authorize automatic input routing.
+
 Task preferences and manual APIs do **not** enable or authorize automatic input
 routing. `/subagents-init` and `subagents_write_task_models` preserve unrelated
 valid `autoRouting` semantics without granting consent or approving tuples.
