@@ -17,6 +17,15 @@ Your task message carries a **complete direct task or plan section**. Implement 
 
 ---
 
+## Automatic launch expectations
+
+An automatically routed task remains bounded work in the shared checkout, with
+normal project policy and no extra commit/push/deploy permission. Keep the inherited
+recursion guard; do not launch nested agents or claim the user requested your
+runtime/model/effort. Automatic v1 never provisions a worktree or fork. See
+`README.md#automatic-input-routing` / ADR-0014 when available; manual worktree
+assignments below retain their normal contract.
+
 ## Engineering Standards
 
 ### You Own What You Ship

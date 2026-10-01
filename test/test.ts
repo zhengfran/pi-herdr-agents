@@ -1243,10 +1243,17 @@ describe("session.ts", () => {
 				},
 			]);
 
-			assert.throws(
-				() => createBtwSessionSnapshot(parentFile, "only-user"),
-				/did not persist/i,
-			);
+			const prototype = SessionManager.prototype;
+			const createBranchedSession = prototype.createBranchedSession;
+			prototype.createBranchedSession = () => join(dir, "missing-child.jsonl");
+			try {
+				assert.throws(
+					() => createBtwSessionSnapshot(parentFile, "only-user"),
+					/did not persist/i,
+				);
+			} finally {
+				prototype.createBranchedSession = createBranchedSession;
+			}
 		});
 	});
 
@@ -6505,6 +6512,29 @@ describe("commands", () => {
 		assert.match(command, /What does that API do\?/);
 		assert.match(command, /PI_CODING_AGENT_DIR=/);
 		assert.doesNotMatch(command, /subagent-done|PI_SUBAGENT_|subagent_result/);
+		// The side session carries only the routing recursion marker: the
+		// Jev credential, model, extensions, and session are untouched.
+		assert.ok(
+			command.startsWith(
+				"cd '/tmp/project path' && PI_CODING_AGENT_DIR='/tmp/pi-agent' PI_HERDR_AUTO_ROUTING_DISABLED=1 pi --session '/tmp/btw.jsonl' --no-extensions --model 'openai-codex/gpt-5.6-sol' --thinking 'high' 'You are answering an ephemeral BTW side question.",
+			),
+			command,
+		);
+		assert.ok(command.endsWith("What does that API do?'"), command);
+		assert.doesNotMatch(command, /TYPESAFE_API_KEY|unset /);
+		const bare = subagentsModule.__test__.buildBtwLaunchCommand({
+			cwd: "/tmp/project",
+			sessionFile: "/tmp/btw.jsonl",
+			question: "Why?",
+			model: "openai-codex/gpt-5.6-sol",
+			thinking: "high",
+		});
+		assert.ok(
+			bare.startsWith(
+				"cd '/tmp/project' && PI_HERDR_AUTO_ROUTING_DISABLED=1 pi --session '/tmp/btw.jsonl' --no-extensions ",
+			),
+			bare,
+		);
 	});
 
 	it("/iterate always emits a full-context fork tool call", () => {

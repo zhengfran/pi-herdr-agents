@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
+	LaunchAbortedError,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	type FreshPiLaunchRequest,
@@ -1261,14 +1262,31 @@ describe("Pi launch", () => {
 				readFileSync(request.parent.sessionFile, "utf8"),
 				parentBefore,
 			);
-			assert.ok(
-				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
-			);
+			const prefix = `cd ${expectedShellQuote(worktreePath)} && `;
+			assert.ok(command.startsWith(prefix));
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,
 			);
 			assert.doesNotMatch(command, /Implement the bounded change/);
+			// The handoff session gets exactly the routing recursion marker; it
+			// keeps the Jev credential and its model, tools, and session.
+			const [environment, launched] = command
+				.slice(prefix.length)
+				.split(" pi --session ");
+			assert.deepEqual(
+				environment
+					.split(" ")
+					.filter((entry) => !entry.startsWith("PI_CODING_AGENT_DIR=")),
+				["PI_HERDR_AUTO_ROUTING_DISABLED=1"],
+			);
+			assert.ok(
+				launched.startsWith(
+					`${expectedShellQuote(result.running.sessionFile)} --model 'fake/worker' --thinking 'high' `,
+				),
+				command,
+			);
+			assert.doesNotMatch(command, /TYPESAFE_API_KEY|unset /);
 			const child = JSON.parse(
 				readFileSync(result.running.sessionFile, "utf8").split("\n")[0],
 			);
@@ -1607,6 +1625,266 @@ describe("Pi launch", () => {
 				readFileSync(request.parent.sessionFile, "utf8"),
 				parentBefore,
 			);
+		});
+	});
+});
+
+/**
+ * A package guard that records every boundary it sees and the latch it
+ * holds, failing at `stopAt` the way the coordinator's guards do.
+ */
+function recordingGuard(
+	events: string[],
+	stopAt?: "beforeResources" | "commitDispatch",
+) {
+	const guard = {
+		state: "uncommitted",
+		beforeResources() {
+			events.push("guard:resources");
+			if (stopAt === "beforeResources")
+				throw new Error("stale before resources");
+		},
+		resourcesCreated() {
+			events.push("guard:created");
+			guard.state = "resources-created";
+		},
+		commitDispatch() {
+			events.push("guard:dispatch");
+			if (stopAt === "commitDispatch") throw new Error("stale before dispatch");
+			guard.state = "dispatch-attempted";
+		},
+	};
+	return guard;
+}
+
+/** Fake Herdr operations recording pane, readiness, and dispatch events. */
+function recordingOperations(
+	events: string[],
+	options: {
+		ready?: () => Promise<void>;
+		run?: () => void;
+	} = {},
+) {
+	const closed: string[] = [];
+	const commands: string[] = [];
+	const operations: PiLaunchOperations = {
+		createPane() {
+			events.push("create");
+			return "auto-pane";
+		},
+		createWorktree() {
+			throw new Error("unexpected worktree creation");
+		},
+		async waitForShellReady() {
+			events.push("ready");
+			await options.ready?.();
+		},
+		runScript(_surface, command, script) {
+			events.push("run");
+			commands.push(command);
+			options.run?.();
+			return script.scriptPath;
+		},
+		closePane(surface) {
+			closed.push(surface);
+		},
+	};
+	return { operations, closed, commands };
+}
+
+describe("automatic Pi launch guards", () => {
+	it("creates no pane when the guard is stale before resources", async () => {
+		await withFixture(async ({ request }) => {
+			const events: string[] = [];
+			const guard = recordingGuard(events, "beforeResources");
+			const herdr = recordingOperations(events);
+			await assert.rejects(
+				launchPiSubagent(
+					{ ...request, automatic: { guard } },
+					herdr.operations,
+				),
+				/stale before resources/,
+			);
+			assert.deepEqual(events, ["guard:resources"]);
+			assert.equal(guard.state, "uncommitted");
+			assert.deepEqual(herdr.closed, []);
+		});
+	});
+
+	it("creates no pane when the package signal aborted before resources", async () => {
+		await withFixture(async ({ request }) => {
+			const events: string[] = [];
+			const controller = new AbortController();
+			controller.abort();
+			const herdr = recordingOperations(events);
+			await assert.rejects(
+				launchPiSubagent(
+					{
+						...request,
+						automatic: { guard: recordingGuard(events) },
+						signal: controller.signal,
+					},
+					herdr.operations,
+				),
+				LaunchAbortedError,
+			);
+			assert.deepEqual(events, []);
+		});
+	});
+
+	it("dispatches nothing and closes only its own pane when aborted during the shell wait", async () => {
+		await withFixture(async ({ request }) => {
+			const events: string[] = [];
+			const controller = new AbortController();
+			let entered!: () => void;
+			const waiting = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const guard = recordingGuard(events);
+			const herdr = recordingOperations(events, {
+				// The shell never becomes ready on its own.
+				ready: () => {
+					entered();
+					return new Promise<void>(() => {});
+				},
+			});
+			const launching = launchPiSubagent(
+				{ ...request, automatic: { guard }, signal: controller.signal },
+				herdr.operations,
+			);
+			await waiting;
+			controller.abort();
+			await assert.rejects(launching, LaunchAbortedError);
+			assert.deepEqual(events, [
+				"guard:resources",
+				"create",
+				"guard:created",
+				"ready",
+			]);
+			assert.equal(guard.state, "resources-created");
+			assert.deepEqual(herdr.closed, ["auto-pane"]);
+		});
+	});
+
+	it("dispatches nothing and closes its pane when the guard fails after readiness", async () => {
+		await withFixture(async ({ request }) => {
+			const events: string[] = [];
+			const guard = recordingGuard(events, "commitDispatch");
+			const herdr = recordingOperations(events);
+			await assert.rejects(
+				launchPiSubagent(
+					{ ...request, automatic: { guard } },
+					herdr.operations,
+				),
+				/stale before dispatch/,
+			);
+			assert.deepEqual(events, [
+				"guard:resources",
+				"create",
+				"guard:created",
+				"ready",
+				"guard:dispatch",
+			]);
+			assert.equal(guard.state, "resources-created");
+			assert.deepEqual(herdr.closed, ["auto-pane"]);
+		});
+	});
+
+	it("keeps the pane of a possibly sent automatic command when runScript throws", async () => {
+		await withFixture(async ({ request }) => {
+			const events: string[] = [];
+			const guard = recordingGuard(events);
+			const herdr = recordingOperations(events, {
+				run: () => {
+					throw new Error("acknowledgement lost after sending");
+				},
+			});
+			await assert.rejects(
+				launchPiSubagent(
+					{ ...request, automatic: { guard } },
+					herdr.operations,
+				),
+				/acknowledgement lost/,
+			);
+			// Latched before runScript; the throw cannot reset it.
+			assert.equal(guard.state, "dispatch-attempted");
+			assert.deepEqual(events.slice(-2), ["guard:dispatch", "run"]);
+			assert.deepEqual(herdr.closed, [], "a possibly running pane is kept");
+		});
+	});
+
+	it("suppresses inherited routing and the Jev key only for automatic commands", async () => {
+		await withFixture(async ({ request, project }) => {
+			const manual = recordingOperations([]);
+			await launchPiSubagent(request, manual.operations);
+			const automatic = recordingOperations([]);
+			await launchPiSubagent(
+				{ ...request, id: "child-auto", automatic: {} },
+				automatic.operations,
+			);
+			const [manualCommand] = manual.commands;
+			const [autoCommand] = automatic.commands;
+			assert.doesNotMatch(manualCommand, /TYPESAFE_API_KEY/);
+			assert.doesNotMatch(manualCommand, /PI_HERDR_AUTO_ROUTING_DISABLED/);
+			assert.ok(
+				autoCommand.startsWith(
+					`cd ${expectedShellQuote(project)} && unset TYPESAFE_API_KEY && export PI_HERDR_AUTO_ROUTING_DISABLED=1 && `,
+				),
+				autoCommand,
+			);
+			// The child gate stays, alongside the explicit automatic marker.
+			assert.match(autoCommand, /PI_SUBAGENT_ID='child-auto'/);
+			// Apart from the prefix, the command is the manual one.
+			const strip = (command: string) =>
+				command
+					.replace(
+						" unset TYPESAFE_API_KEY && export PI_HERDR_AUTO_ROUTING_DISABLED=1 &&",
+						"",
+					)
+					.replace(/child-auto|child-1/g, "ID")
+					.replace(/[^' ]*\/(sessions|context)\/[^' ]*/g, "PATH");
+			assert.equal(strip(autoCommand), strip(manualCommand));
+			// The parent's own environment is never changed.
+			assert.equal(process.env.PI_HERDR_AUTO_ROUTING_DISABLED, undefined);
+		});
+	});
+
+	it("runs the automatic shell prefix without the Jev key and with the marker", () => {
+		const probe = execFileSync(
+			"bash",
+			[
+				"-c",
+				`unset TYPESAFE_API_KEY && export PI_HERDR_AUTO_ROUTING_DISABLED=1 && printf '%s|%s' "\${TYPESAFE_API_KEY-unset}" "$PI_HERDR_AUTO_ROUTING_DISABLED"`,
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, TYPESAFE_API_KEY: "parent-secret" },
+			},
+		);
+		assert.equal(probe, "unset|1");
+	});
+
+	it("rejects an automatic worktree, handoff, or caller surface before resources", async () => {
+		await withFixture(async ({ request }) => {
+			for (const placement of [
+				{ worktree: { branch: "auto" } },
+				{ surface: "caller-pane" },
+			]) {
+				const events: string[] = [];
+				const herdr = recordingOperations(events);
+				await assert.rejects(
+					launchPiSubagent(
+						{
+							...request,
+							...placement,
+							automatic: { guard: recordingGuard(events) },
+						},
+						herdr.operations,
+					),
+					/only a fresh launch in its own ordinary pane/,
+				);
+				assert.deepEqual(events, []);
+			}
 		});
 	});
 });

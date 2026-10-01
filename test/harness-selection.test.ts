@@ -10,7 +10,16 @@
 import "./isolated-agent-dir.ts";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR!;
@@ -39,6 +48,7 @@ const {
 	registered,
 	resultFor,
 	resume,
+	skillCommands,
 	start,
 	testApi,
 	useHerdr,
@@ -49,6 +59,12 @@ const {
 const { scratch } = await import("./native-fixtures.ts");
 const { appendPersistentTaskEvent } = await import(
 	"../pi-extension/subagents/session.ts"
+);
+const { autoRoutingConfigDigest, parseAutoRoutingConfig } = await import(
+	"../pi-extension/subagents/auto-routing-config.ts"
+);
+const { createNativeHarnessOperations } = await import(
+	"../pi-extension/subagents/native-harness.ts"
 );
 
 writeRole("hs-pi-open", [
@@ -119,6 +135,45 @@ writeRole("hs-delegator", [
 	"tools: read",
 	"spawn-agents: hs-claude-open",
 ]);
+// Autonomous leaf roles an administrator can approve for automatic spawns.
+writeRole("hs-auto-pi", [
+	"model: fake/pinned",
+	"thinking: low",
+	"auto-exit: true",
+	"tools: read, bash",
+	"spawning: false",
+]);
+writeRole("hs-auto-claude", [
+	"cli: claude",
+	"model: opus",
+	"thinking: high",
+	"auto-exit: true",
+	"tools: read, bash",
+	"spawning: false",
+]);
+writeRole("hs-auto-skilled", [
+	"cli: claude",
+	"auto-exit: true",
+	"tools: read, bash",
+	"spawning: false",
+	"skills: hs-auto-skill",
+]);
+writeRole("hs-auto-interactive", [
+	"auto-exit: false",
+	"tools: read",
+	"spawning: false",
+]);
+writeRole("hs-auto-spawner", [
+	"auto-exit: true",
+	"tools: read, subagent",
+	"spawning: true",
+]);
+writeRole("hs-auto-hidden", [
+	"auto-exit: true",
+	"tools: read",
+	"spawning: false",
+	"disable-model-invocation: true",
+]);
 
 type StartParams = Parameters<typeof testApi.startSubagentRun>[1];
 
@@ -133,6 +188,7 @@ interface PiChild {
 interface PiOutcome {
 	exitCode?: number;
 	errorMessage?: string;
+	ping?: { name: string; message: string };
 }
 
 /** A Pi registry with authenticated reasoning models under provider `fake`. */
@@ -990,4 +1046,1392 @@ describe("role projection contract", () => {
 			agentDefs: null,
 		});
 	});
+});
+
+const AUTO_SHA = "a".repeat(64);
+
+function approvedRole(id: string, agent: string) {
+	return {
+		id,
+		agent,
+		source: "global",
+		definitionSha256: AUTO_SHA,
+		labelRole: "build",
+		intent: "modify",
+		purpose: "task",
+		responsibility: "Bounded test responsibility.",
+		deliverable: "A short report.",
+		excludes: "External actions.",
+	};
+}
+
+function approvedCandidate(
+	id: string,
+	roleId: string,
+	harness: "pi" | "claude" | "kiro",
+	model: string,
+	effort: string,
+	preference: number,
+) {
+	return {
+		id,
+		roleId,
+		harness,
+		model:
+			harness === "pi"
+				? { namespace: "pi", ref: model }
+				: { namespace: harness, id: model },
+		effort,
+		tier: "mid",
+		family: "fake-family",
+		taskStrengths: "Offline fixture strengths.",
+		limitations: "Offline fixture limitations.",
+		capabilityEvidence: "Offline fixture evidence.",
+		preference,
+	};
+}
+
+/** An administrator-approved enabled configuration, as the loader returns it. */
+function enabledAutoRouting() {
+	const config = parseAutoRoutingConfig(
+		{
+			autoRouting: {
+				version: 1,
+				mode: "auto",
+				policyVersion: "jev-auto-v1",
+				questionVersion: "jev-auto-questions-v1",
+				consent: {
+					disclosureVersion: "jev-egress-v1",
+					acknowledgedAt: "2026-09-30T00:00:00Z",
+					sendCurrentPromptAndReviewedProfiles: true,
+				},
+				jev: { provider: "typesafe", model: "jev-1.13.0", timeoutMs: 5000 },
+				roles: [
+					approvedRole("auto-pi", "hs-auto-pi"),
+					approvedRole("auto-claude", "hs-auto-claude"),
+					approvedRole("auto-skilled", "hs-auto-skilled"),
+					approvedRole("auto-interactive", "hs-auto-interactive"),
+					approvedRole("auto-spawner", "hs-auto-spawner"),
+					approvedRole("auto-hidden", "hs-auto-hidden"),
+				],
+				candidates: [
+					approvedCandidate(
+						"pi-on-claude",
+						"auto-claude",
+						"pi",
+						"fake/pi-2",
+						"high",
+						1,
+					),
+					approvedCandidate(
+						"claude-on-pi",
+						"auto-pi",
+						"claude",
+						"claude-dest-4",
+						"high",
+						2,
+					),
+					approvedCandidate(
+						"pi-same",
+						"auto-pi",
+						"pi",
+						"fake/exact-1",
+						"medium",
+						3,
+					),
+					approvedCandidate(
+						"kiro-on-claude",
+						"auto-claude",
+						"kiro",
+						"kiro-dest-2",
+						"medium",
+						4,
+					),
+					approvedCandidate(
+						"pi-plain",
+						"auto-pi",
+						"pi",
+						"fake/plain-1",
+						"high",
+						5,
+					),
+					approvedCandidate(
+						"pi-sparse",
+						"auto-pi",
+						"pi",
+						"fake/sparse-1",
+						"medium",
+						6,
+					),
+					approvedCandidate(
+						"pi-gone",
+						"auto-pi",
+						"pi",
+						"fake/gone-3",
+						"medium",
+						7,
+					),
+					approvedCandidate(
+						"claude-pi-ref",
+						"auto-pi",
+						"claude",
+						"fake/pi-2",
+						"high",
+						8,
+					),
+					approvedCandidate(
+						"skilled-claude",
+						"auto-skilled",
+						"claude",
+						"claude-dest-4",
+						"medium",
+						9,
+					),
+					approvedCandidate(
+						"interactive-pi",
+						"auto-interactive",
+						"pi",
+						"fake/pi-2",
+						"high",
+						10,
+					),
+					approvedCandidate(
+						"spawner-pi",
+						"auto-spawner",
+						"pi",
+						"fake/pi-2",
+						"high",
+						11,
+					),
+					approvedCandidate(
+						"hidden-pi",
+						"auto-hidden",
+						"pi",
+						"fake/pi-2",
+						"high",
+						12,
+					),
+					approvedCandidate(
+						"pi-virtual",
+						"auto-pi",
+						"pi",
+						"fake/router-1",
+						"high",
+						13,
+					),
+				],
+			},
+		},
+		"test.json",
+	);
+	if (config.mode === "off") throw new Error("expected an enabled config");
+	return {
+		status: "enabled" as const,
+		source: "test.json",
+		config,
+		digest: autoRoutingConfigDigest(config),
+	};
+}
+
+const autoState = enabledAutoRouting();
+const authorize = (candidateId: string) =>
+	testApi.createAutoLaunchAuthorization(autoState, candidateId);
+
+/**
+ * A Pi registry with physical reasoning, non-reasoning, and sparse models,
+ * and one virtual routing model, each with its model API as Pi reports it.
+ */
+function autoCtx(project: string) {
+	const api = "openai-completions";
+	const models = [
+		{ provider: "fake", id: "parent", api, reasoning: true },
+		{ provider: "fake", id: "pi-2", api, reasoning: true },
+		{ provider: "fake", id: "exact-1", api, reasoning: true },
+		{ provider: "fake", id: "pinned", api, reasoning: true },
+		{ provider: "fake", id: "plain-1", api, reasoning: false },
+		{ provider: "fake", id: "router-1", api: "pi-virtual", reasoning: true },
+		{
+			provider: "fake",
+			id: "sparse-1",
+			api,
+			reasoning: true,
+			thinkingLevelMap: {
+				off: "off",
+				minimal: "minimal",
+				low: "low",
+				medium: null,
+				high: "high",
+			},
+		},
+	];
+	return {
+		...ctxFor(project),
+		model: { provider: "fake", id: "parent" },
+		modelRegistry: {
+			find: (provider: string, id: string) =>
+				models.find((model) => model.provider === provider && model.id === id),
+			getAvailable: () => models,
+			hasConfiguredAuth: () => true,
+		},
+	};
+}
+
+/** Every file below the given directories, for no-write assertions. */
+function filesBelow(...directories: string[]): string[] {
+	return directories
+		.flatMap((directory) =>
+			existsSync(directory)
+				? readdirSync(directory, { recursive: true }).map(
+						(entry) => `${directory}/${entry}`,
+					)
+				: [],
+		)
+		.sort();
+}
+
+describe("automatic launch authorization", () => {
+	it("mints only from a loaded, unmodified approval and copies its exact tuple", () => {
+		const authorization = authorize("pi-on-claude");
+		assert.ok(Object.isFrozen(authorization));
+		assert.equal(authorization.harness, "pi");
+		assert.equal(authorization.model, "fake/pi-2");
+		assert.equal(authorization.effort, "high");
+		assert.equal(authorization.role.agent, "hs-auto-claude");
+		assert.equal(authorization.configDigest, autoState.digest);
+		assert.throws(() => authorize("missing"), /is not approved/);
+		assert.throws(
+			() =>
+				testApi.createAutoLaunchAuthorization(
+					{ ...autoState, digest: "0".repeat(64) },
+					"pi-on-claude",
+				),
+			/unmodified enabled autoRouting/,
+		);
+		// A hand-built approval that the strict schema rejects never mints.
+		// SAFETY: deliberately untyped, since the type system would reject
+		// the unrepresentable native effort this value smuggles in.
+		const invalid: any = {
+			...autoState.config,
+			candidates: [{ ...autoState.config.candidates[1], effort: "minimal" }],
+		};
+		assert.throws(
+			() =>
+				testApi.createAutoLaunchAuthorization(
+					{
+						...autoState,
+						config: invalid,
+						digest: autoRoutingConfigDigest(invalid),
+					},
+					"claude-on-pi",
+				),
+			/requires a valid autoRouting configuration/,
+		);
+	});
+
+	it("never accepts an automatic selection from public tool or command arguments", async () => {
+		const properties = Object.keys(subagentTool().parameters.properties);
+		assert.ok(
+			!properties.some((key) => /auto|prepared|authori[sz]/i.test(key)),
+			properties.join(", "),
+		);
+		const project = scratch("hs-auto-forge");
+		const herdr = useHerdr({ log: join(project, "..", "auto-forge.json") });
+		const authorization = authorize("pi-on-claude");
+		// SAFETY: deliberately untyped tool arguments that try to smuggle an
+		// automatic selection past the public schema.
+		const forged: any = {
+			name: "hs-auto-forged",
+			task: "Task",
+			agent: "hs-auto-claude",
+			harness: "pi",
+			auto: authorization,
+			autoAuthorization: authorization,
+			prepared: authorization,
+			harnessSource: "auto",
+		};
+		const result = await executeTool(project, forged);
+		assert.equal(result.details.error, "harness-switch-requires-model");
+		assert.deepEqual(herdr.events, []);
+
+		// A launch that passes validation still records a manual request.
+		const log = join(project, "..", "auto-forge-launch.json");
+		useHerdr({ log });
+		const launched = await executeTool(project, {
+			...forged,
+			name: "hs-auto-forged-launch",
+			agent: "hs-auto-pi",
+			harness: "claude",
+			model: "claude-dest-4",
+		});
+		assert.equal(launched.details.status, "started", textOf(launched));
+		assert.equal(launched.details.selection.harnessSource, "request");
+		const settled = await resultFor("hs-auto-forged-launch");
+		assert.equal(settled.details.selection.harnessSource, "request");
+
+		const notices: Array<{ text: string; level: string }> = [];
+		const commandCtx = {
+			ui: {
+				notify: (text: string, level: string) => notices.push({ text, level }),
+			},
+		};
+		const dispatched = userMessages.length;
+		for (const [args, error] of [
+			["hs-auto-claude --auto Task", /Unknown option --auto/],
+			[
+				"hs-auto-claude --harness auto Task",
+				/--harness must be one of pi, claude, kiro/,
+			],
+			[
+				"hs-auto-claude --harness pi Task",
+				/requires an explicit Pi provider\/model-id/,
+			],
+		] as const) {
+			notices.length = 0;
+			await commands.get("subagent").handler(args, commandCtx);
+			assert.equal(notices.length, 1, args);
+			assert.match(notices[0].text, error, args);
+		}
+		assert.equal(userMessages.length, dispatched);
+	});
+
+	it("rejects forged, reused-shape, and mismatched authorizations before any resource", async () => {
+		const project = scratch("hs-auto-invalid");
+		const herdr = useHerdr({ log: join(project, "..", "auto-invalid.json") });
+		const before = testApi.runningSubagents.size;
+		const authorization = authorize("pi-on-claude");
+		const cases: Array<[StartParams, any, RegExp]> = [
+			// Structural copies of a genuine authorization are not verified.
+			[
+				{ name: "hs-auto-copy", task: "Task", agent: "hs-auto-claude" },
+				{ ...authorization },
+				/not a verified administrator approval/,
+			],
+			[
+				{ name: "hs-auto-proto", task: "Task", agent: "hs-auto-claude" },
+				Object.create(authorization),
+				/not a verified administrator approval/,
+			],
+			[
+				{ name: "hs-auto-true", task: "Task", agent: "hs-auto-claude" },
+				true,
+				/not a verified administrator approval/,
+			],
+			// The approval names another role.
+			[
+				{ name: "hs-auto-other", task: "Task", agent: "hs-auto-pi" },
+				authorization,
+				/Approved role "hs-auto-claude" \(global\) is not the role/,
+			],
+			// Harness and model come only from the approved tuple.
+			[
+				{
+					name: "hs-auto-harness",
+					task: "Task",
+					agent: "hs-auto-claude",
+					harness: "pi",
+				},
+				authorization,
+				/only from its approved tuple/,
+			],
+			[
+				{
+					name: "hs-auto-model",
+					task: "Task",
+					agent: "hs-auto-claude",
+					model: "fake/exact-1",
+				},
+				authorization,
+				/only from its approved tuple/,
+			],
+		];
+		for (const [params, auto, reason] of cases) {
+			const result = await testApi.startSubagentRun(
+				api,
+				params,
+				autoCtx(project),
+				{ auto },
+			);
+			assert.equal(result.details.error, "auto-authorization-invalid");
+			assert.match(textOf(result), reason);
+			const prepared = testApi.prepareSubagentRun(
+				api,
+				params,
+				autoCtx(project),
+				{ auto },
+			);
+			assert.equal(prepared.ok, false);
+		}
+		const forgedProjection = testApi.resolveRoleProjection(
+			{ agent: "hs-auto-claude" },
+			testApi.loadAgentDefaults("hs-auto-claude"),
+			{ ...authorization },
+		);
+		assert.equal(forgedProjection.ok, false);
+		assert.deepEqual(herdr.events, []);
+		assert.equal(testApi.runningSubagents.size, before);
+	});
+
+	it("replaces a pinned runtime across harnesses only with a verified authorization", async () => {
+		const project = scratch("hs-auto-pi");
+		const manual = await testApi.startSubagentRun(
+			api,
+			{
+				name: "hs-auto-manual",
+				task: "Task",
+				agent: "hs-auto-claude",
+				harness: "pi",
+			},
+			autoCtx(project),
+		);
+		assert.equal(manual.details.error, "harness-switch-requires-model");
+
+		const pi = usePiRecorder();
+		const toPi = testApi.prepareSubagentRun(
+			api,
+			{ name: "hs-auto-to-pi", task: "Task", agent: "hs-auto-claude" },
+			autoCtx(project),
+			{ auto: authorize("pi-on-claude") },
+		);
+		assert.ok(toPi.ok, JSON.stringify(toPi));
+		assert.deepEqual(toPi.prepared.selection, {
+			harness: "pi",
+			harnessSource: "auto",
+			projected: true,
+			role: { name: "hs-auto-claude", source: "global", harness: "claude" },
+		});
+		assert.deepEqual(toPi.prepared.runtimePlans, [
+			{
+				provider: "fake",
+				modelId: "pi-2",
+				model: "fake/pi-2",
+				thinking: "high",
+				modelSource: "auto",
+				thinkingSource: "auto",
+				// The role's own Claude pin and effort are what the tuple
+				// replaced; no Pi default below the projection is ever involved.
+				provenance: {
+					version: 1,
+					model: {
+						source: "auto",
+						replaced: { value: "opus", source: "role", harness: "claude" },
+					},
+					thinking: {
+						source: "auto",
+						replaced: { value: "high", source: "role", harness: "claude" },
+					},
+				},
+			},
+		]);
+		assert.deepEqual(
+			toPi.prepared.provenance,
+			toPi.prepared.runtimePlans[0].provenance,
+		);
+
+		// Same-harness replacement records the role pin it replaced.
+		const same = testApi.prepareSubagentRun(
+			api,
+			{ name: "hs-auto-same", task: "Task", agent: "hs-auto-pi" },
+			autoCtx(project),
+			{ auto: authorize("pi-same") },
+		);
+		assert.ok(same.ok, JSON.stringify(same));
+		assert.equal(same.prepared.selection.harnessSource, "auto");
+		assert.equal(same.prepared.selection.projected, false);
+		const [samePlan] = same.prepared.runtimePlans;
+		assert.equal(samePlan.model, "fake/exact-1");
+		assert.equal(samePlan.requestedModel, undefined);
+		assert.equal(samePlan.requestedThinking, undefined);
+		assert.deepEqual(samePlan.provenance, {
+			version: 1,
+			model: {
+				source: "auto",
+				replaced: { value: "fake/pinned", source: "role" },
+			},
+			thinking: {
+				source: "auto",
+				replaced: { value: "low", source: "role" },
+			},
+		});
+
+		// Launching needs the routing decision's run binding, which only the
+		// coordinator creates: the bare tuple creates nothing.
+		const unbound = await testApi.startSubagentRun(
+			api,
+			{ name: "hs-auto-to-pi", task: "Task", agent: "hs-auto-claude" },
+			autoCtx(project),
+			{ auto: authorize("pi-on-claude") },
+		);
+		assert.equal(unbound.details.error, "auto-binding-required");
+		assert.deepEqual(pi.events, []);
+	});
+
+	it("prepares a pinned Pi role on a native harness with the exact approved model and effort", async () => {
+		for (const [agent, candidate, harness, model, effort, declared] of [
+			[
+				"hs-auto-pi",
+				"claude-on-pi",
+				"claude",
+				"claude-dest-4",
+				"high",
+				{ harness: "pi", model: "fake/pinned", thinking: "low" },
+			],
+			[
+				"hs-auto-claude",
+				"kiro-on-claude",
+				"kiro",
+				"kiro-dest-2",
+				"medium",
+				{ harness: "claude", model: "opus", thinking: "high" },
+			],
+		] as const) {
+			const project = scratch(`hs-auto-${candidate}`);
+			const log = join(project, "..", `auto-${candidate}.json`);
+			const herdr = useHerdr({ log });
+			const name = `hs-auto-${candidate}`;
+			const preparation = testApi.prepareSubagentRun(
+				api,
+				{ name, task: "Task", agent },
+				autoCtx(project),
+				{ auto: authorize(candidate) },
+			);
+			assert.ok(preparation.ok, JSON.stringify(preparation));
+			const { prepared } = preparation;
+			const plan = prepared.nativePlan;
+			assert.equal(plan?.spec.harness, harness);
+			assert.deepEqual(plan?.models, [model]);
+			assert.equal(plan?.spec.thinking, effort);
+			assert.equal(plan?.spec.mode, "autonomous");
+			assert.deepEqual(prepared.runtimePlans, []);
+			assert.equal(prepared.selection.harnessSource, "auto");
+			assert.equal(prepared.selection.projected, true);
+			// The role's own pin and effort on its declared harness were replaced.
+			assert.deepEqual(prepared.provenance, {
+				version: 1,
+				model: {
+					source: "auto",
+					replaced: {
+						value: declared.model,
+						source: "role",
+						harness: declared.harness,
+					},
+				},
+				thinking: {
+					source: "auto",
+					replaced: {
+						value: declared.thinking,
+						source: "role",
+						harness: declared.harness,
+					},
+				},
+			});
+			// Without the coordinator's binding the pending run is consumed
+			// and nothing is created.
+			const unbound = await testApi.startSubagentRun(
+				api,
+				prepared.params,
+				autoCtx(project),
+				{ prepared },
+			);
+			assert.equal(unbound.details.error, "auto-binding-required");
+			const retry = await testApi.startSubagentRun(
+				api,
+				prepared.params,
+				autoCtx(project),
+				{ prepared },
+			);
+			assert.equal(retry.details.error, "prepared-run-invalid");
+			assert.deepEqual(herdr.events, []);
+			assert.equal(existsSync(log), false);
+		}
+	});
+
+	it("validates the exact runtime without clamping, fallback, or mixed namespaces", async () => {
+		const project = scratch("hs-auto-exact");
+		const pi = usePiRecorder();
+		for (const [candidate, reason] of [
+			["pi-plain", /thinking "high" is not supported by "fake\/plain-1"/],
+			["pi-sparse", /thinking "medium" is not supported by "fake\/sparse-1"/],
+			["pi-gone", /unknown model "fake\/gone-3"/],
+			["pi-virtual", /"fake\/router-1" is a virtual routing model/],
+		] as const)
+			await assert.rejects(
+				testApi.startSubagentRun(
+					api,
+					{ name: `hs-auto-${candidate}`, task: "Task", agent: "hs-auto-pi" },
+					autoCtx(project),
+					{ auto: authorize(candidate) },
+				),
+				reason,
+			);
+		assert.deepEqual(pi.events, []);
+
+		// A caller may still request the virtual routing model by name.
+		const manual = await testApi.startSubagentRun(
+			api,
+			{
+				name: "hs-auto-virtual-manual",
+				task: "Task",
+				agent: "hs-auto-pi",
+				model: "fake/router-1",
+			},
+			autoCtx(project),
+		);
+		assert.equal(manual.details.status, "started", textOf(manual));
+		assert.equal(manual.details.runtimePlan.model, "fake/router-1");
+		assert.equal(manual.details.runtimePlan.modelSource, "request");
+		await resultFor("hs-auto-virtual-manual");
+
+		const herdr = useHerdr({ log: join(project, "..", "auto-exact.json") });
+		const native = await testApi.startSubagentRun(
+			api,
+			{ name: "hs-auto-pi-ref", task: "Task", agent: "hs-auto-pi" },
+			autoCtx(project),
+			{ auto: authorize("claude-pi-ref") },
+		);
+		assert.equal(native.details.error, "native-harness-unsupported");
+		assert.match(textOf(native), /Pi provider\/model reference/);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("never broadens a role's tools, skills, or modes", async () => {
+		const project = scratch("hs-auto-broaden");
+		const herdr = useHerdr({ log: join(project, "..", "auto-broaden.json") });
+		const cases: Array<[string, StartParams, RegExp]> = [
+			[
+				"interactive-pi",
+				{ name: "hs-auto-i", task: "Task", agent: "hs-auto-interactive" },
+				/not an autonomous, standalone, non-persistent role/,
+			],
+			[
+				"spawner-pi",
+				{ name: "hs-auto-s", task: "Task", agent: "hs-auto-spawner" },
+				/not a declared leaf/,
+			],
+			[
+				"hidden-pi",
+				{ name: "hs-auto-h", task: "Task", agent: "hs-auto-hidden" },
+				/hidden from model invocation/,
+			],
+			[
+				"pi-same",
+				{
+					name: "hs-auto-t",
+					task: "Task",
+					agent: "hs-auto-pi",
+					tools: "read, bash, write",
+					skills: "hs-auto-skill",
+				},
+				/cannot set skills, tools/,
+			],
+			[
+				"pi-same",
+				{
+					name: "hs-auto-m",
+					task: "Task",
+					agent: "hs-auto-pi",
+					persistent: true,
+				},
+				/cannot set persistent/,
+			],
+			[
+				"pi-same",
+				{ name: "hs-auto-f", task: "Task", agent: "hs-auto-pi", fork: true },
+				/cannot set fork/,
+			],
+			[
+				"pi-same",
+				{
+					name: "hs-auto-w",
+					task: "Task",
+					agent: "hs-auto-pi",
+					worktree: { branch: "hs-auto" },
+				},
+				/cannot set worktree/,
+			],
+		];
+		for (const [candidate, params, reason] of cases) {
+			const result = await testApi.startSubagentRun(
+				api,
+				params,
+				autoCtx(project),
+				{ auto: authorize(candidate) },
+			);
+			assert.equal(result.details.error, "auto-launch-ineligible", params.name);
+			assert.match(textOf(result), reason);
+		}
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("prepares without creating any Herdr resource, file, or lease", () => {
+		const project = scratch("hs-auto-prepare");
+		const ctx = autoCtx(project);
+		const skillDir = join(project, "..", "hs-auto-skill");
+		mkdirSync(skillDir, { recursive: true });
+		writeFileSync(
+			join(skillDir, "SKILL.md"),
+			"---\nname: hs-auto-skill\ndescription: test skill\n---\n\nRead notes.md first.\n",
+		);
+		writeFileSync(join(skillDir, "notes.md"), "Supporting notes.\n");
+		skillCommands.push({
+			name: "skill:hs-auto-skill",
+			source: "skill",
+			sourceInfo: { path: join(skillDir, "SKILL.md") },
+		});
+		const herdr = useHerdr({ log: join(project, "..", "auto-prepare.json") });
+		const watched = [project, ctx.sessionManager.getSessionDir()];
+		const files = filesBelow(...watched);
+		const running = testApi.runningSubagents.size;
+		const unresolved = testApi.unresolvedNativeRuns().size;
+		try {
+			const autoPi = testApi.prepareSubagentRun(
+				api,
+				{ name: "hs-prep-pi", task: "Task", agent: "hs-auto-claude" },
+				ctx,
+				{ auto: authorize("pi-on-claude") },
+			);
+			assert.ok(autoPi.ok);
+			assert.equal(autoPi.prepared.forceLeaf, true);
+			assert.equal(autoPi.prepared.selection.harnessSource, "auto");
+			assert.equal(autoPi.prepared.role?.cli, "claude");
+			assert.equal(autoPi.prepared.agentDefs?.cli, undefined);
+			assert.deepEqual(
+				autoPi.prepared.runtimePlans.map((plan) => plan.model),
+				["fake/pi-2"],
+			);
+			assert.ok(Object.isFrozen(autoPi.prepared));
+			assert.ok(Object.isFrozen(autoPi.prepared.params));
+
+			const autoNative = testApi.prepareSubagentRun(
+				api,
+				{ name: "hs-prep-native", task: "Task", agent: "hs-auto-skilled" },
+				ctx,
+				{ auto: authorize("skilled-claude") },
+			);
+			assert.ok(autoNative.ok);
+			const plan = autoNative.prepared.nativePlan;
+			assert.deepEqual(plan?.models, ["claude-dest-4"]);
+			assert.equal(plan?.spec.thinking, "medium");
+			assert.equal(plan?.spec.mode, "autonomous");
+			assert.equal(plan?.spec.spawnAgents, null);
+			// The skill snapshot is planned in memory; launch writes it.
+			const snapshot = plan?.skills[0]?.snapshot;
+			assert.ok(snapshot);
+			assert.equal(existsSync(snapshot.dir), false);
+			assert.deepEqual(autoNative.prepared.provenance, {
+				version: 1,
+				model: { source: "auto" },
+				thinking: { source: "auto" },
+			});
+
+			const manual = testApi.prepareSubagentRun(
+				api,
+				{ name: "hs-prep-manual", task: "Task", agent: "hs-claude-pinned" },
+				ctx,
+			);
+			assert.ok(manual.ok);
+			assert.deepEqual(manual.prepared.provenance, {
+				version: 1,
+				model: { source: "role" },
+				thinking: { source: "default" },
+			});
+			assert.equal(manual.prepared.forceLeaf, false);
+		} finally {
+			skillCommands.pop();
+		}
+		assert.deepEqual(herdr.events, []);
+		assert.deepEqual(filesBelow(...watched), files);
+		assert.equal(testApi.runningSubagents.size, running);
+		assert.equal(testApi.unresolvedNativeRuns().size, unresolved);
+	});
+
+	it("launches a prepared run once and never launches a stale preparation", async () => {
+		const project = scratch("hs-auto-consume");
+		const pi = usePiRecorder();
+		// Manual preparations launch without a binding; automatic ones need it.
+		const prepare = (name: string, automatic = false) => {
+			const preparation = testApi.prepareSubagentRun(
+				api,
+				{ name, task: "Task", agent: "hs-auto-pi" },
+				autoCtx(project),
+				automatic ? { auto: authorize("pi-same") } : {},
+			);
+			assert.ok(preparation.ok);
+			return preparation.prepared;
+		};
+		const prepared = prepare("hs-auto-prepared");
+		const started = await testApi.startSubagentRun(
+			api,
+			prepared.params,
+			autoCtx(project),
+			{ prepared },
+		);
+		assert.equal(started.details.status, "started", textOf(started));
+		assert.equal(started.details.runtimePlan.model, "fake/pinned");
+		await resultFor("hs-auto-prepared");
+		const again = await testApi.startSubagentRun(
+			api,
+			prepared.params,
+			autoCtx(project),
+			{ prepared },
+		);
+		assert.equal(again.details.error, "prepared-run-invalid");
+
+		const copied = prepare("hs-auto-copied");
+		const copy = await testApi.startSubagentRun(
+			api,
+			copied.params,
+			autoCtx(project),
+			{ prepared: { ...copied } },
+		);
+		assert.equal(copy.details.error, "prepared-run-invalid");
+
+		// An unbound automatic preparation is consumed without launching.
+		const automatic = prepare("hs-auto-unbound", true);
+		const unbound = await testApi.startSubagentRun(
+			api,
+			automatic.params,
+			autoCtx(project),
+			{ prepared: automatic },
+		);
+		assert.equal(unbound.details.error, "auto-binding-required");
+		const retry = await testApi.startSubagentRun(
+			api,
+			automatic.params,
+			autoCtx(project),
+			{ prepared: automatic },
+		);
+		assert.equal(retry.details.error, "prepared-run-invalid");
+
+		const rolePath = join(agentDir, "agents", "hs-auto-pi.md");
+		const original = readFileSync(rolePath, "utf8");
+		for (const kind of ["manual", "automatic"] as const) {
+			const stale = prepare(`hs-auto-stale-${kind}`, kind === "automatic");
+			writeFileSync(
+				rolePath,
+				original.replace("tools: read, bash", "tools: read"),
+			);
+			try {
+				const result = await testApi.startSubagentRun(
+					api,
+					stale.params,
+					autoCtx(project),
+					{ prepared: stale },
+				);
+				assert.equal(result.details.error, "prepared-run-stale", kind);
+			} finally {
+				writeFileSync(rolePath, original);
+			}
+		}
+		assert.equal(pi.launched.length, 1);
+	});
+});
+
+describe("canonical runtime provenance", () => {
+	it("tells role, configured default, request, and automatic origins apart without changing legacy fields", async () => {
+		const project = scratch("hs-provenance-fields");
+		const cases: Array<[StartParams, string, object, object]> = [
+			[
+				{ name: "hs-prov-agent-default", task: "Task", agent: "hs-pi-open" },
+				"fake/pi-agent-default",
+				{ source: "default", defaultKey: "models.agents.hs-pi-open" },
+				{ source: "role" },
+			],
+			[
+				{ name: "hs-prov-role", task: "Task", agent: "hs-pi-pinned" },
+				"fake/pinned",
+				{ source: "role" },
+				{ source: "parent" },
+			],
+			[
+				{ name: "hs-prov-default", task: "Task", agent: "hs-pi-writer" },
+				"fake/pi-default",
+				{ source: "default", defaultKey: "models.default" },
+				{ source: "parent" },
+			],
+			[
+				{
+					name: "hs-prov-request",
+					task: "Task",
+					agent: "hs-pi-open",
+					model: "fake/pi-a",
+					thinking: "low",
+				},
+				"fake/pi-a",
+				{ source: "request" },
+				{ source: "request" },
+			],
+		];
+		for (const [params, model, modelOrigin, thinkingOrigin] of cases) {
+			usePiRecorder();
+			const started = await testApi.startSubagentRun(
+				api,
+				params,
+				piCtx(project),
+			);
+			const plan = started.details.runtimePlan;
+			assert.equal(plan.model, model, params.name);
+			// Legacy sources and requested fields keep their meaning.
+			assert.equal(
+				plan.modelSource,
+				params.model ? "request" : "agent",
+				params.name,
+			);
+			assert.equal(plan.requestedModel, model, params.name);
+			assert.deepEqual(
+				plan.provenance,
+				{ version: 1, model: modelOrigin, thinking: thinkingOrigin },
+				params.name,
+			);
+			assert.deepEqual(started.details.runtimeProvenance, plan.provenance);
+			const result = await resultFor(params.name);
+			assert.deepEqual(result.details.runtimeProvenance, plan.provenance);
+		}
+	});
+});
+
+describe("runtime provenance through completion", () => {
+	// Automatic runs launch only under a coordinator binding; their help,
+	// error, and native results are covered through the real coordinator in
+	// test/auto-routing-input.test.ts.
+	it("carries native provenance on manual runs", async () => {
+		const project = scratch("hs-prov-native");
+		useHerdr({ log: join(project, "..", "prov-native-manual.json") });
+		const manual = await start(project, {
+			name: "hs-prov-native-manual",
+			task: "Task",
+			agent: "hs-claude-pinned",
+		});
+		const manualProvenance = {
+			version: 1,
+			model: { source: "role" },
+			thinking: { source: "default" },
+		};
+		assert.deepEqual(manual.details.runtimeProvenance, manualProvenance);
+		const result = await resultFor("hs-prov-native-manual");
+		assert.deepEqual(result.details.runtimeProvenance, manualProvenance);
+	});
+});
+
+describe("native prerequisites in preparation", () => {
+	/** Native checks where `missing` is absent and every other tool is ready. */
+	function prerequisites(missing?: string) {
+		const calls: string[] = [];
+		const operations = createNativeHarnessOperations((file) => {
+			calls.push(file);
+			if (file === missing) throw new Error(`spawn ${file} ENOENT`);
+			return file === "kiro-cli" ? "kiro-cli 2.24.1" : "";
+		});
+		return { calls, operations };
+	}
+
+	it("rejects before any Herdr resource, file, or lease when a prerequisite is missing", async () => {
+		for (const [missing, manualAgent, autoAgent, candidate, reason] of [
+			[
+				"claude",
+				"hs-claude-open",
+				"hs-auto-pi",
+				"claude-on-pi",
+				/Claude Code CLI is unavailable: spawn claude ENOENT/,
+			],
+			[
+				"kiro-cli",
+				"hs-kiro-pinned",
+				"hs-auto-claude",
+				"kiro-on-claude",
+				/Kiro CLI is unavailable: spawn kiro-cli ENOENT/,
+			],
+			[
+				"python3",
+				"hs-claude-open",
+				"hs-auto-pi",
+				"claude-on-pi",
+				/hooks require python3 with fcntl: spawn python3 ENOENT/,
+			],
+		] as const) {
+			const project = scratch(`hs-prereq-${missing}`);
+			const ctx = autoCtx(project);
+			const herdr = useHerdr(
+				{ log: join(project, "..", `prereq-${missing}.json`) },
+				{ nativeOperations: prerequisites(missing).operations },
+			);
+			const watched = [project, ctx.sessionManager.getSessionDir()];
+			const files = filesBelow(...watched);
+			const running = testApi.runningSubagents.size;
+			const unresolved = testApi.unresolvedNativeRuns().size;
+			const manual = { name: `hs-prereq-${missing}`, task: "Task" };
+			assert.throws(
+				() =>
+					testApi.prepareSubagentRun(
+						api,
+						{ ...manual, agent: manualAgent },
+						ctx,
+					),
+				reason,
+			);
+			assert.throws(
+				() =>
+					testApi.prepareSubagentRun(
+						api,
+						{ ...manual, agent: autoAgent },
+						ctx,
+						{ auto: authorize(candidate) },
+					),
+				reason,
+			);
+			// An ordinary launch still fails on the same check.
+			await assert.rejects(
+				testApi.startSubagentRun(api, { ...manual, agent: manualAgent }, ctx),
+				reason,
+			);
+			assert.deepEqual(herdr.events, [], missing);
+			assert.deepEqual(filesBelow(...watched), files, missing);
+			assert.equal(testApi.runningSubagents.size, running);
+			assert.equal(testApi.unresolvedNativeRuns().size, unresolved);
+		}
+	});
+
+	it("keeps Herdr, session, and parent runtime checks ahead of native prerequisites", async () => {
+		const project = scratch("hs-prereq-order");
+		const log = join(project, "..", "prereq-order.json");
+		const params = {
+			name: "hs-prereq-order",
+			task: "Task",
+			agent: "hs-claude-open",
+		};
+		const { operations } = prerequisites("claude");
+		useHerdr(
+			{ log },
+			{ nativeOperations: operations, terminalAvailable: false },
+		);
+		const noHerdr = await testApi.startSubagentRun(
+			api,
+			params,
+			ctxFor(project),
+		);
+		assert.equal(noHerdr.details.error, "herdr not available");
+
+		const herdr = useHerdr({ log }, { nativeOperations: operations });
+		const ctx = ctxFor(project);
+		const noSession = await testApi.startSubagentRun(api, params, {
+			...ctx,
+			sessionManager: { ...ctx.sessionManager, getSessionFile: () => null },
+		});
+		assert.equal(noSession.details.error, "no session file");
+		await assert.rejects(
+			testApi.startSubagentRun(
+				{ ...api, getThinkingLevel: () => "extreme" },
+				params,
+				ctx,
+			),
+			/Unsupported parent thinking level: extreme/,
+		);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("checks prerequisites in preparation and again at launch", async () => {
+		const project = scratch("hs-prereq-launch");
+		const { calls, operations } = prerequisites();
+		useHerdr(
+			{ log: join(project, "..", "prereq-launch.json") },
+			{ nativeOperations: operations },
+		);
+		await start(project, {
+			name: "hs-prereq-launch",
+			task: "Task",
+			agent: "hs-claude-open",
+		});
+		assert.deepEqual(calls, ["python3", "claude", "python3", "claude"]);
+		await resultFor("hs-prereq-launch");
+
+		// A prerequisite that disappears after preparation stops the launch
+		// before any pane exists.
+		let checks = 0;
+		const herdr = useHerdr(
+			{ log: join(project, "..", "prereq-vanish.json") },
+			{
+				nativeOperations: {
+					assertAvailable(harness) {
+						if (++checks > 1) throw new Error(`${harness} disappeared`);
+					},
+					validate() {},
+				},
+			},
+		);
+		await assert.rejects(
+			testApi.startSubagentRun(
+				api,
+				{ name: "hs-prereq-vanish", task: "Task", agent: "hs-claude-open" },
+				ctxFor(project),
+			),
+			/claude disappeared/,
+		);
+		assert.equal(checks, 2);
+		assert.deepEqual(herdr.events, []);
+	});
+});
+
+describe("prepared run context binding", () => {
+	/** An automatic preparation, or a manual one without a candidate. */
+	const prepare = (
+		name: string,
+		agent: string,
+		candidate: string | undefined,
+		ctx: ReturnType<typeof autoCtx>,
+	) => {
+		const preparation = testApi.prepareSubagentRun(
+			api,
+			{ name, task: "Task", agent },
+			ctx,
+			candidate ? { auto: authorize(candidate) } : {},
+		);
+		assert.ok(preparation.ok, JSON.stringify(preparation));
+		return preparation.prepared;
+	};
+
+	it("binds a prepared run to its canonical checkout, discovery cwd, and parent session", () => {
+		const project = scratch("hs-bind-origin");
+		const ctx = autoCtx(project);
+		usePiRecorder();
+		const prepared = prepare(
+			"hs-bind-origin",
+			"hs-auto-claude",
+			"pi-on-claude",
+			ctx,
+		);
+		assert.deepEqual(prepared.origin, {
+			cwd: realpathSync(project),
+			discoveryCwd: realpathSync(process.cwd()),
+			sessionId: "parent",
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			sessionDir: ctx.sessionManager.getSessionDir(),
+		});
+		assert.ok(Object.isFrozen(prepared.origin));
+	});
+
+	it("never moves a prepared Pi or native run to another checkout or parent session", async () => {
+		const project = scratch("hs-bind");
+		const other = scratch("hs-bind-other");
+		const ctx = autoCtx(project);
+		const pi = usePiRecorder();
+		const moves: Array<[string, () => ReturnType<typeof autoCtx>]> = [
+			["another checkout", () => autoCtx(other)],
+			[
+				"another session",
+				() => ({
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionId: () => "other-parent",
+					},
+				}),
+			],
+			[
+				"another session file",
+				() => ({
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionFile: () =>
+							join(ctx.sessionManager.getSessionDir(), "other.jsonl"),
+					},
+				}),
+			],
+		];
+		for (const [move, moved] of moves) {
+			const prepared = prepare(
+				`hs-bind-${move}`,
+				"hs-auto-claude",
+				"pi-on-claude",
+				ctx,
+			);
+			const result = await testApi.startSubagentRun(
+				api,
+				prepared.params,
+				moved(),
+				{ prepared },
+			);
+			assert.equal(result.details.error, "prepared-run-context-changed", move);
+			// The rejected preparation is consumed; it cannot launch later.
+			const retry = await testApi.startSubagentRun(api, prepared.params, ctx, {
+				prepared,
+			});
+			assert.equal(retry.details.error, "prepared-run-invalid", move);
+		}
+
+		// Project roles are discovered from process.cwd(), which is bound too.
+		const discovered = prepare(
+			"hs-bind-discovery",
+			"hs-auto-claude",
+			"pi-on-claude",
+			ctx,
+		);
+		const previous = process.cwd();
+		process.chdir(other);
+		try {
+			const result = await testApi.startSubagentRun(
+				api,
+				discovered.params,
+				ctx,
+				{ prepared: discovered },
+			);
+			assert.equal(result.details.error, "prepared-run-context-changed");
+		} finally {
+			process.chdir(previous);
+		}
+		assert.equal(pi.launched.length, 0);
+
+		// The same checkout through a symlink is the same canonical checkout.
+		// Positive launches use manual preparations: an automatic one also
+		// needs its coordinator binding.
+		const link = join(other, "..", "hs-bind-link");
+		symlinkSync(project, link);
+		const linked = prepare("hs-bind-linked", "hs-auto-pi", undefined, ctx);
+		const started = await testApi.startSubagentRun(
+			api,
+			linked.params,
+			{ ...ctx, cwd: link },
+			{ prepared: linked },
+		);
+		assert.equal(started.details.status, "started", textOf(started));
+		await resultFor("hs-bind-linked");
+
+		// Native: another checkout is rejected before any Herdr resource;
+		// an equal context for the same checkout and session launches.
+		const herdr = useHerdr({ log: join(project, "..", "bind-native.json") });
+		const native = prepare("hs-bind-native", "hs-auto-pi", "claude-on-pi", ctx);
+		const moved = await testApi.startSubagentRun(
+			api,
+			native.params,
+			autoCtx(other),
+			{ prepared: native },
+		);
+		assert.equal(moved.details.error, "prepared-run-context-changed");
+		assert.deepEqual(herdr.events, []);
+		const again = prepare(
+			"hs-bind-native-same",
+			"hs-auto-claude",
+			undefined,
+			ctx,
+		);
+		const launched = await testApi.startSubagentRun(
+			api,
+			again.params,
+			autoCtx(project),
+			{ prepared: again },
+		);
+		assert.equal(launched.details.status, "started", textOf(launched));
+		assert.equal(launched.details.harness, "claude");
+		const result = await resultFor("hs-bind-native-same");
+		assert.equal(result.details.exitCode, 0, result.content);
+	});
+});
+
+describe("automatic run binding through startSubagentRun", () => {
+	// Only the routing coordinator creates a genuine binding, for the one
+	// pending handle it just revalidated; its guarded launch, lifecycle, and
+	// native flows are exercised through the coordinator in
+	// test/auto-routing-input.test.ts.
+
+	/** A structurally complete binding the coordinator never created. */
+	function handBuiltBinding(approvalId: string, events: string[]) {
+		const record =
+			(event: string) =>
+			(..._args: unknown[]) => {
+				events.push(`binding:${event}`);
+			};
+		return {
+			receipt: Object.freeze({
+				decisionId: "ad-00000000-0000-4000-8000-0000000000b8",
+				policyVersion: "jev-auto-v1" as const,
+				questionVersion: "jev-auto-questions-v1" as const,
+				jevModel: "jev-1.13.0" as const,
+				candidateId: "c001",
+				configHash: autoState.digest,
+				candidateSetHash: "e".repeat(64),
+				selectionSource: "auto" as const,
+			}),
+			approvalId,
+			signal: new AbortController().signal,
+			dispatchState: () => "uncommitted" as const,
+			stopReason: () => undefined,
+			beforeResources: record("resources"),
+			resourcesCreated: record("created"),
+			commitDispatch: record("dispatch"),
+			recordStarted: record("started"),
+			recordSettled: record("settled"),
+			settled: () => false,
+		};
+	}
+
+	for (const [harness, agent, candidate] of [
+		["pi", "hs-auto-pi", "pi-same"],
+		["claude", "hs-auto-pi", "claude-on-pi"],
+	] as const)
+		it(`rejects forged or missing bindings for a ${harness} tuple before any resource`, async () => {
+			const project = scratch(`hs-bind-forged-${harness}`);
+			const events =
+				harness === "pi"
+					? usePiRecorder().events
+					: useHerdr({ log: join(project, "..", "bind-forged.json") }).events;
+			const params = { name: `hs-bind-${harness}`, task: "Task", agent };
+			const prepare = () => {
+				const preparation = testApi.prepareSubagentRun(
+					api,
+					params,
+					autoCtx(project),
+					{ auto: authorize(candidate) },
+				);
+				assert.ok(preparation.ok, JSON.stringify(preparation));
+				return preparation.prepared;
+			};
+			const prepared = prepare();
+			const forged = handBuiltBinding(candidate, events);
+			for (const [label, options, error] of [
+				[
+					"a hand-built binding for the pending handle",
+					{ prepared, autoRun: forged },
+					"auto-binding-invalid",
+				],
+				[
+					"a hand-built binding with a bare tuple",
+					{ auto: authorize(candidate), autoRun: forged },
+					"auto-binding-invalid",
+				],
+				[
+					"a hand-built binding for a manual spawn",
+					{ autoRun: forged },
+					"auto-binding-invalid",
+				],
+				[
+					"a bare tuple without a binding",
+					{ auto: authorize(candidate) },
+					"auto-binding-required",
+				],
+			] as const) {
+				const result = await testApi.startSubagentRun(
+					api,
+					params,
+					autoCtx(project),
+					options,
+				);
+				assert.equal(result.details.error, error, label);
+			}
+			// A rejected forged binding consumed nothing; the pending handle
+			// is consumed only by its own unbound launch attempt.
+			const unbound = await testApi.startSubagentRun(
+				api,
+				prepared.params,
+				autoCtx(project),
+				{ prepared },
+			);
+			assert.equal(unbound.details.error, "auto-binding-required");
+			const again = await testApi.startSubagentRun(
+				api,
+				prepared.params,
+				autoCtx(project),
+				{ prepared },
+			);
+			assert.equal(again.details.error, "prepared-run-invalid");
+			assert.deepEqual(events, [], "no binding call, pane, or dispatch");
+		});
 });

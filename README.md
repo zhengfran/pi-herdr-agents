@@ -7,7 +7,7 @@
 
 Asynchronous subagents for [Pi](https://github.com/earendil-works/pi), running exclusively in [Herdr](https://herdr.dev).
 
-Delegate investigation, implementation, and review without blocking the parent session. Each child runs as a real Pi process in its own Herdr surface; results return automatically when the child finishes.
+Delegate investigation, implementation, and review without blocking the parent session. Each child runs as a real Pi or supported native CLI process in its own Herdr surface; results return automatically when the child finishes.
 
 ## Features
 
@@ -21,6 +21,7 @@ Delegate investigation, implementation, and review without blocking the parent s
 - **Persistent specialists** — retain one policy-bound Pi or native session for sequential, turn-based tasks.
 - **Native Claude Code and Kiro roles** — run `cli: claude|kiro` roles with correlated turn receipts, exact-loadout resume, queued follow-ups, verified interrupts, interactive sessions, fork context, skills, native model fallback, and allowlisted nested delegation.
 - **Spawn-time harness selection** — run a named role on `pi`, `claude`, or `kiro` for one spawn with `harness` or `/subagent <role> --harness`, as a strictly validated projection of the role.
+- **Opt-in automatic TUI delegation** — pinned Jev evidence can select one administrator-authorized exact role/harness/model/effort tuple. Off by default; shadow also sends data. See [Automatic input routing](#automatic-input-routing) before opting in.
 
 ## Requirements
 
@@ -89,7 +90,7 @@ Use ordinary panes for read-only agents. A single or sequential writer can work 
 
 ![Pi Herdr Agents lifecycle: spawn a child, run it in Herdr, supervise live state, and deliver one bounded result to the parent.](https://raw.githubusercontent.com/zhengfran/pi-herdr-agents/main/docs/assets/async-subagent-lifecycle.png)
 
-A `subagent` call selects the target checkout, reuses its Herdr workspace, and gives the child a pane in an extension-owned `Agents` tab. Four panes fit in each tab by default; overflow opens another tab in the same workspace. A worktree is created only when explicitly requested for checkout isolation. The call launches a child Pi session and returns `started`. The parent watcher combines Herdr process state with child activity details and projects the result into a live widget:
+A `subagent` call selects the target checkout, reuses its Herdr workspace, and gives the child a pane in an extension-owned `Agents` tab. Four panes fit in each tab by default; overflow opens another tab in the same workspace. A worktree is created only when explicitly requested for checkout isolation. The call launches a child Pi or native session and returns `started`. The parent watcher combines Herdr process state with child activity details and projects the result into a live widget:
 
 ```text
 ╭─ Subagents ──────────────────── 1 active · 1 open ─╮
@@ -98,7 +99,7 @@ A `subagent` call selects the target checkout, reuses its Herdr workspace, and g
 ╰────────────────────────────────────────────────────╯
 ```
 
-When the child completes, the parent receives one bounded `subagent_result` message and starts a new turn with that result in context. Disposable ordinary panes close after result delivery; Herdr removes a tab when its last pane closes. Persistent specialists keep their pane between tasks, and managed worktree roots return to retained interactive shells. Callers never need to poll, tail session files, or wait in a shell loop.
+When the child completes, the parent receives one bounded `subagent_result` message and starts a new turn with that result in context. Disposable ordinary panes close after result delivery, or for an autonomous native child whose process exit is still unconfirmed, after a later re-check confirms that exit; Herdr removes a tab when its last pane closes. Persistent specialists keep their pane between tasks, and managed worktree roots return to retained interactive shells. Callers never need to poll, tail session files, or wait in a shell loop.
 
 ## Troubleshooting completion delivery
 
@@ -125,7 +126,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 9 parent-session tools + 7 commands, plus 2 child-only tools:
+**Subagents** — 9 parent-session tools + 8 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -152,7 +153,8 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> [--harness pi\|claude\|kiro] [--model <value>] [--thinking <level>] [--] [task]` | Spawn a named agent directly, optionally on another harness (`/subagent list` lists available agents); see [Spawn-time harness selection](#spawn-time-harness-selection) |
-| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
+| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences; does not enable or authorize automatic routing |
+| `/subagents-routing status\|cancel` | Local automatic-routing diagnostics or observable preflight cancellation; cannot enable routing, approve tuples, or terminate a running child |
 
 ### Taxonomy and discovery
 
@@ -170,6 +172,7 @@ The current orchestration inventory is:
 | Worktree handoff | `/worktree <name> [task]`, `/worktree list` | Forks the active conversation into a managed worktree. |
 | Orchestrated review | `/skill:orchestrate` | Parent materializes evidence, fans out public reviewers, and synthesizes results. |
 | Adversarial review | `/skill:orchestrate`, `adversarial-reviewer` | Risk-based public discovery, cross-family verification, and parent synthesis. |
+| Automatic input routing | Eligible idle top-level TUI input; durable `autoRouting` opt-in | One authorized standalone autonomous leaf in the shared checkout; no worktree or review-purpose launch in v1. |
 
 See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
 [ADR-0009](docs/adr/0009-remove-workflow-subsystem.md).
@@ -305,6 +308,10 @@ or re-run `/subagents-init`.
   "status": {
     "enabled": true
   },
+  "autoRouting": {
+    "version": 1,
+    "mode": "off"
+  },
   "models": {
     "agents": {}
   },
@@ -386,6 +393,13 @@ shortlist `provider/model-id` when the
 authoring family is known; `task:review` does not establish independence. Family
 is the independence boundary; project policy may separately require a different
 provider. This is guidance, not extension enforcement.
+
+Task preferences and manual APIs do **not** enable or authorize automatic input
+routing. `/subagents-init` and `subagents_write_task_models` preserve unrelated
+valid `autoRouting` semantics without granting consent or approving tuples.
+The task writer rejects duplicate-member ambiguity in `autoRouting` (including
+a repeated top-level section) in either the current file or example source before
+any temporary write/rename; it never repairs ambiguous approval JSON.
 
 Run `/subagents-init [preferences]` to draft task-model preferences. For example:
 
@@ -556,6 +570,260 @@ diagnostics seam for final provider errors and retry outcomes.
 `config.json` is durable user state under the Pi agent directory and is loaded
 when the extension starts. Run `/reload` after changing it. Package-root
 `config.json` files are ignored; move them manually or re-run `/subagents-init`.
+
+---
+
+## Automatic input routing
+
+Automatic routing v1 is a **package-only public Pi 0.99.1 contract**, not a
+host patch or an external gate. It leaves the parent model/thinking unchanged
+and uses existing launch, supervision, bounded result delivery, and parent
+synthesis. [ADR-0014](docs/adr/0014-jev-auto-input-dispatch.md) records the
+architecture, alternatives, threat model, and residual risks.
+
+### Eligibility and current-view limits
+
+Only eligible **idle top-level TUI** events with `source: "interactive"` and
+**undefined `streamingBehavior`** may route. The parent must have no pending
+messages or managed child/uncertain launch, be inside Herdr, and have an existing
+persisted session on disk. A fresh/unpersisted session's first prompt bypasses;
+the package does not force persistence. Required public APIs must be available.
+Missing compatibility or invalid config disables routing, not manual tools.
+
+RPC (including fresh prompts and idle steer/follow-up), JSON, print,
+extension-source input, and streaming `steer`/`followUp` **bypass in every mode**.
+So do child/BTW/handoff sessions, visible `/` or `!` commands, blank text,
+current images (including mixed text/images), oversized or locally unsafe text,
+and `[no-auto-route]` when still visible. Manual `subagent`, `/subagent`,
+resume/send, `/plan`, `/iterate`, `/btw`, `/worktree`, and task selectors never
+consult Jev. Substantive prose need not say “delegate”; explicit runtime choices,
+parent-only work, earlier-context dependence, multi-child/independent review, or
+external actions instead require ordinary parent/manual handling.
+
+**This handler's view is the only input contract.** Earlier handlers can expand
+files/history into text or remove images, commands, or an opt-out marker; that
+transformed text may be sent. The router itself does not open references or add
+prior conversation for classification. There is no original-input provenance,
+physical-ingress authenticity, first/last ordering, or universal secret-screening
+guarantee. Earlier handlers may consume input; returning `handled` prevents
+later handlers (including their security checks) and normal expansion from
+running. `continue` lets later handlers transform it further. Operators must
+review installed input extensions and their ordering; disable routing if this
+composition is unacceptable. TUI/interactive labels cannot distinguish a
+physical gesture from SDK/startup input carrying the same labels.
+
+### Consent, egress, and execution authority
+
+Absent config or `mode: "off"` sends nothing to Jev. **Every non-off mode,
+including shadow, requires explicit durable administrator consent.** An input
+prompt, model shortlist, or classifier answer cannot grant it.
+
+Eligible current prompt text plus reviewed compact role/runtime profiles go to
+TypeSafe AI at the fixed `https://api.typesafe.ai/v1/systemone` endpoint. Pasted
+or earlier-expanded content may be confidential. TypeSafe's no-training statement
+is **not zero retention or a residency guarantee**; verify your agreement before
+sending private data. The child and parent retain normal provider and local
+session behavior. No separate history, repository inventory, role/skill body,
+credentials, or endpoints are classifier state fields, but earlier expansions
+can already be present in the current prompt.
+
+The public Pi authenticated classifier seam sends exactly `typesafe` /
+`jev-1.13.0`, with `jev-auto-questions-v1` and `jev-auto-v1`, at most two batches,
+zero retries, and one A+B/auth deadline (initial recommendation 5000 ms).
+An immutable copy of the built-in `jev-latest` descriptor can supply transport
+when the pin is not catalog-listed; the outgoing request is still the exact pin,
+never latest. A bounded wire observer checks returned model, full distributions,
+and adapter agreement; incompatible evidence is unavailable, never permission.
+Auth comes from Pi's TypeSafe authentication or `TYPESAFE_API_KEY`; auto config
+accepts **no credentials or endpoint override**. Bounds: current prompt 8 KiB,
+batch body 24 KiB, state plus longest question 16 KiB, response 64 KiB. No silent
+truncation or candidate trimming. Normal receipts contain bounded versions,
+IDs, hashes, reasons and timings, not prompt/probability dumps.
+Unpriced/zero catalog cost is not a free-service claim.
+
+An explicit allowlist authorizes each **exact role + harness + model + effort**.
+Jev is untrusted evidence, never authorization. Resolve normal project > global >
+package discovery first, then verify the reviewed full role/provenance SHA-256.
+Changed/overridden roles require deliberate reapproval; skill/config/runtime
+changes invalidate snapshots. No name-based assumptions about model quality,
+family, independence, price, or capability. Declared tiers/families and strengths
+need administrator evidence. Choice confidence/probability/margin, absolute fit,
+semantic gates, and both complete Score distributions are checked conjunctively;
+upper-tail/low-confidence effort conservatism can abstain rather than downgrade.
+Effort buckets are policy floors, **not portable vendor token budgets**.
+
+The tuple explicitly authorizes replacing role runtime defaults or projecting to
+another harness; manual pinned-role projection still needs an explicit destination
+model. Pi exact physical chat refs must have configured auth/text input/supported
+exact thinking; no clamping, task alias, fuzzy ref, or fallback list. Native IDs
+are separate exact versioned CLI IDs, not aliases/defaults or Pi refs; account
+access/effort capability require admin evidence, not Pi authentication inference.
+Existing native prerequisites, tool/skill projection, and prompt-mode rules still
+apply. All relevant feasible candidates are revalidated before resources/dispatch.
+Current effort floors use the configured `effortQuantile` (default .90) of each
+full reasoning/consequence Score distribution and their maximum; mass at level 3 of at least .10 or low Score
+confidence raises band 3. Minimum tier/effort bands are fast/0, mid/1,
+frontier/2, frontier/3. Pi off/minimal/low map to 0, medium to 1, high to 2,
+xhigh/max to 3; native uses low/medium/high/xhigh-or-max respectively. Confident
+explicit equivalence uses administrator rank, not inferred cheapness.
+
+Children are named, standalone, autonomous, nonpersistent **ordinary-pane leaves
+in the current shared checkout**. V1 rejects/never creates worktrees and grants
+no fork, fan-out, nesting, extra tools/skills, auto commit/push/deploy, or external
+action permission. Report roles with Bash are not sandboxed read-only. Manual
+or other-process work can conflict; the slot is not a machine-wide lock.
+Review-purpose roles (including reviewer responsibilities) always abstain under
+v1 strict review policy, even if configured/evaluated in shadow: no trusted
+pinned authorship input exists. Use the parent/manual review workflow.
+Auto children inherit a recursion guard and unset `TYPESAFE_API_KEY` in the launch
+command. This Jev-key hygiene is **not OS secret isolation**: same-user tools,
+processes, shells and auth files remain accessible.
+
+### Durable schema and operator workflow
+
+Edit only `$PI_CODING_AGENT_DIR/herdr-agents/config.json` (default
+`~/.pi/agent/herdr-agents/config.json`), top-level `autoRouting`. The copyable
+example is deliberately only `{ "version": 1, "mode": "off" }`, with no consent
+or tuples. No public approval/config writer or fingerprint-generation wizard is
+provided; `/subagents-routing status` diagnoses loaded state, not approvals.
+
+| Field | Contract |
+| --- | --- |
+| `version`, `mode` | `1`; `off`, `shadow`, `pilot`, or `auto`. Off can retain a complete valid enabled-form config, but partial retained fields are invalid. |
+| `policyVersion`, `questionVersion` | Required when enabled: `jev-auto-v1`, `jev-auto-questions-v1`. |
+| `consent` | Required: `disclosureVersion: "jev-egress-v1"`, strict ISO-8601 `acknowledgedAt`, `sendCurrentPromptAndReviewedProfiles: true`; record only after accepting this disclosure. |
+| `jev` | Required: `provider: "typesafe"`, `model: "jev-1.13.0"`, integer `timeoutMs` 500–15000. |
+| `failurePolicy` | `parent` (default) or `hold`; see ownership rules below. |
+| `thresholds` | Optional complete object; defaults below. Only more conservative v1 values allowed. |
+| `roles` | 1–16 approvals; each needs at least one tuple. |
+| `candidates` | 1–128 exact approved tuples; no duplicate role/harness/model/effort. |
+
+Each role approval has `id`, exact discovered `agent`, `source`
+(`project|global|package`), `definitionSha256` (64 lower-case hex of the shipped
+versioned canonical full resolved role and provenance), `labelRole`
+(`plan|research|ui|api|build|test|review|browser|security|perf|merge`),
+`intent` (`report|modify`), `purpose` (`task|review`), and reviewed
+`responsibility`, `deliverable`, `excludes`. Contributed package roles also need
+both `provider` and `providerVersion`. Review responsibilities must use purpose
+`review`. Do not hash only the role body or blindly approve a changed hash.
+
+Each candidate has `id`, `roleId`, `harness` (`pi|claude|kiro`), `model`,
+`effort`, `tier` (`fast|mid|frontier`), reviewed upstream `family`,
+`taskStrengths`, `limitations`, `capabilityEvidence`, and `preference`.
+Pi model is `{namespace:"pi", ref:"provider/model-id"}`; native model is
+`{namespace:"claude"|"kiro", id:"<exact-versioned-cli-id>"}` matching the harness.
+Pi effort is `off|minimal|low|medium|high|xhigh|max`; native excludes off/minimal.
+Preference is integer 0–10000, unique within role/harness/model. IDs match
+`^[a-z][a-z0-9-]{0,39}$` and cannot use reserved IDs such as `none`/`equivalent`.
+Profile strings are nonempty/control-free and at most 256 UTF-8 bytes; model
+refs/IDs 200, family 80, capability evidence 512. Aggregate payload limits still
+apply; a large valid catalog can be unavailable for a particular prompt.
+
+Threshold defaults (ranges): `choiceConfidence` .80 (.80–1),
+`choiceProbability` .70 (.70–1), `choiceMargin` .20 (.20–1),
+`absoluteFit` .80 (.80–1), `falseCeiling` .20 (0–.20), `trueFloor` .80 (.80–1),
+`scoreConfidence` .80 (.80–1), `effortQuantile` .90 (.90–.99).
+`falseCeiling < trueFloor`; full Score upper tails are used, never just means.
+Unknown keys, duplicate JSON members/IDs, prototype keys, wrong types/nulls,
+nonfinite/out-of-range values, moving aliases, credentials, endpoints, and launch
+bags (`tools`, `skills`, `cwd`, `worktree`, etc.) are rejected. Hidden,
+interactive, persistent, non-standalone, unrestricted or spawning roles are
+ineligible, not silently rehabilitated.
+
+Review exact role/provenance fingerprints, installed skill/tool compatibility,
+physical model/native access evidence and compact profiles locally before
+writing approvals. Reapprove actual policy changes deliberately. After edits,
+`/reload` loads the snapshot; durable digest drift/deletion/revocation blocks
+later egress/launch until reload. Invalid routing config disables only routing.
+Enabled sessions show a startup disclosure/status indicator without a Jev call.
+There is no automatic refresh, live probe, consent shortcut, or auto opt-in by
+`/subagents-init`, manual APIs or task model preferences.
+
+### Ownership, persistence, cancellation, and recovery
+
+A synchronous **in-flight decision slot is not request ownership**. Safe unowned
+abstention/unavailability under parent policy returns `continue`, with ordinary
+parent handling and no replacement turn. `hold` consumes without execution.
+Shadow reserves an observational slot and returns `continue` immediately; it
+never owns the request, launches, changes runtime, sends suggestions/context
+messages, or wakes the parent. Normal parent work does not cancel shadow;
+observable navigation/reload/local cancel and the deadline still bound it.
+
+Selected pilot/auto takes irreversible ownership **before** attempting a custom
+`jev_auto_request` append: every subsequent path returns `handled`, including
+errors. The message is labeled “User request · automatic delegation ·
+handler-visible text”, records the exact captured request losslessly, and means
+awaiting execution, not already started. Public branch/message observations plus
+bounded read-back of the existing session file must verify that exact entry on
+the current branch **before resources/dispatch**. `sendMessage` returns void;
+this is ordinary on-disk verification, **not fsync or atomic persistence plus
+execution**. The custom message enters normal model context/export/reload but
+is not an ordinary user node in `/fork`'s user-message picker.
+
+Pilot adds a bounded TUI confirmation (30 seconds) showing exact role origin,
+harness/model/effort and shared-checkout behavior; decline/timeout holds, never
+approves by default. `jev_auto_status` reports actual state/child identity and
+exact runtime after launch. Existing `subagent_result`/`subagent_ping`,
+supervision and replacement-parent delivery remain unchanged; completion is a
+review handoff, not acceptance. Automatic metadata uses `selection.harnessSource: "auto"`, per-field provenance
+and an `autoRouting` receipt, not a claim that the
+user requested those runtime fields. Non-context `jev_auto_route_v1` entries are
+bounded decision receipts, not durable task execution acknowledgements.
+
+Only **positively known no-dispatch**, verified-persistence, current-session
+owned failures can attempt parent fallback once (`fallback-attempted`, not proof
+of parent execution). Uncertain dispatch, recording failure, observed cancel,
+stale context or unexpected owned errors hold; unknown is never no-work.
+There is no alternate automatic child route or automatic replay/retry/adoption.
+A package decision ID is correlation only, **not host submission identity or
+cross-process exactly-once**. Repeated identical submissions are distinct
+decisions. The live latch only prevents repeated dispatch within one decision.
+
+A crash before persistence can lose pending handler input; after recording it
+can leave a request with no work, or work running without a started receipt,
+or uncertain fallback delivery. Session append, launch, delivery and `handled`
+are not one host transaction. Unknown owned/launching records block new automatic
+work on the active branch. Inspect cited session/child resources, establish
+whether anything still runs, recover explicitly with existing manual lifecycle
+tools, and use a fresh session for further auto work only after prior work is
+accounted for. Do not infer safe retry from missing receipts or resend unknowns.
+
+Use `/subagents-routing status` for loaded mode/drift, pending decision/ownership,
+busy/unknown recovery state and limitations. There is **no routing status tool**.
+`/subagents-routing cancel` cancels preflight/pilot only **when observable**; it
+cannot stop an already dispatched child (use existing `subagent_interrupt` and
+manual recovery). Observed lifecycle/session events and the classifier deadline
+bound package waiting, but **idle Escape is not reliable cancellation**.
+Real Pi 0.99.1 TUI evidence observed Escape followed by `jev-timeout`, not cancel.
+It also queued the local cancel command and public `newSession` until the awaited
+input resolved: those two pre-dispatch integration scenarios are explicit
+blockers/skips, **not passes**. No host patch or private-hook substitute fixes
+this contract. Off/reload blocks later egress/launch and cancels pending decisions
+when lifecycle change is observed; it does **not retroactively stop children**
+or undo already sent data. New prompts while a child runs use ordinary parent
+handling, not an automatic child queue.
+
+### Rollout and rollback
+
+Progress deliberately: **off → offline fake transport → consented shadow →
+consented pilot → auto**. Fake transport is test infrastructure, not a production
+config mode/endpoint. Begin pilot with a small reviewed report-task allowlist;
+expand modify/native tuples only after their own evidence. Shadow does not prove
+ownership/dispatch safety. Thresholds, latency budget and model-quality profiles
+remain **synthetic/unmeasured/uncalibrated**; T11 fixture scores prove mechanical
+consistency, not achieved TypeSafe service or execution-model quality. The
+[offline evaluator guide](test/evals/jev-routing-README.md) describes commands
+and frozen splits (development-only, excluded from the package). Separate live
+capture requires explicit informed egress consent and remains outside the
+package; normal tests/integration never call live Jev.
+
+Promotion needs deterministic safety gates, measured workload/pilot evidence and
+administrator acceptance of privacy, extension composition, shared-checkout and
+crash risk. Roll back by setting off and reloading; retain/inspect any dispatched
+child under its existing lifecycle. No threshold supplies universal read-only,
+secret isolation, zero retention, reliable Escape, original provenance, stable
+submission identity, a host transaction, cross-process exactly-once, or RPC
+routing guarantees.
 
 ---
 
@@ -1127,7 +1395,9 @@ worktree. Nothing is silently dropped, mapped, or widened:
   bounds the Pi child as usual.
 - A frontmatter `model` belongs to the role's own harness. When the role runs
   elsewhere, the pinned model is dropped and an explicit destination `model` is
-  required; it is never reused, translated, or used as a fallback. Pi → native
+  required for manual launches; [automatic routing](#automatic-input-routing)
+  instead requires a verified administrator-authorized exact destination tuple.
+  The pin is never reused, translated, or used as a fallback. Pi → native
   and native → Pi are switches, and so are Claude → Kiro and Kiro → Claude.
 - Model namespaces never cross. On Pi, `model` is an exact authenticated
   `provider/model-id`, fallback list, or `task:<category>` from
@@ -1159,7 +1429,8 @@ stop, stop-failure, and crash notice details carry a `selection` record:
 }
 ```
 
-`harnessSource` is `request`, `role`, or `default`; `role.source` is
+`harnessSource` is `request`, `role`, or `default` for manual launches, and
+`auto` for an administrator-authorized automatic selection; `role.source` is
 `project`, `global`, or `package`, with `provider` and `providerVersion` for
 role packs. Selected models and thinking stay in the existing fields
 (`runtimePlan` for Pi; `model`, `nativeModels`, `nativeThinking`, and
@@ -1415,7 +1686,13 @@ leases, and worktree are retained. The worktree manifest records
 `processExit: "unconfirmed"` without a Git snapshot. `worktree_remove` treats
 the worktree as held, through the in-memory holder and the durable native
 lease, until exit is later confirmed; then the owned files and leases are
-released. Parent shutdown does not terminate native children. Launch scripts
+released. After the parent accepts the result of an autonomous, non-persistent,
+non-nested run, it re-checks exit in the background with backoff (2 to 60
+seconds). It closes that run's ordinary pane once, after exit is confirmed.
+Interactive, persistent, nested, worktree and never-delivered runs keep their
+panes. The re-check lives in the parent process: it survives `/reload` but
+not a parent restart, and panes retained before a restart need manual
+cleanup. Parent shutdown does not terminate native children. Launch scripts
 embed task text and are staged `0600` in `0700` directories created for them.
 A parent shutdown or a cancelled `subagent`/`subagent_resume` call, while a
 native launch still waits for its shell, stops the launch before its process
@@ -1580,8 +1857,19 @@ Run local checks:
 ```bash
 npm ci
 npm test
+npm run test:eval:jev-routing
+npm run format:check
 npm run lint
 npm pack --dry-run
+git diff --check
+```
+
+Automatic-routing unit/public-handler tests are not real TUI evidence. The
+focused offline checks are:
+
+```bash
+node --experimental-strip-types --test test/auto-routing-*.test.ts test/jev-client.test.ts test/jev-questions.test.ts
+node --experimental-strip-types --test test/evals/jev-routing-*.test.mjs
 ```
 
 Run the required end-to-end suite from inside Herdr:
@@ -1590,7 +1878,23 @@ Run the required end-to-end suite from inside Herdr:
 npm run test:integration
 ```
 
-The deterministic suite launches real Pi sessions, Herdr panes, and worktrees without provider credentials. The optional live-provider smoke test is not a merge gate:
+Run only one integration suite at a time per Herdr instance. The automatic suite
+uses real idle editor submission in a persisted TUI session, not a direct handler
+or RPC routing proxy; separate real RPC processes verify bypass. Its isolated
+Herdr environment uses a fake classifier and offline native executables. Focused
+command: `node --experimental-strip-types --test test/integration/auto-routing.test.ts`.
+It runs only in deterministic mode (live mode skips it). Pi 0.99.1 idle local
+cancel and pre-dispatch `newSession` remain two honest blockers/skips, never
+passes; Escape was observed reaching timeout. Record counts and test-owned
+resource cleanup using the
+[source-checkout contributor integration workflow](https://github.com/zhengfran/pi-herdr-agents/blob/main/.pi/skills/run-integration-tests/SKILL.md)
+(the skill is excluded from the installed package).
+Do not enable auto routing as part of package/release verification.
+
+The deterministic suite is designed to launch real Pi sessions, Herdr panes,
+and worktrees without live providers. That describes the isolated test setup,
+not a claim that all historical implementation activity was network-free.
+The optional live-provider smoke test is not a merge gate:
 
 ```bash
 PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 \

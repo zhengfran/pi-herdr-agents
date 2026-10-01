@@ -3,8 +3,9 @@
 ## Language
 
 **Pi subagent runtime**:
-The single execution path for fresh and resumed children. `launchPiSubagent()`
-owns the complete Pi and Herdr launch transaction; completion uses Pi sidecar
+The Pi execution path for fresh and resumed Pi-backed children. `launchPiSubagent()`
+owns the complete Pi and Herdr launch sequence (not an atomic host transaction);
+completion uses Pi sidecar
 evidence first and the terminal exit marker as fallback.
 _Avoid_: Runtime dispatch, adapter registry, split launch ownership
 
@@ -46,11 +47,68 @@ Running a role on a harness other than the one it declares by interpreting its
 capabilities under the destination harness's rules, and rejecting before any
 resource whatever that harness cannot represent faithfully (tools, thinking,
 skills, prompt mode, delegation). A role's pinned model belongs to its own
-harness and is replaced only by an explicit destination model. It is not a
+harness and is replaced only by an explicit destination model on manual launches,
+or a verified administrator-approved exact automatic tuple. It is not a
 transparent conversion: nothing is dropped, mapped, widened, or retried on
 another harness, and Pi and native model namespaces never mix.
 _Avoid_: Transparent conversion, tool translation, cross-harness fallback,
 reusing a pinned model
+
+**Automatic input routing**:
+An off-by-default parent-only public Pi 0.99.1 input coordinator using pinned Jev
+evidence to select one administrator-approved exact role/harness/model/effort.
+Only eligible idle top-level TUI/interactive current-view input with undefined
+streaming behavior, no current images and an existing persisted session can
+route. RPC/JSON/print/extension-source and steer/followUp bypass in every mode;
+fresh unpersisted first prompts and child/side sessions bypass. Automatic children
+are standalone autonomous shared-checkout ordinary-pane leaves, never worktrees,
+forks, persistent specialists or nested coordinators. Review-purpose roles abstain.
+See [the public contract](README.md#automatic-input-routing) and
+[ADR-0014](docs/adr/0014-jev-auto-input-dispatch.md).
+_Avoid_: RPC routing, parent model switch, task-preference authorization
+
+**Handler-visible captured request**:
+Exactly the current text seen by the routing handler. Earlier extensions may have
+expanded confidential file/history data or removed images, commands and opt-out
+syntax. Later handlers do not run after `handled`. There is no original-input
+provenance, ordering or physical-ingress authenticity guarantee.
+_Avoid_: Original editor submission, universal secret screening
+
+**Automatic tuple approval**:
+Durable administrator authorization binding exact role/provenance fingerprint,
+harness, model namespace/ID and supported effort, with reviewed compact capability
+profiles. Jev probabilities are evidence only. Changed role/skill/config/runtime
+snapshots invalidate selection; role changes require deliberate reapproval.
+_Avoid_: Model catalog as permission, name-derived quality, portable effort
+
+**Automatic decision slot**:
+One local in-flight attempt reserved synchronously before awaits, distinct from
+request ownership. Shadow is observational and immediately continues parent
+input; it still egresses and requires consent. Safe unowned parent-policy
+abstention/unavailability can continue without a replacement turn.
+_Avoid_: Machine-wide lock, duplicate-submission detection
+
+**Automatic request ownership**:
+The irreversible latch set before attempting `jev_auto_request` persistence or
+resource-bearing launch. Owned paths always return `handled`. Public current-branch
+observations and bounded disk read-back must verify the captured custom message
+before resources/dispatch. Known no-dispatch failures alone can attempt parent
+fallback; cancel, stale or uncertain work holds.
+_Avoid_: fsync guarantee, atomic host transaction, error fall-through
+
+**Package decision ID**:
+Correlation for one local routing attempt, not a host submission identity.
+Repeated identical submissions are distinct decisions. A live dispatch latch
+limits repeats within that decision; pre-persistence crashes can lose input and
+post-dispatch crashes can leave unknown work. Unknown never auto-replays.
+_Avoid_: Cross-process exactly-once, durable replay key, prompt-hash deduplication
+
+**Observable routing cancellation**:
+Package deadline or a local cancel/lifecycle/session event when its handler can
+actually run. Idle Escape is not a reliable cancel API. Pi 0.99.1 queued local
+cancel and public newSession until awaited input resolved; those pre-dispatch
+integration cases remain blockers/skips. Off/reload does not stop dispatched children.
+_Avoid_: Escape cancellation guarantee, skipped-as-pass, retroactive revocation
 
 **Tagged turn**:
 One orchestrator-submitted native prompt carrying its own
@@ -286,7 +344,9 @@ describe work, not complexity. `/subagents-init [preferences]` drafts them from
 the active extension-loaded registry's synchronous snapshot and existing saved
 choices, with source-based research when available. A dynamic provider awaiting
 its initial catalog refresh might be absent. `task:<category>` is a subagent
-model selector, not a command or parent model change. Ordered authenticated
+model selector, not a command or parent model change. These preferences and
+`/subagents-init` do not enable or authorize automatic routing; the writer preserves
+unrelated `autoRouting` config without consent grants. Ordered authenticated
 candidate plans resolve before launch; ordinary nonpersistent runs can retry
 after launch failure or a running child's provider/agent error, not a completed
 negative task result. Persistent specialists do not advance after a running-child

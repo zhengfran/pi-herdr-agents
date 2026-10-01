@@ -197,6 +197,25 @@ persistent generation keeps that snapshot and its selection record (effective
 harness, its source, and role provenance). Resume never re-resolves a role or
 harness: native markers keep replaying their recorded immutable loadout.
 
+### Automatic-input interaction (ADR-0014)
+
+[ADR-0014](0014-jev-auto-input-dispatch.md) adds a separate off-by-default public
+Pi 0.99.1 TUI coordinator, not native task-model routing. A verified durable
+administrator-approved exact role/harness/model/effort tuple can authorize a
+pinned-role replacement/projection; manual explicit-destination-model rules above
+remain unchanged. Native prerequisites, strict tool/skill/effort projection,
+correlated turn receipts and existing completion remain authoritative. Automatic
+v1 is standalone, autonomous, nonpersistent and leaf-only in the shared checkout:
+no native fallback route, worktree, fork or nested-spawn grant, and no Pi-auth
+inference of native account access.
+
+Package children carry their existing child policy plus a recursion guard;
+package-created BTW/worktree-handoff side sessions without `PI_SUBAGENT_ID` also
+carry internal `PI_HERDR_AUTO_ROUTING_DISABLED=1`. This marker disables recursive
+input routing, not manual capabilities or authorization. Unsetting the inherited
+Jev key on automatic launch is hygiene, not OS isolation. Idle-parent Escape
+limitations in ADR-0014 are distinct from native tagged-turn interrupts here.
+
 ## Why
 
 The first stage proved that correlated hook receipts plus owner-token process

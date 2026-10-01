@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { getSubagentActivityFile } from "./activity.ts";
+import { AUTO_ROUTING_DISABLED_ENV } from "./auto-routing-input.ts";
 import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
@@ -88,6 +89,44 @@ export interface WorktreeHandoff extends WorktreeLaunch {
 	gitError?: string;
 }
 
+/**
+ * Package-owned checks for one fresh automatic launch; manual launches have
+ * none. Each call throws to stop the launch, and the owner's state records
+ * how far the launch got: no resource, a resource, or a dispatch attempt.
+ */
+export interface FreshLaunchGuard {
+	/** Runs before any Herdr pane, workspace, worktree, or owned file. */
+	beforeResources(): void;
+	/** A Herdr surface for this launch now exists. */
+	resourcesCreated(): void;
+	/**
+	 * The final check, called with no await before the one `runScript`: it
+	 * irreversibly latches the launch as dispatch-attempted, because sending
+	 * can fail after the command reached the pane, or it throws.
+	 */
+	commitDispatch(): void;
+}
+
+/**
+ * Marks the launch of an administrator-approved automatic tuple. Its child
+ * command suppresses inherited automatic routing and the Jev credential,
+ * without changing the parent's environment; manual launches never set it.
+ */
+export interface AutomaticLaunch {
+	guard?: FreshLaunchGuard;
+}
+
+/** Jev's credential, never inherited by an automatic child by accident. */
+export const AUTOMATIC_CHILD_UNSET_ENV = ["TYPESAFE_API_KEY"] as const;
+
+/**
+ * Shell lines an automatic child runs before its command: hygiene against
+ * accidental inherited use, not isolation from same-user credentials.
+ */
+function automaticChildEnvironment(): string {
+	return `unset ${AUTOMATIC_CHILD_UNSET_ENV.join(" ")} && export ${AUTO_ROUTING_DISABLED_ENV}=1`;
+}
+
 export interface FreshPiLaunchRequest {
 	kind: "fresh";
 	id?: string;
@@ -123,6 +162,13 @@ export interface FreshPiLaunchRequest {
 		sessionMode: SubagentSessionMode;
 		cwd?: string;
 	};
+	/** Set only for an automatic launch; see AutomaticLaunch. */
+	automatic?: AutomaticLaunch;
+	/**
+	 * Package-owned cancellation: checked before any resource and before
+	 * dispatch, and a pending shell-readiness wait ends as soon as it aborts.
+	 */
+	signal?: AbortSignal;
 }
 
 export interface ResumePiLaunchRequest {
@@ -297,15 +343,32 @@ async function launchFreshPiSubagent(
 	operations: PiLaunchOperations,
 ): Promise<PiRunningChild> {
 	const resolved = resolveLaunchRequest(request);
+	const guard = request.automatic?.guard;
+	if (
+		request.automatic &&
+		(request.worktree || request.handoff || request.surface)
+	)
+		throw new Error(
+			"An automatic launch is only a fresh launch in its own ordinary pane.",
+		);
+	// Nothing exists yet: a stale or cancelled launch creates no resource.
+	throwIfLaunchAborted(request.signal, abortedPiLaunch);
+	guard?.beforeResources();
 	let surface: PreparedSurface | undefined;
+	let dispatchAttempted = false;
 
 	try {
 		surface = prepareLaunchSurface(resolved, operations);
+		guard?.resourcesCreated();
 		const session = prepareChildSession(resolved, surface);
 		const handoffArtifacts = request.handoff
 			? prepareTaskArtifacts(resolved, session)
 			: undefined;
-		await confirmShellReady(session, operations);
+		await readyUnlessAborted(
+			confirmShellReady(session, operations),
+			request.signal,
+			abortedPiLaunch,
+		);
 		const artifacts =
 			handoffArtifacts ?? prepareTaskArtifacts(resolved, session);
 		const command = buildPiCommand(resolved, artifacts);
@@ -314,6 +377,12 @@ async function launchFreshPiSubagent(
 			artifacts,
 			command,
 			operations,
+			() => {
+				// Last checks before dispatch, with no await before runScript.
+				throwIfLaunchAborted(request.signal, abortedPiLaunch);
+				guard?.commitDispatch();
+				dispatchAttempted = true;
+			},
 		);
 		if (request.handoff) {
 			if (!operations.waitForPiReady) {
@@ -330,6 +399,9 @@ async function launchFreshPiSubagent(
 		}
 		return createRunningChild(resolved, artifacts, launchScriptFile);
 	} catch (error) {
+		// An automatic command may have reached its pane: the pane is kept
+		// for inspection instead of closing whatever it may be running.
+		if (request.automatic && dispatchAttempted) throw error;
 		rethrowLaunchFailure(request.surface, surface, error, operations);
 	}
 }
@@ -367,6 +439,8 @@ export interface FreshNativeLaunchRequest {
 	 * pending shell-readiness wait ends as soon as it aborts.
 	 */
 	signal?: AbortSignal;
+	/** Set only for an automatic fresh launch; see AutomaticLaunch. */
+	automatic?: AutomaticLaunch;
 	/**
 	 * Runs once the run is prepared (marker and loadout hash exist) and
 	 * immediately before its process is dispatched. A throw fails the launch
@@ -413,10 +487,24 @@ export async function launchNativeSubagent(
 	// Prerequisites fail before any pane, workspace, or worktree exists.
 	nativeOperations.assertAvailable(harness);
 	throwIfLaunchAborted(request.signal);
+	const guard = request.automatic?.guard;
+	if (
+		request.automatic &&
+		(request.resume ||
+			request.reuseWorktree ||
+			request.boundWorktree ||
+			request.worktree ||
+			request.surface)
+	)
+		throw new Error(
+			"An automatic launch is only a fresh launch in its own ordinary pane.",
+		);
+	guard?.beforeResources();
 	let surface: PreparedSurface | undefined;
 	let run: NativeRun | undefined;
 	try {
 		surface = prepareNativeSurface(request, location, operations);
+		guard?.resourcesCreated();
 		const binding = surface.worktree ?? request.boundWorktree;
 		const prepared = prepareNativeRun({
 			id: location.id,
@@ -461,24 +549,32 @@ export async function launchNativeSubagent(
 		throwIfLaunchAborted(request.signal);
 		request.beforeDispatch?.(run);
 		if (surface.worktree) persistWorktreeResult(surface.worktree, "running");
+		const command = supervisedCommand(
+			request.automatic
+				? `${automaticChildEnvironment()}\n${prepared.command}`
+				: prepared.command,
+			run.processRun,
+		);
+		const script = {
+			scriptPath: join(
+				location.artifactDir,
+				"subagent-scripts",
+				`${safeName(request.name) || "subagent"}-${run.harness}-${location.id}.sh`,
+			),
+			scriptPreamble: [
+				shellComment(
+					`Native ${run.harness} subagent launch script for ${request.name}`,
+				),
+				shellComment(`Generated: ${new Date().toISOString()}`),
+				shellComment(`Native marker: ${run.markerFile}`),
+				shellComment(`Surface: ${surface.surface}`),
+			].join("\n"),
+		};
+		guard?.commitDispatch();
 		const launchScriptFile = operations.runScript(
 			surface.surface,
-			supervisedCommand(prepared.command, run.processRun),
-			{
-				scriptPath: join(
-					location.artifactDir,
-					"subagent-scripts",
-					`${safeName(request.name) || "subagent"}-${run.harness}-${location.id}.sh`,
-				),
-				scriptPreamble: [
-					shellComment(
-						`Native ${run.harness} subagent launch script for ${request.name}`,
-					),
-					shellComment(`Generated: ${new Date().toISOString()}`),
-					shellComment(`Native marker: ${run.markerFile}`),
-					shellComment(`Surface: ${surface.surface}`),
-				].join("\n"),
-			},
+			command,
+			script,
 		);
 		markNativeSubmitted(run);
 		if (request.boundWorktree)
@@ -520,27 +616,42 @@ export async function launchNativeSubagent(
 	}
 }
 
+/** A launch was aborted before its process was dispatched. */
+export class LaunchAbortedError extends Error {
+	constructor(message = "Launch cancelled before its process was dispatched.") {
+		super(message);
+		this.name = "LaunchAbortedError";
+	}
+}
+
 /** The parent aborted a native launch before its process was dispatched. */
-export class NativeLaunchAbortedError extends Error {
+export class NativeLaunchAbortedError extends LaunchAbortedError {
 	constructor() {
 		super("Native launch cancelled before its process was dispatched.");
 		this.name = "NativeLaunchAbortedError";
 	}
 }
 
-function throwIfLaunchAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw new NativeLaunchAbortedError();
+const abortedNativeLaunch = () => new NativeLaunchAbortedError();
+const abortedPiLaunch = () => new LaunchAbortedError();
+
+function throwIfLaunchAborted(
+	signal: AbortSignal | undefined,
+	aborted: () => LaunchAbortedError = abortedNativeLaunch,
+): void {
+	if (signal?.aborted) throw aborted();
 }
 
 /** Resolve with `ready`, or reject as soon as the launch is aborted. */
 function readyUnlessAborted(
 	ready: Promise<void>,
 	signal: AbortSignal | undefined,
+	aborted: () => LaunchAbortedError = abortedNativeLaunch,
 ): Promise<void> {
 	if (!signal) return ready;
-	throwIfLaunchAborted(signal);
+	throwIfLaunchAborted(signal, aborted);
 	return new Promise((resolve, reject) => {
-		const onAbort = () => reject(new NativeLaunchAbortedError());
+		const onAbort = () => reject(aborted());
 		signal.addEventListener("abort", onAbort, { once: true });
 		ready.then(
 			() => {
@@ -1053,10 +1164,15 @@ function buildPiCommand(
 		env.push(`PI_SUBAGENT_ID=${shellQuote(resolved.id)}`);
 		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(artifacts.activityFile)}`);
 		env.push(`PI_SUBAGENT_SURFACE=${shellQuote(artifacts.surface)}`);
+	} else {
+		// A handoff session has no subagent identity but is never a routing
+		// parent: a recursion guard only, not an authorization boundary.
+		env.push(`${AUTO_ROUTING_DISABLED_ENV}=1`);
 	}
 
 	const piCommand =
 		`cd ${shellQuote(artifacts.targetCwd)} && ` +
+		(request.automatic ? `${automaticChildEnvironment()} && ` : "") +
 		`${env.join(" ")} ${parts.join(" ")}`;
 	return request.handoff
 		? piCommand
@@ -1068,6 +1184,7 @@ function startPiProcess(
 	artifacts: PreparedArtifacts,
 	command: string,
 	operations: PiLaunchOperations,
+	beforeDispatch: () => void,
 ): string {
 	const launchScriptFile = join(
 		resolved.artifactDir,
@@ -1077,7 +1194,7 @@ function startPiProcess(
 	if (artifacts.worktree && !resolved.request.handoff) {
 		persistWorktreeResult(artifacts.worktree, "running");
 	}
-	return operations.runScript(artifacts.surface, command, {
+	const script = {
 		scriptPath: launchScriptFile,
 		scriptPreamble: [
 			shellComment(`Subagent launch script for ${resolved.request.name}`),
@@ -1085,7 +1202,9 @@ function startPiProcess(
 			shellComment(`Session: ${artifacts.sessionFile}`),
 			shellComment(`Surface: ${artifacts.surface}`),
 		].join("\n"),
-	});
+	};
+	beforeDispatch();
+	return operations.runScript(artifacts.surface, command, script);
 }
 
 function createRunningChild(

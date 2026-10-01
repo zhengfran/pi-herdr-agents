@@ -2,6 +2,10 @@
   "status": {
     "enabled": true
   },
+  "autoRouting": {
+    "version": 1,
+    "mode": "off"
+  },
   "models": {
     "agents": {}
   },

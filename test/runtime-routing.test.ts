@@ -9,6 +9,7 @@ import {
 	wrapPiModelRegistry,
 	type ParentRuntime,
 	type RoutingModel,
+	type RuntimeDefaults,
 	type RuntimeRequest,
 } from "../pi-extension/subagents/runtime-routing.ts";
 
@@ -69,7 +70,7 @@ function registry(entries = [model("fake", "parent"), model("other", "fast")]) {
 	});
 }
 
-function resolve(request: RuntimeRequest = {}, defaults: RuntimeRequest = {}) {
+function resolve(request: RuntimeRequest = {}, defaults: RuntimeDefaults = {}) {
 	return resolveRuntimePlan(request, defaults, parent, registry());
 }
 
@@ -456,6 +457,332 @@ describe("authenticated model catalog", () => {
 		assert.ok(
 			genericLines.some((line) => line.startsWith("For ordinary review")),
 			"generic catalog must put ordinary-review guidance on a separate line",
+		);
+	});
+});
+
+describe("automatic runtime selection", () => {
+	/** A physical model with a known API, as Pi's registry reports it. */
+	const physical = (
+		provider: string,
+		id: string,
+		overrides: Partial<RoutingModel> = {},
+	) => model(provider, id, { api: "openai-completions", ...overrides });
+	const physicalRegistry = (
+		entries = [physical("fake", "parent"), physical("other", "fast")],
+	) => registry(entries);
+	const roleDefaults: RuntimeDefaults = {
+		model: "fake/parent",
+		thinking: "low",
+		origin: { model: { source: "role" } },
+	};
+
+	it("records an exact approved tuple as auto and never as a request", () => {
+		assert.deepEqual(
+			resolveRuntimePlan(
+				{ model: "other/fast", thinking: "high", source: "auto" },
+				roleDefaults,
+				parent,
+				physicalRegistry(),
+			),
+			{
+				provider: "other",
+				modelId: "fast",
+				model: "other/fast",
+				thinking: "high",
+				modelSource: "auto",
+				thinkingSource: "auto",
+				provenance: {
+					version: 1,
+					model: {
+						source: "auto",
+						replaced: { value: "fake/parent", source: "role" },
+					},
+					thinking: {
+						source: "auto",
+						replaced: { value: "low", source: "role" },
+					},
+				},
+			},
+		);
+	});
+
+	it("never falls back to role, configured, or parent values", () => {
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ thinking: "high", source: "auto" },
+					roleDefaults,
+					parent,
+					physicalRegistry(),
+				),
+			/automatic model "" must be one exact provider\/model-id/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ model: "other/fast", source: "auto" },
+					roleDefaults,
+					parent,
+					physicalRegistry(),
+				),
+			/automatic thinking "" must be one exact level/,
+		);
+	});
+
+	it("rejects lists, task references, fuzzy, unknown, and unauthenticated models", () => {
+		const entries = [physical("fake", "parent"), physical("other", "unauthed")];
+		for (const [reference, reason] of [
+			["other/fast, fake/parent", /must be one exact provider\/model-id/],
+			["task:coding", /must be one exact provider\/model-id/],
+			[" other/fast", /must be one exact provider\/model-id/],
+			["fast", /must be one exact provider\/model-id/],
+			["other/missing", /unknown model "other\/missing"/],
+			["other/unauthed", /has no configured authentication/],
+		] as const)
+			assert.throws(
+				() =>
+					resolveRuntimePlans(
+						{ model: reference, thinking: "high", source: "auto" },
+						{},
+						parent,
+						registry(entries),
+						{ coding: ["other/unauthed"] },
+					),
+				reason,
+				reference,
+			);
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: "fake/parent", thinking: "high", source: "auto" },
+				{ model: "other/fast, fake/parent" },
+				parent,
+				physicalRegistry(),
+			).map((plan) => [plan.model, plan.modelSource]),
+			[["fake/parent", "auto"]],
+		);
+	});
+
+	it("validates exact thinking and never clamps it", () => {
+		const plain = physical("other", "plain", { reasoning: false });
+		const sparse = physical("other", "sparse", {
+			thinkingLevelMap: {
+				off: "off",
+				minimal: "minimal",
+				low: "low",
+				medium: null,
+				high: "high",
+			},
+		});
+		const entries = [physical("fake", "parent"), plain, sparse];
+		for (const [reference, thinking] of [
+			["other/plain", "high"],
+			["other/sparse", "medium"],
+		] as const)
+			assert.throws(
+				() =>
+					resolveRuntimePlan(
+						{ model: reference, thinking, source: "auto" },
+						{},
+						parent,
+						registry(entries),
+					),
+				new RegExp(`thinking "${thinking}" is not supported`),
+			);
+		const off = resolveRuntimePlan(
+			{ model: "other/plain", thinking: "off", source: "auto" },
+			{},
+			parent,
+			registry(entries),
+		);
+		assert.equal(off.thinking, "off");
+		assert.equal(off.thinkingAdjustment, undefined);
+	});
+
+	it("requires an exact registry identity and text input", () => {
+		const imageOnly = physical("other", "vision", { input: ["image"] });
+		const aliasing = wrapPiModelRegistry({
+			find: (provider: string, id: string) =>
+				provider === "other" && id.toLowerCase() === "fast"
+					? physical("other", "fast")
+					: undefined,
+			getAvailable: () => [physical("other", "fast")],
+			hasConfiguredAuth: () => true,
+		});
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ model: "other/FAST", thinking: "high", source: "auto" },
+					{},
+					parent,
+					aliasing,
+				),
+			/an exact registry identity is required/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ model: "other/vision", thinking: "high", source: "auto" },
+					{},
+					parent,
+					registry([physical("fake", "parent"), imageOnly]),
+				),
+			/does not accept text input/,
+		);
+	});
+
+	it("rejects virtual routing and unknown-API models while manual routing keeps them", () => {
+		const entries = [
+			physical("fake", "parent"),
+			model("router", "auto-1", { api: "pi-virtual" }),
+			model("other", "bare"),
+		];
+		const pi = registry(entries);
+		assert.equal(pi.find("router", "auto-1")?.api, "pi-virtual");
+		assert.equal(pi.find("other", "bare")?.api, undefined);
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ model: "router/auto-1", thinking: "high", source: "auto" },
+					{},
+					parent,
+					pi,
+				),
+			/"router\/auto-1" is a virtual routing model; an exact physical model is required/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlan(
+					{ model: "other/bare", thinking: "high", source: "auto" },
+					{},
+					parent,
+					pi,
+				),
+			/"other\/bare" has no known model API/,
+		);
+		// Manual selections keep routing through virtual models unchanged.
+		const manual = resolveRuntimePlan(
+			{ model: "router/auto-1", thinking: "high" },
+			{},
+			parent,
+			pi,
+		);
+		assert.equal(manual.model, "router/auto-1");
+		assert.equal(manual.modelSource, "request");
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: "router/auto-1, other/bare" },
+				{},
+				parent,
+				pi,
+			).map((plan) => plan.model),
+			["router/auto-1", "other/bare"],
+		);
+	});
+
+	it("tags a replaced value with its harness when another harness runs", () => {
+		const plan = resolveRuntimePlan(
+			{ model: "other/fast", thinking: "high", source: "auto" },
+			{
+				model: "opus",
+				thinking: "low",
+				origin: {
+					model: { source: "role", harness: "claude" },
+					thinking: { source: "role", harness: "claude" },
+				},
+			},
+			parent,
+			physicalRegistry(),
+		);
+		assert.equal(plan.model, "other/fast");
+		assert.deepEqual(plan.provenance, {
+			version: 1,
+			model: {
+				source: "auto",
+				replaced: { value: "opus", source: "role", harness: "claude" },
+			},
+			thinking: {
+				source: "auto",
+				replaced: { value: "low", source: "role", harness: "claude" },
+			},
+		});
+	});
+});
+
+describe("canonical runtime provenance", () => {
+	it("omits provenance when the caller cannot tell role and configured defaults apart", () => {
+		assert.equal(resolve().provenance, undefined);
+		assert.equal(resolve({}, { model: "other/fast" }).provenance, undefined);
+	});
+
+	it("distinguishes a role value from a configured default behind the legacy agent source", () => {
+		const fromRole = resolve(
+			{},
+			{
+				model: "other/fast",
+				thinking: "low",
+				origin: { model: { source: "role" } },
+			},
+		);
+		assert.equal(fromRole.modelSource, "agent");
+		assert.equal(fromRole.thinkingSource, "agent");
+		assert.equal(fromRole.requestedModel, "other/fast");
+		assert.equal(fromRole.requestedThinking, "low");
+		assert.deepEqual(fromRole.provenance, {
+			version: 1,
+			model: { source: "role" },
+			thinking: { source: "role" },
+		});
+
+		const fromConfig = resolve(
+			{},
+			{
+				model: "other/fast",
+				origin: {
+					model: { source: "default", defaultKey: "models.agents.scout" },
+				},
+			},
+		);
+		assert.equal(fromConfig.modelSource, "agent");
+		assert.deepEqual(fromConfig.provenance, {
+			version: 1,
+			model: { source: "default", defaultKey: "models.agents.scout" },
+			thinking: { source: "parent" },
+		});
+	});
+
+	it("records request and parent origins and keeps them on every fallback", () => {
+		assert.deepEqual(
+			resolve(
+				{ model: "other/fast", thinking: "high" },
+				{
+					model: "fake/parent",
+					origin: { model: { source: "role" } },
+				},
+			).provenance,
+			{
+				version: 1,
+				model: { source: "request" },
+				thinking: { source: "request" },
+			},
+		);
+		assert.deepEqual(resolve({}, { origin: { model: undefined } }).provenance, {
+			version: 1,
+			model: { source: "parent" },
+			thinking: { source: "parent" },
+		});
+		const configured: RuntimeDefaults = {
+			model: "other/fast, fake/parent",
+			origin: { model: { source: "default", defaultKey: "models.default" } },
+		};
+		assert.deepEqual(
+			resolveRuntimePlans({}, configured, parent, registry()).map(
+				(plan) => plan.provenance?.model,
+			),
+			[
+				{ source: "default", defaultKey: "models.default" },
+				{ source: "default", defaultKey: "models.default" },
+			],
 		);
 	});
 });

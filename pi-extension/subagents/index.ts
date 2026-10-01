@@ -3,6 +3,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	SessionShutdownEvent,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { keyHint, loadSkills } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
@@ -57,10 +58,47 @@ import {
 	resolveRuntimePlans,
 	wrapPiModelRegistry,
 	THINKING_LEVELS,
+	automaticFieldProvenance,
 	isThinkingLevel,
 	type ResolvedRuntimePlan,
+	type RuntimeDefaults,
+	type RuntimeFieldProvenance,
+	type RuntimeProvenance,
 	type ThinkingLevel,
 } from "./runtime-routing.ts";
+import {
+	AUTO_ROUTING_CONFIG_KEY,
+	autoRoutingConfigDigest,
+	loadAutoRoutingConfig,
+	parseAutoRoutingConfig,
+	type AutoCandidateApproval,
+	type AutoRoleApproval,
+	type AutoRoutingConfig,
+	type EnabledAutoRoutingState,
+} from "./auto-routing-config.ts";
+import type {
+	AutoNativePlanView,
+	AutoRoutingAuthority,
+} from "./auto-routing-candidates.ts";
+import {
+	AUTO_REQUEST_CUSTOM_TYPE,
+	AUTO_ROUTING_DISABLED_ENV,
+	AUTO_STATUS_CUSTOM_TYPE,
+	autoRequestView,
+	autoStatusView,
+	AutoLaunchStoppedError,
+	autoRunBindingAuthorizes,
+	createAutoRoutingCoordinator,
+	formatAutoRoutingStatus,
+	type AutoLaunchHandoff,
+	type AutoLaunchOutcome,
+	type AutoMessageView,
+	type AutoRetainedWork,
+	type AutoRoutingCoordinatorOptions,
+	type AutoRunBinding,
+	type AutoRunReceipt,
+} from "./auto-routing-input.ts";
+import { createJevTransport } from "./jev-client.ts";
 import {
 	loadModelConfig,
 	resolveModelDefault,
@@ -147,6 +185,7 @@ import {
 	NativeLaunchUnresolvedError,
 	retainUnresolvedWorktree,
 	unknownWorktreeHandoff,
+	type AutomaticLaunch,
 	type PiLaunchOperations,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
@@ -159,6 +198,7 @@ import {
 } from "./launch.ts";
 import {
 	checkNativeResume,
+	createNativeHarnessOperations,
 	isNativeHarnessName,
 	nativeHarnessLabel,
 	nativeOutcome,
@@ -455,6 +495,23 @@ interface AgentCatalog {
 	diagnostics: AgentDiagnostic[];
 }
 
+/**
+ * A per-role discovery failure and the precedence layer that produced it:
+ * every diagnostic naming a role, and every definition without valid
+ * frontmatter, which ordinary discovery skips silently. Only automatic
+ * routing collects these; manual discovery and launch never consult them.
+ */
+interface AgentLayerFailure {
+	agentName: string;
+	source: AgentSource;
+	code: string;
+}
+
+/** A catalog with the precedence evidence automatic routing requires. */
+interface AutoAgentCatalog extends AgentCatalog {
+	failures: AgentLayerFailure[];
+}
+
 const ROLE_PACK_DISCOVERY_EVENT = "pi-herdr-subagents:roles:discover:v1";
 
 /** Tools that are gated by `spawning: false` */
@@ -514,8 +571,11 @@ function isSubagentHarness(value: string): value is SubagentHarness {
  */
 interface SubagentSelection {
 	harness: SubagentHarness;
-	/** `request`: the spawn's `harness`; `role`: the role's `cli`; `default`: Pi. */
-	harnessSource: "request" | "role" | "default";
+	/**
+	 * `request`: the spawn's `harness`; `role`: the role's `cli`; `default`:
+	 * Pi; `auto`: a verified administrator-approved automatic tuple.
+	 */
+	harnessSource: "request" | "role" | "default" | "auto";
 	/** A named role running outside the harness it declares. */
 	projected: boolean;
 	/** Named roles only: the resolved definition's provenance. */
@@ -539,18 +599,125 @@ type RoleProjection =
 	| { ok: false; error: string; message: string };
 
 /**
- * Resolve the effective harness (explicit request → role `cli` → Pi) and
- * project a named role onto it. Projection is a strict validated view, not
- * a conversion: a role's frontmatter `model` belongs to the harness the role
- * declares and is dropped when the role runs elsewhere, so a pinned model
- * requires an explicit destination model. Native `spawn-agents` has no
- * bounded Pi equivalent and cannot be projected to Pi. The destination
- * harness then validates every remaining capability before any resource.
+ * Administrator authorization for one automatic spawn: one exact approved
+ * role/harness/model/effort tuple of a loaded `autoRouting` configuration.
+ * Only createAutoLaunchAuthorization mints one. Structurally identical
+ * objects, including anything parsed from tool or command arguments, are
+ * rejected; no public parameter can carry one.
+ */
+interface AutoLaunchAuthorization {
+	readonly configDigest: string;
+	readonly role: AutoRoleApproval;
+	readonly candidate: AutoCandidateApproval;
+	readonly harness: SubagentHarness;
+	/** Exact Pi provider/model-id or exact native model ID, per harness. */
+	readonly model: string;
+	readonly effort: ThinkingLevel;
+}
+
+const mintedAutoAuthorizations = new WeakSet<AutoLaunchAuthorization>();
+
+/**
+ * Mint the authorization for one approved candidate. The configuration must
+ * re-parse strictly to its recorded digest, and the tuple is copied from that
+ * immutable parse, so a modified approval can never authorize a launch.
+ */
+function createAutoLaunchAuthorization(
+	state: EnabledAutoRoutingState,
+	candidateId: string,
+): AutoLaunchAuthorization {
+	let config: AutoRoutingConfig;
+	try {
+		config = parseAutoRoutingConfig({
+			[AUTO_ROUTING_CONFIG_KEY]: state.config,
+		});
+	} catch (error) {
+		throw new Error(
+			`Automatic launch authorization requires a valid autoRouting configuration: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (
+		state.status !== "enabled" ||
+		config.mode === "off" ||
+		autoRoutingConfigDigest(config) !== state.digest
+	)
+		throw new Error(
+			"Automatic launch authorization requires the loaded, unmodified enabled autoRouting configuration.",
+		);
+	const candidate = config.candidates.find((entry) => entry.id === candidateId);
+	const role =
+		candidate && config.roles.find((entry) => entry.id === candidate.roleId);
+	if (!candidate || !role)
+		throw new Error(
+			`Automatic launch authorization: candidate ${JSON.stringify(candidateId)} is not approved.`,
+		);
+	const authorization: AutoLaunchAuthorization = Object.freeze({
+		configDigest: state.digest,
+		role,
+		candidate,
+		harness: candidate.harness,
+		model:
+			candidate.model.namespace === "pi"
+				? candidate.model.ref
+				: candidate.model.id,
+		effort: candidate.effort,
+	});
+	mintedAutoAuthorizations.add(authorization);
+	return authorization;
+}
+
+/**
+ * An automatic spawn runs exactly its approved role, resolved by ordinary
+ * precedence. Its harness and model come only from a verified authorization,
+ * never from spawn parameters.
+ */
+function autoAuthorizationRejection(
+	params: Pick<Static<typeof SubagentParams>, "agent" | "harness" | "model">,
+	role: ListedAgentDefinition | null,
+	auto: AutoLaunchAuthorization,
+): string | undefined {
+	if (!mintedAutoAuthorizations.has(auto))
+		return "Automatic launch authorization is not a verified administrator approval.";
+	if (params.harness !== undefined || params.model !== undefined)
+		return "An automatic spawn takes its harness and model only from its approved tuple.";
+	const approved = auto.role;
+	if (
+		!role ||
+		params.agent !== approved.agent ||
+		role.name !== approved.agent ||
+		role.source !== approved.source ||
+		role.provider !== approved.provider ||
+		role.providerVersion !== approved.providerVersion
+	)
+		return `Approved role "${approved.agent}" (${approved.provider ? `package:${approved.provider}@${approved.providerVersion}` : approved.source}) is not the role this spawn resolves.`;
+	return undefined;
+}
+
+/**
+ * Resolve the effective harness (explicit request → role `cli` → Pi, or a
+ * verified automatic tuple) and project a named role onto it. Projection is
+ * a strict validated view, not a conversion: a role's frontmatter `model`
+ * belongs to the harness the role declares and is dropped when the role runs
+ * elsewhere, so a pinned model requires an explicit destination model, which
+ * an approved automatic tuple supplies. Native `spawn-agents` has no bounded
+ * Pi equivalent and cannot be projected to Pi. The destination harness then
+ * validates every remaining capability before any resource.
  */
 function resolveRoleProjection(
 	params: Pick<Static<typeof SubagentParams>, "agent" | "harness" | "model">,
 	role: ListedAgentDefinition | null,
+	auto?: AutoLaunchAuthorization,
 ): RoleProjection {
+	const autoRejection =
+		auto === undefined
+			? undefined
+			: autoAuthorizationRejection(params, role, auto);
+	if (autoRejection)
+		return {
+			ok: false,
+			error: "auto-authorization-invalid",
+			message: autoRejection,
+		};
 	if (params.harness && !params.agent)
 		return {
 			ok: false,
@@ -567,10 +734,17 @@ function resolveRoleProjection(
 	const roleHarness: SubagentHarness | undefined = role
 		? (role.cli ?? "pi")
 		: undefined;
-	const harness: SubagentHarness = params.harness ?? role?.cli ?? "pi";
+	const harness: SubagentHarness =
+		auto?.harness ?? params.harness ?? role?.cli ?? "pi";
 	const selection: SubagentSelection = {
 		harness,
-		harnessSource: params.harness ? "request" : role?.cli ? "role" : "default",
+		harnessSource: auto
+			? "auto"
+			: params.harness
+				? "request"
+				: role?.cli
+					? "role"
+					: "default",
 		projected: !!roleHarness && roleHarness !== harness,
 	};
 	if (!role || !roleHarness) return { ok: true, selection, agentDefs: null };
@@ -584,7 +758,8 @@ function resolveRoleProjection(
 		selection.role.providerVersion = role.providerVersion;
 	if (!selection.projected) return { ok: true, selection, agentDefs: role };
 
-	if (role.model && !params.model?.trim())
+	// A verified automatic tuple is the administrator's explicit destination.
+	if (role.model && !(auto?.model ?? params.model)?.trim())
 		return {
 			ok: false,
 			error: "harness-switch-requires-model",
@@ -961,12 +1136,44 @@ function discoverRolePackPaths(
 	return { paths: [...paths], diagnostics };
 }
 
+/**
+ * The role names a definition without valid frontmatter may have meant to
+ * override: its file name, and any `name:` in a CRLF, BOM-prefixed, or
+ * unterminated frontmatter block.
+ */
+function malformedRoleNames(content: string, fallbackName: string): string[] {
+	const block = content
+		.replace(/^\uFEFF/, "")
+		.replace(/\r\n?/g, "\n")
+		.match(/^---\n([\s\S]*?)(?:\n---|$)/);
+	const name = block ? getFrontmatterValue(block[1], "name") : undefined;
+	return name && name !== fallbackName ? [fallbackName, name] : [fallbackName];
+}
+
+/**
+ * Discover roles by precedence (package < global < project). When `failures`
+ * is supplied, every per-role failure is also recorded there with its layer;
+ * the returned catalog is identical either way.
+ */
 function discoverAgentCatalog(
 	pi?: Pick<ExtensionAPI, "events">,
 	roleConfig: RoleConfig = bundledRoleConfig,
+	failures?: AgentLayerFailure[],
 ): AgentCatalog {
 	const agents = new Map<string, ListedAgentDefinition>();
 	const diagnostics: AgentDiagnostic[] = [];
+	// Diagnostics are recorded per layer after each layer is discovered.
+	let recorded = 0;
+	const recordLayer = (source: AgentSource) => {
+		for (const diagnostic of diagnostics.slice(recorded))
+			if (diagnostic.agentName)
+				failures?.push({
+					agentName: diagnostic.agentName,
+					source,
+					code: diagnostic.code,
+				});
+		recorded = diagnostics.length;
+	};
 
 	const addDirectory = (path: string, source: AgentSource) => {
 		if (!existsSync(path)) return;
@@ -996,6 +1203,15 @@ function discoverAgentCatalog(
 			const parsed = parseAgentDefinition(content, fallbackName);
 			if (parsed)
 				agents.set(parsed.name, { ...parsed, source, path: filePath });
+			// Ordinary discovery skips it; automatic routing never lets a
+			// lower-precedence definition stand in for a failed override.
+			else
+				for (const agentName of malformedRoleNames(content, fallbackName))
+					failures?.push({
+						agentName,
+						source,
+						code: "invalid-role-definition",
+					});
 		}
 	};
 
@@ -1138,9 +1354,12 @@ function discoverAgentCatalog(
 		}
 		agents.set(name, definitions[0]);
 	}
+	recordLayer("package");
 
 	addDirectory(join(getAgentConfigDir(), "agents"), "global");
+	recordLayer("global");
 	addDirectory(join(process.cwd(), ".pi", "agents"), "project");
+	recordLayer("project");
 
 	return { agents: [...agents.values()], diagnostics };
 }
@@ -1548,6 +1767,10 @@ interface SubagentResultDetails {
 	native?: NativeResultReference;
 	/** Effective harness selection and role provenance (fresh spawns). */
 	selection?: SubagentSelection;
+	/** Canonical origin of the model and thinking (fresh spawns). */
+	runtimeProvenance?: RuntimeProvenance;
+	/** Decision-only correlation of an automatic spawn; never identity. */
+	autoRouting?: AutoRunReceipt;
 }
 
 interface SubagentPingDetails {
@@ -1557,6 +1780,8 @@ interface SubagentPingDetails {
 	sessionFile: string;
 	worktree?: WorktreeHandoff;
 	selection?: SubagentSelection;
+	runtimeProvenance?: RuntimeProvenance;
+	autoRouting?: AutoRunReceipt;
 }
 
 interface SubagentStartedDetails {
@@ -1577,6 +1802,10 @@ interface SubagentStartedDetails {
 	nativeMode?: "autonomous" | "interactive" | "persistent";
 	/** Effective harness selection and role provenance. */
 	selection?: SubagentSelection;
+	/** Canonical origin of the model and thinking, for every harness. */
+	runtimeProvenance?: RuntimeProvenance;
+	/** Decision-only correlation of an automatic spawn; never identity. */
+	autoRouting?: AutoRunReceipt;
 	status: "started";
 }
 
@@ -1665,6 +1894,7 @@ function resolveResultPresentation(
 	>,
 	name: string,
 	runtimeMismatch?: string,
+	selection?: SubagentSelection,
 ): string {
 	const sessionRef = result.native
 		? formatNativeSessionReference(result.native)
@@ -1712,7 +1942,12 @@ function resolveResultPresentation(
 				: `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}`;
 	}
 
-	if (requestedModel) body += `\n\nRequested model: ${requestedModel}`;
+	// An automatic choice is an approved tuple, never a caller's request.
+	const requestedLabel =
+		selection?.harnessSource === "auto"
+			? "Automatically selected model"
+			: "Requested model";
+	if (requestedModel) body += `\n\n${requestedLabel}: ${requestedModel}`;
 	if (attempted.length > 1)
 		body += `\nModels attempted: ${attempted.join(", ")}`;
 	if (usedModel) body += `\nModel used: ${usedModel}`;
@@ -1805,6 +2040,16 @@ interface RunningSubagent {
 	 * every fallback attempt; absent for resumed sessions.
 	 */
 	selection?: SubagentSelection;
+	/**
+	 * Canonical origin of the model and thinking for every harness, fixed
+	 * with the selection; absent for resumed sessions.
+	 */
+	runtimeProvenance?: RuntimeProvenance;
+	/**
+	 * Decision-only correlation of an automatic spawn, fixed with the
+	 * selection and copied to every attempt; never a submission identity.
+	 */
+	autoRouting?: AutoRunReceipt;
 	worktree?: WorktreeLaunch;
 	persistent?: boolean;
 	logicalId?: string;
@@ -1869,6 +2114,11 @@ interface NestedOrigin {
 interface UnresolvedNativeRun {
 	run: NativeRun;
 	worktreePath?: string;
+	/**
+	 * Ordinary pane this parent created for an autonomous run whose result
+	 * the parent accepted; closed once exit is confirmed late.
+	 */
+	closePaneOnExit?: string;
 }
 
 /**
@@ -1887,6 +2137,8 @@ interface NativeTestSeam {
 	deliveryRetryMs?: number;
 	/** Final persistent delivery attempts before the notice carries results. */
 	deliveryAttempts?: number;
+	/** First delay of the late native exit re-check. */
+	lateExitRecheckMs?: number;
 	/** Replaces Herdr/session supervision of Pi-backed children. */
 	piWatch?: (
 		running: RunningSubagent,
@@ -1899,6 +2151,10 @@ interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
 	/** Retained until exit is confirmed; blocks cleanup of their worktrees. */
 	unresolvedNativeRuns?: Map<string, UnresolvedNativeRun>;
+	/** Pending re-check of unresolved runs that retain a closable pane. */
+	lateExitRecheck?: ReturnType<typeof setTimeout>;
+	/** Unresolved runs a re-check released before any pane was marked. */
+	lateReleasedNativeRuns?: WeakSet<NativeRun>;
 	/** Aborted by a non-preserving parent shutdown: in-flight native launches. */
 	nativeLaunchAbort?: AbortController;
 	/** Persistent first tasks planned in the ledger whose launch is in flight. */
@@ -1907,6 +2163,10 @@ interface SubagentRuntime {
 	pi?: ExtensionAPI;
 	latestCtx?: ExtensionContext;
 	modelCatalog?: string;
+	/** Automatic-routing work dispatched or possibly dispatched; kept busy. */
+	autoRoutingRetained?: AutoRetainedWork;
+	/** Automatic decisions this process resolved; recovery defers to them. */
+	autoRoutingResolved?: Set<string>;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -2541,6 +2801,7 @@ interface PersistentHelpDetails {
 	sessionFile: string;
 	/** The fresh spawn's immutable harness selection, when it has one. */
 	selection?: SubagentSelection;
+	runtimeProvenance?: RuntimeProvenance;
 }
 
 /** Terminal notice details for a persistent specialist. */
@@ -2550,14 +2811,17 @@ interface PersistentNoticeDetails {
 	facts: PersistentSpecialistFacts;
 	/** The fresh spawn's immutable harness selection, when it has one. */
 	selection?: SubagentSelection;
+	runtimeProvenance?: RuntimeProvenance;
 }
 
 function persistentNoticeDetails(
 	running: RunningSubagent,
-	base: Omit<PersistentNoticeDetails, "selection">,
+	base: Omit<PersistentNoticeDetails, "selection" | "runtimeProvenance">,
 ): PersistentNoticeDetails {
 	const details: PersistentNoticeDetails = { ...base };
 	if (running.selection) details.selection = running.selection;
+	if (running.runtimeProvenance)
+		details.runtimeProvenance = running.runtimeProvenance;
 	return details;
 }
 
@@ -3082,7 +3346,8 @@ function buildBtwLaunchCommand(params: {
 	const envPrefix = params.agentDir
 		? `PI_CODING_AGENT_DIR=${shellQuote(params.agentDir)} `
 		: "";
-	return `cd ${shellQuote(params.cwd)} && ${envPrefix}${parts.join(" ")}`;
+	// A side session is never a routing parent: recursion guard only.
+	return `cd ${shellQuote(params.cwd)} && ${envPrefix}${AUTO_ROUTING_DISABLED_ENV}=1 ${parts.join(" ")}`;
 }
 
 const SUBAGENT_COMMAND_USAGE =
@@ -3286,6 +3551,8 @@ export const __test__ = {
 	watchNativeSubagent,
 	resolveNativeSpecForParams,
 	reconcileUnresolvedNativeRuns,
+	closePaneAfterLateExit,
+	lateReleasedNativeRuns,
 	recoverPlannedPersistentDispatches,
 	unresolvedNativeRuns,
 	handleNativeFollowUp,
@@ -3299,6 +3566,10 @@ export const __test__ = {
 	verifyResumeWorktree,
 	resumeNativeSession,
 	launchNativeFromParams,
+	prepareSubagentRun,
+	createAutoLaunchAuthorization,
+	createAutoRoutingAuthority,
+	launchAutoRoutedRun,
 	startSubagentRun,
 	watchNativeWithFallbacks,
 	setNativeTestSeam(seam: NativeTestSeam | undefined) {
@@ -3313,6 +3584,36 @@ function startWidgetRefresh() {
 		updateWidget();
 	}, 1000);
 	writeGlobalSlot(WIDGET_INTERVAL_KEY, widgetInterval);
+}
+
+/**
+ * A Pi role's runtime defaults (role model → `models.agents[role]` →
+ * `models.default`; role thinking) with the canonical origin of the model,
+ * which the legacy `agent` source flattens.
+ */
+function resolveRuntimeDefaults(
+	agentName: string | undefined,
+	agentDefs: AgentDefaults | null,
+): RuntimeDefaults {
+	const origin: RuntimeDefaults["origin"] = agentDefs?.model
+		? { model: { source: "role" } }
+		: agentName && Object.hasOwn(modelConfig.agents, agentName)
+			? {
+					model: {
+						source: "default",
+						defaultKey: `models.agents.${agentName}`,
+					},
+				}
+			: {
+					model: modelConfig.default
+						? { source: "default", defaultKey: "models.default" }
+						: undefined,
+				};
+	return {
+		model: resolveModelDefault(agentName, agentDefs?.model, modelConfig),
+		thinking: agentDefs?.thinking,
+		origin,
+	};
 }
 
 /**
@@ -3370,6 +3671,10 @@ async function launchSubagent(
 		forceLeaf?: boolean;
 		/** The role as resolved and projected once for this spawn. */
 		agentDefs?: AgentDefaults | null;
+		/** An automatic launch: its guards and child environment hygiene. */
+		automatic?: AutomaticLaunch;
+		/** Package-owned cancellation of an automatic launch. */
+		signal?: AbortSignal;
 	},
 ): Promise<RunningSubagent> {
 	const agentDefs = resolveLaunchAgentDefs(params, options?.agentDefs);
@@ -3379,10 +3684,7 @@ async function launchSubagent(
 		options?.runtimePlan ??
 		resolveRuntimePlan(
 			{ model: params.model, thinking: params.thinking },
-			{
-				model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-				thinking: agentDefs?.thinking,
-			},
+			resolveRuntimeDefaults(params.agent, agentDefs),
 			{
 				provider: ctx.model.provider,
 				modelId: ctx.model.id,
@@ -3441,6 +3743,8 @@ async function launchSubagent(
 				sessionMode: resolveEffectiveSessionMode(params, agentDefs),
 				cwd: agentDefs?.cwd,
 			},
+			automatic: options?.automatic,
+			signal: options?.signal,
 		},
 		runtime.nativeTestSeam?.operations,
 	);
@@ -3688,6 +3992,8 @@ async function launchNativeFromParams(
 		reuseWorktree?: WorktreeLaunch;
 		worktreeLeaseFrom?: string;
 		signal?: AbortSignal;
+		/** An automatic fresh launch: its guards and child hygiene. */
+		automatic?: AutomaticLaunch;
 	},
 ): Promise<RunningSubagent> {
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
@@ -3737,6 +4043,7 @@ async function launchNativeFromParams(
 			reuseWorktree: options.reuseWorktree,
 			worktreeLeaseFrom: options.worktreeLeaseFrom,
 			signal: options.signal,
+			automatic: options.automatic,
 			beforeDispatch: persistent
 				? (prepared) => {
 						// The first tagged turn is the specialist's first task.
@@ -3954,6 +4261,8 @@ async function watchNativeWithFallbacks(
 			// result is owed to its requester, never to the ordinary parent.
 			if (previous.nestedOf) running.nestedOf = previous.nestedOf;
 			running.selection = previous.selection;
+			running.runtimeProvenance = previous.runtimeProvenance;
+			if (previous.autoRouting) running.autoRouting = previous.autoRouting;
 			startWidgetRefresh();
 			if (runtime.pi) startStatusRefresh(runtime.pi);
 		} catch (error) {
@@ -4177,6 +4486,8 @@ function deliverNestedResult(
 	};
 	if (result.errorMessage) details.errorMessage = result.errorMessage;
 	if (child.selection) details.selection = child.selection;
+	if (child.runtimeProvenance)
+		details.runtimeProvenance = child.runtimeProvenance;
 	sendSubagentResult(
 		selectCompletionApi(pi, runtime.pi),
 		`Nested subagent "${origin.name}" (${origin.agent}) ${outcome}; its requesting native child "${origin.requesterName}" could not accept the result, so it is delivered here.\n\n${resolveResultPresentation(result, child.name)}`,
@@ -4194,16 +4505,24 @@ function resolveSubagentRuntimePlans(
 	ctx: Parameters<typeof launchSubagent>[1],
 	parentThinking: ThinkingLevel,
 	suppliedAgentDefs?: AgentDefaults | null,
+	/** An automatic tuple and, for provenance only, what it replaces. */
+	automatic?: {
+		authorization: AutoLaunchAuthorization;
+		replaced: RuntimeDefaults;
+	},
 ): ResolvedRuntimePlan[] {
 	const agentDefs = resolveLaunchAgentDefs(params, suppliedAgentDefs);
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
 	const plans = resolveRuntimePlans(
-		{ model: params.model, thinking: params.thinking },
-		{
-			model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-			thinking: agentDefs?.thinking,
-		},
+		automatic
+			? {
+					model: automatic.authorization.model,
+					thinking: automatic.authorization.effort,
+					source: "auto",
+				}
+			: { model: params.model, thinking: params.thinking },
+		automatic?.replaced ?? resolveRuntimeDefaults(params.agent, agentDefs),
 		{
 			provider: ctx.model.provider,
 			modelId: ctx.model.id,
@@ -4226,13 +4545,35 @@ async function launchSubagentWithFallbacks(
 	ctx: Parameters<typeof launchSubagent>[1],
 	parentThinking: ThinkingLevel,
 	plans: ResolvedRuntimePlan[],
-	extra: { forceLeaf?: boolean; agentDefs?: AgentDefaults | null } = {},
+	extra: {
+		forceLeaf?: boolean;
+		agentDefs?: AgentDefaults | null;
+		automatic?: AutomaticLaunch;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<{
 	running: RunningSubagent;
 	index: number;
 	launchFailures: ModelFailure[];
 }> {
 	const launchFailures: ModelFailure[] = [];
+	// An automatic tuple is one exact plan with no model fallback: its one
+	// launch error, with the dispatch latch it left, is never aggregated.
+	if (extra.automatic) {
+		if (plans.length !== 1)
+			throw new Error("An automatic launch has exactly one runtime plan.");
+		return {
+			running: await launchSubagent(params, ctx, parentThinking, {
+				runtimePlan: plans[0],
+				forceLeaf: extra.forceLeaf,
+				agentDefs: extra.agentDefs,
+				automatic: extra.automatic,
+				signal: extra.signal,
+			}),
+			index: 0,
+			launchFailures,
+		};
+	}
 	for (const [index, plan] of plans.entries()) {
 		try {
 			return {
@@ -4284,6 +4625,8 @@ function deliverPersistentTaskEvent(
 			sessionFile: running.sessionFile,
 		};
 		if (running.selection) details.selection = running.selection;
+		if (running.runtimeProvenance)
+			details.runtimeProvenance = running.runtimeProvenance;
 		try {
 			api.sendMessage(
 				{
@@ -4332,6 +4675,8 @@ function deliverPersistentTaskEvent(
 			policyHash: running.policyHash!,
 		};
 		if (running.selection) details.selection = running.selection;
+		if (running.runtimeProvenance)
+			details.runtimeProvenance = running.runtimeProvenance;
 		sendSubagentResult(
 			api,
 			`Persistent specialist "${running.name}" completed task ${event.task} (${completed} tasks completed) and is idle and accepting subagent_send.\n\n${summary}`,
@@ -4634,7 +4979,8 @@ function unresolvedNativeRuns(): Map<string, UnresolvedNativeRun> {
 
 /**
  * Re-check retained native runs. A run whose exit is now confirmed releases
- * its owned files and session lease and stops blocking worktree cleanup.
+ * its owned files and session lease and stops blocking worktree cleanup; the
+ * ordinary pane of an accepted autonomous result is then closed.
  */
 function reconcileUnresolvedNativeRuns(
 	confirm: (run: NativeRun["processRun"]) => ExitConfirmation = (run) =>
@@ -4646,9 +4992,82 @@ function reconcileUnresolvedNativeRuns(
 		if (exit.kind === "confirmed") {
 			releaseNativeRun(entry.run, exit, "exit-confirmed-late");
 			unresolved.delete(id);
+			if (entry.closePaneOnExit) closeCompletedPanes([entry.closePaneOnExit]);
+			// Its result may still be in flight: delivery decides the pane.
+			else lateReleasedNativeRuns().add(entry.run);
 		}
 	}
 	return [...unresolved.values()];
+}
+
+function lateReleasedNativeRuns(): WeakSet<NativeRun> {
+	runtime.lateReleasedNativeRuns ??= new WeakSet();
+	return runtime.lateReleasedNativeRuns;
+}
+
+const LATE_EXIT_RECHECK_MS = 2_000;
+const MAX_LATE_EXIT_RECHECK_MS = 60_000;
+
+/**
+ * After the parent accepted an autonomous run's result while its exit was
+ * unconfirmed, mark the ordinary pane it created for closing at confirmed
+ * exit. If a re-check already released this exact run before delivery, the
+ * pane closes now, but only after its exit is confirmed again. Worktree
+ * roots, persistent, interactive and nested runs keep theirs.
+ */
+function closePaneAfterLateExit(
+	running: RunningSubagent,
+	native: NativeResultReference | undefined,
+): void {
+	const run = running.native;
+	if (!run || !native) return;
+	if (running.worktree || running.persistent || running.nestedOf) return;
+	if (run.driver.mode !== "autonomous") return;
+	if (native.surface !== undefined && native.surface !== running.surface)
+		return;
+	const entry = unresolvedNativeRuns().get(running.id);
+	if (entry) {
+		if (entry.run !== run || native.processExit !== "unconfirmed") return;
+		entry.closePaneOnExit = running.surface;
+		scheduleLateExitRecheck();
+		return;
+	}
+	if (!lateReleasedNativeRuns().delete(run)) return;
+	const confirm =
+		runtime.nativeTestSeam?.watch?.confirmExit ?? confirmProcessExit;
+	let exit: ExitConfirmation;
+	try {
+		exit = confirm(run.processRun);
+	} catch {
+		return;
+	}
+	if (exit.kind === "confirmed") closeCompletedPanes([running.surface]);
+}
+
+/**
+ * Re-check unresolved runs with backoff while any retains a closable pane.
+ * The timer is unreferenced and survives /reload with the runtime.
+ */
+function scheduleLateExitRecheck(
+	delayMs = runtime.nativeTestSeam?.lateExitRecheckMs ?? LATE_EXIT_RECHECK_MS,
+): void {
+	if (runtime.lateExitRecheck) return;
+	const timer = setTimeout(() => {
+		runtime.lateExitRecheck = undefined;
+		const confirm = runtime.nativeTestSeam?.watch?.confirmExit;
+		let pending = true;
+		try {
+			pending = reconcileUnresolvedNativeRuns(confirm).some(
+				(entry) => entry.closePaneOnExit,
+			);
+		} catch {
+			// Release I/O failed; the entry stays unresolved and is retried.
+		}
+		if (pending)
+			scheduleLateExitRecheck(Math.min(delayMs * 2, MAX_LATE_EXIT_RECHECK_MS));
+	}, delayMs);
+	timer.unref?.();
+	runtime.lateExitRecheck = timer;
 }
 
 /** Git state is never captured while an owned process may still write it. */
@@ -4684,12 +5103,15 @@ function settleThrownNativeWatcher(
 			run,
 			worktreePath: running.worktree?.path,
 		});
-	else
+	else {
+		// A confirmed settlement hands its pane to the caller's close path.
+		lateReleasedNativeRuns().delete(run);
 		try {
 			releaseNativeRun(run, exit, "failed");
 		} catch {
 			// Leases are released before the run record; evidence stays on disk.
 		}
+	}
 	const settlement: ThrownNativeSettlement = {
 		native: {
 			harness: run.harness,
@@ -4846,6 +5268,8 @@ function flushNativePersistentDeliveries(
 			policyHash: running.policyHash!,
 		};
 		if (running.selection) details.selection = running.selection;
+		if (running.runtimeProvenance)
+			details.runtimeProvenance = running.runtimeProvenance;
 		try {
 			sendSubagentResult(
 				api,
@@ -5217,11 +5641,14 @@ async function watchSubagentWithFallbacks(
 	for (;;) {
 		const result = await watchSubagent(running, signal);
 		if (!running.worktree) completedPanes.add(running.surface);
-		const shouldRetry = shouldAdvanceToFallback(
-			result,
-			plans.length - nextPlan,
-			running.persistent,
-		);
+		// An automatic child never retries another model: it may have worked.
+		const shouldRetry =
+			!running.autoRouting &&
+			shouldAdvanceToFallback(
+				result,
+				plans.length - nextPlan,
+				running.persistent,
+			);
 		if (result.errorMessage) {
 			modelFailures.push({
 				model: running.runtimePlan?.model ?? attempts[attempts.length - 1],
@@ -5256,6 +5683,8 @@ async function watchSubagentWithFallbacks(
 				if (initial.nestedOf) running.nestedOf = initial.nestedOf;
 				// Every attempt keeps the spawn's one immutable selection.
 				running.selection = initial.selection;
+				running.runtimeProvenance = initial.runtimeProvenance;
+				if (initial.autoRouting) running.autoRouting = initial.autoRouting;
 				running.abortController = initial.abortController;
 				launchedFallback = true;
 				startWidgetRefresh();
@@ -5515,6 +5944,7 @@ async function resumeNativeSession(
 				details,
 			);
 			closePane = result.native?.processExit !== "unconfirmed";
+			closePaneAfterLateExit(running, result.native);
 		})
 		.catch((err) => {
 			runningSubagents.delete(running.id);
@@ -5540,6 +5970,7 @@ async function resumeNativeSession(
 				),
 				details,
 			);
+			closePaneAfterLateExit(running, settlement.native);
 		})
 		.finally(() => {
 			if (closePane) closeCompletedPanes([running.surface]);
@@ -5638,14 +6069,169 @@ function formatUndeliveredTasks(undelivered: NativeSettledTask[]): string {
 		.join("")}`;
 }
 
-/** Per-call launch options that are not tool parameters. */
-interface StartSubagentOptions {
-	/** Results go to the requesting native child instead of the parent. */
-	nestedOf?: NestedOrigin;
+/** Per-call preparation options that are not tool parameters. */
+interface PrepareSubagentOptions {
 	/** Deny every spawning tool regardless of the role (nested leaves). */
 	forceLeaf?: boolean;
+	/** A verified administrator-approved tuple for an automatic spawn. */
+	auto?: AutoLaunchAuthorization;
+}
+
+/**
+ * Read-only inputs that the preparations of one automatic candidate snapshot
+ * share, so the role catalog, installed skills, and native prerequisites are
+ * read once per snapshot and never across prompts. Omitted inputs are read
+ * fresh, as every launch does.
+ */
+interface PreparationReads {
+	catalog?: AgentCatalog;
+	installedSkills?: () => InstalledSkill[];
+	nativeOperations?: NativeHarnessOperations;
+}
+
+/** Per-call launch options that are not tool parameters. */
+interface StartSubagentOptions extends PrepareSubagentOptions {
+	/** Results go to the requesting native child instead of the parent. */
+	nestedOf?: NestedOrigin;
 	/** Aborts a native launch before its process is dispatched. */
 	signal?: AbortSignal;
+	/**
+	 * A run from prepareSubagentRun, or its automatic snapshot handle,
+	 * launched with its own options. Launch consumes it once and starts only
+	 * if a fresh preparation is identical.
+	 */
+	prepared?: PendingPreparedRun;
+	/**
+	 * The coordinator's binding for an automatic prepared run: its resource
+	 * and dispatch guards, cancellation, dispatch latch, and lifecycle.
+	 * Every launch of an automatic tuple requires it, and it authorizes only
+	 * the pending prepared handle it was created for.
+	 */
+	autoRun?: AutoRunBinding;
+}
+
+/**
+ * Everything one fresh spawn resolves before any Herdr resource: the role
+ * snapshot, harness selection and projection, modes, Pi runtime plans or the
+ * native plan, and prerequisites. Preparing creates no pane, workspace,
+ * worktree, file, or lease.
+ */
+interface PreparedSubagentRun {
+	readonly params: Readonly<Static<typeof SubagentParams>>;
+	/** The precedence-resolved role before projection; null for bare spawns. */
+	readonly role: ListedAgentDefinition | null;
+	readonly selection: SubagentSelection;
+	/** The role as the effective harness sees it; null for bare spawns. */
+	readonly agentDefs: ListedAgentDefinition | null;
+	readonly persistent: boolean;
+	readonly forceLeaf: boolean;
+	readonly parentThinking: ThinkingLevel;
+	/** Pi plans in fallback order; empty for a native harness. */
+	readonly runtimePlans: ResolvedRuntimePlan[];
+	readonly nativePlan?: NativeLaunchPlan;
+	/** Canonical origin of the effective model and thinking. */
+	readonly provenance: RuntimeProvenance;
+	readonly auto?: AutoLaunchAuthorization;
+	/** The checkout and parent session the run was prepared for. */
+	readonly origin: PreparedRunOrigin;
+}
+
+/**
+ * What launch reads from a pending prepared run. Its plan is never launched
+ * as held: launch prepares afresh and must resolve identically.
+ */
+type PendingPreparedRun = Pick<
+	PreparedSubagentRun,
+	"params" | "forceLeaf" | "auto" | "origin"
+>;
+
+/**
+ * A prepared run as an automatic snapshot holds it: identical, except that
+ * native skill snapshots keep their hashes but not their file bytes.
+ */
+type AutoPreparedSubagentRun = Omit<PreparedSubagentRun, "nativePlan"> & {
+	readonly nativePlan?: AutoNativePlanView;
+};
+
+/** The checkout and parent session one prepared run is bound to. */
+interface PreparedRunOrigin {
+	/** Canonical parent cwd (`ctx.cwd`). */
+	readonly cwd: string;
+	/** Canonical `process.cwd()`, where project roles are discovered. */
+	readonly discoveryCwd: string;
+	readonly sessionId: string;
+	readonly sessionFile: string;
+	readonly sessionDir: string;
+}
+
+function canonicalPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
+function preparedRunOrigin(
+	ctx: Parameters<typeof launchSubagent>[1],
+): PreparedRunOrigin {
+	return Object.freeze({
+		cwd: canonicalPath(ctx.cwd ?? process.cwd()),
+		discoveryCwd: canonicalPath(process.cwd()),
+		sessionId: ctx.sessionManager.getSessionId(),
+		sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+		sessionDir: ctx.sessionManager.getSessionDir(),
+	});
+}
+
+/** Native CLI and hook prerequisite checks: the test seam's, else the real ones. */
+function nativeHarnessOperations(): NativeHarnessOperations {
+	return (
+		runtime.nativeTestSeam?.nativeOperations ?? createNativeHarnessOperations()
+	);
+}
+
+type SubagentPreparation =
+	| { ok: true; prepared: PreparedSubagentRun }
+	| { ok: false; result: AgentToolResult<any> };
+
+/** Prepared runs not yet launched, with the launch key recorded at preparation. */
+const unlaunchedPreparedRuns = new WeakMap<PendingPreparedRun, string>();
+
+function rejected(result: AgentToolResult<any>): SubagentPreparation {
+	return { ok: false, result };
+}
+
+/** Everything a launch depends on, so any change after preparation is detected. */
+function preparedRunKey(prepared: PreparedSubagentRun): string {
+	const native = prepared.nativePlan;
+	return JSON.stringify({
+		params: prepared.params,
+		role: prepared.role,
+		selection: prepared.selection,
+		agentDefs: prepared.agentDefs,
+		persistent: prepared.persistent,
+		forceLeaf: prepared.forceLeaf,
+		parentThinking: prepared.parentThinking,
+		runtimePlans: prepared.runtimePlans,
+		native: native && {
+			spec: native.spec,
+			models: native.models,
+			skills: native.skills.map((skill) => ({
+				name: skill.name,
+				sha256: skill.sha256,
+				snapshot: skill.snapshot?.sha256 ?? null,
+			})),
+			lineage: native.lineage?.mode ?? null,
+			initialText: native.initialText,
+		},
+		provenance: prepared.provenance,
+		auto: prepared.auto && {
+			configDigest: prepared.auto.configDigest,
+			candidate: prepared.auto.candidate.id,
+		},
+		origin: prepared.origin,
+	});
 }
 
 /** A native capability failure, attributed to its projection when switched. */
@@ -5663,18 +6249,125 @@ function nativeProjectionError(
 	};
 }
 
+/** Per-call fields an automatic spawn never sets; its role runs as declared. */
+const AUTO_FORBIDDEN_OVERRIDES = [
+	"thinking",
+	"systemPrompt",
+	"skills",
+	"tools",
+	"cwd",
+	"fork",
+	"persistent",
+	"interactive",
+] as const;
+
 /**
- * Validate, launch, and start watching one subagent. Every rejection happens
- * before Herdr creates a pane, workspace, or worktree. Shared by the
- * subagent tool and by authenticated nested-spawn requests.
+ * Why an approved role cannot run as an automatic spawn. An automatic child
+ * is an autonomous, standalone, non-persistent leaf in the parent's cwd that
+ * runs its role exactly as declared: no per-call override, and no role
+ * capability is stripped to make it eligible.
  */
-async function startSubagentRun(
+function autoLaunchIneligibility(
+	params: Static<typeof SubagentParams>,
+	agentDefs: ListedAgentDefinition,
+): string | undefined {
+	const overrides = AUTO_FORBIDDEN_OVERRIDES.filter(
+		(key) => params[key] !== undefined,
+	).join(", ");
+	if (overrides || params.worktree != null)
+		return `An automatic spawn cannot set ${overrides || "worktree"}; it runs its approved role as declared.`;
+	const name = agentDefs.name;
+	if (agentDefs.disableModelInvocation)
+		return `Role "${name}" is hidden from model invocation and cannot run automatically.`;
+	if (
+		resolveEffectivePersistent(params, agentDefs) ||
+		!resolveEffectiveAutoExit(params, agentDefs) ||
+		resolveEffectiveInteractive(params, agentDefs) ||
+		resolveEffectiveSessionMode(params, agentDefs) !== "standalone"
+	)
+		return `Role "${name}" is not an autonomous, standalone, non-persistent role and cannot run automatically.`;
+	if (agentDefs.cwd)
+		return `Role "${name}" overrides cwd; an automatic spawn runs in the parent's cwd.`;
+	const tools = (agentDefs.tools ?? "")
+		.split(",")
+		.map((tool) => tool.trim())
+		.filter(Boolean);
+	if (
+		tools.length === 0 ||
+		tools.some((tool) => SPAWNING_TOOLS.has(tool)) ||
+		agentDefs.spawning !== false ||
+		agentDefs.spawnAgents?.trim()
+	)
+		return `Role "${name}" is not a declared leaf (explicit tools without orchestration tools, spawning: false, no spawn-agents); an automatic spawn never strips a role capability.`;
+	return undefined;
+}
+
+/**
+ * Canonical origin of one native model or effort chosen by the caller or the
+ * role. Mirrors resolveNativeLaunchSpec: a supplied request value wins even
+ * when empty, and `default` without a key is the native CLI's own default.
+ */
+function nativeFieldProvenance(
+	requestValue: string | undefined,
+	roleValue: string | undefined,
+): RuntimeFieldProvenance {
+	const role = roleValue?.trim();
+	if (requestValue != null)
+		return { source: requestValue.trim() ? "request" : "default" };
+	return { source: role ? "role" : "default" };
+}
+
+/**
+ * What an automatic tuple replaces, recorded as provenance only and never a
+ * fallback: the model and thinking the precedence-resolved role would get on
+ * its own declared harness, tagged with that harness when the tuple runs on
+ * another one, so a cross-harness pin is reported truthfully.
+ */
+function autoReplacedDefaults(
+	role: ListedAgentDefinition,
+	harness: SubagentHarness,
+): RuntimeDefaults {
+	const declared: SubagentHarness = role.cli ?? "pi";
+	const own: RuntimeDefaults =
+		declared === "pi"
+			? resolveRuntimeDefaults(role.name, role)
+			: {
+					model: role.model,
+					thinking: role.thinking,
+					origin: {
+						model: role.model?.trim() ? { source: "role" } : undefined,
+					},
+				};
+	if (declared === harness) return own;
+	const model = own.origin?.model;
+	return {
+		...own,
+		origin: {
+			model: model && { ...model, harness: declared },
+			thinking: { source: "role", harness: declared },
+		},
+	};
+}
+
+/**
+ * Resolve and validate one fresh spawn without creating anything: the role
+ * snapshot, harness projection, modes, the native plan or Pi runtime plans,
+ * and the Herdr and session prerequisites. Every rejection happens here,
+ * before Herdr creates a pane, workspace, or worktree, and preparation never
+ * writes a file or takes a lease. Shared by launch and by trusted internal
+ * callers that must know a spawn is feasible before choosing it.
+ */
+function prepareSubagentRun(
 	pi: ExtensionAPI,
 	params: Static<typeof SubagentParams>,
 	ctx: Parameters<typeof launchSubagent>[1],
-	options: StartSubagentOptions = {},
-): Promise<AgentToolResult<any>> {
-	const catalog = params.agent ? discoverAgentCatalog(runtime.pi) : undefined;
+	options: PrepareSubagentOptions = {},
+	reads: PreparationReads = {},
+): SubagentPreparation {
+	const { auto } = options;
+	const catalog = params.agent
+		? (reads.catalog ?? discoverAgentCatalog(runtime.pi))
+		: undefined;
 	const roleDiagnostic =
 		catalog && !catalog.agents.some((agent) => agent.name === params.agent)
 			? catalog.diagnostics.find(
@@ -5686,10 +6379,10 @@ async function startSubagentRun(
 				)
 			: undefined;
 	if (roleDiagnostic) {
-		return {
+		return rejected({
 			content: [{ type: "text", text: `Error: ${roleDiagnostic.message}` }],
 			details: { error: roleDiagnostic.code },
-		};
+		});
 	}
 
 	// The role is resolved once; every launch attempt uses this snapshot.
@@ -5702,7 +6395,7 @@ async function startSubagentRun(
 		const diagnostic = catalog?.diagnostics.find(
 			(candidate) => candidate.agentName === params.agent,
 		);
-		return {
+		return rejected({
 			content: [
 				{
 					type: "text",
@@ -5710,40 +6403,69 @@ async function startSubagentRun(
 				},
 			],
 			details: { error: diagnostic?.code ?? "agent-not-found" },
-		};
+		});
 	}
-	const projection = resolveRoleProjection(params, role);
+	const projection = resolveRoleProjection(params, role, auto);
 	if (!projection.ok) {
-		return {
+		return rejected({
 			content: [{ type: "text", text: `Error: ${projection.message}` }],
 			details: { error: projection.error },
-		};
+		});
 	}
 	const { selection, agentDefs: selectedDefs } = projection;
+	const autoRejection =
+		auto && selectedDefs
+			? autoLaunchIneligibility(params, selectedDefs)
+			: undefined;
+	if (autoRejection)
+		return rejected({
+			content: [{ type: "text", text: `Error: ${autoRejection}` }],
+			details: { error: "auto-launch-ineligible" },
+		});
+	// Automatic spawns are leaves whose model and effort come only from the
+	// approved tuple; role and configured defaults are never fallbacks.
+	const forceLeaf = options.forceLeaf === true || auto !== undefined;
+	const runtimeParams = auto
+		? { ...params, model: auto.model, thinking: auto.effort }
+		: params;
 
 	// Native harness capability checks run before any Herdr resource.
 	let nativeSpec: NativeLaunchSpec | undefined;
 	if (selection.harness !== "pi" && selectedDefs) {
 		try {
-			nativeSpec = resolveNativeSpecForParams(params, {
+			nativeSpec = resolveNativeSpecForParams(runtimeParams, {
 				...selectedDefs,
 				cli: selection.harness,
 			});
 		} catch (error) {
-			return nativeProjectionError(
-				selection,
-				error instanceof Error ? error.message : String(error),
+			return rejected(
+				nativeProjectionError(
+					selection,
+					error instanceof Error ? error.message : String(error),
+				),
 			);
 		}
+		if (
+			auto &&
+			(nativeSpec.modelRequest.kind !== "exact" ||
+				nativeSpec.model !== auto.model ||
+				nativeSpec.thinking !== auto.effort)
+		)
+			return rejected(
+				nativeProjectionError(
+					selection,
+					`cannot run approved model ${JSON.stringify(auto.model)} at effort ${auto.effort} exactly.`,
+				),
+			);
 	}
 
 	const persistent = resolveEffectivePersistent(params, selectedDefs);
 	const capError = persistent ? persistentCapacityError() : undefined;
 	if (capError) {
-		return {
+		return rejected({
 			content: [{ type: "text", text: capError }],
 			details: { error: "persistent-cap" },
-		};
+		});
 	}
 
 	// Native models, skills, inherited context, and prompt bounds resolve
@@ -5751,32 +6473,35 @@ async function startSubagentRun(
 	let nativePlan: NativeLaunchPlan | undefined;
 	if (nativeSpec) {
 		// Nested children are leaves: a delegated native child never delegates.
-		if (options.forceLeaf) nativeSpec.spawnAgents = null;
+		if (forceLeaf) nativeSpec.spawnAgents = null;
 		try {
 			nativePlan = planNativeLaunch(nativeSpec, {
 				task: params.task,
 				parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined,
-				installedSkills: () =>
-					discoverInstalledSkills(pi, ctx.cwd ?? process.cwd()),
+				installedSkills:
+					reads.installedSkills ??
+					(() => discoverInstalledSkills(pi, ctx.cwd ?? process.cwd())),
 				snapshotRoot: nativeSkillSnapshotRoot(ctx),
 				nativeTasks: modelConfig.native,
 				isPiModelRef: (value) => isPiModelRef(ctx.modelRegistry, value),
 			});
 		} catch (error) {
-			return nativeProjectionError(
-				selection,
-				error instanceof Error ? error.message : String(error),
+			return rejected(
+				nativeProjectionError(
+					selection,
+					error instanceof Error ? error.message : String(error),
+				),
 			);
 		}
 	}
 
 	// Validate prerequisites
 	if (!terminalReady()) {
-		return muxUnavailableResult();
+		return rejected(muxUnavailableResult());
 	}
 
 	if (!ctx.sessionManager.getSessionFile()) {
-		return {
+		return rejected({
 			content: [
 				{
 					type: "text",
@@ -5784,10 +6509,9 @@ async function startSubagentRun(
 				},
 			],
 			details: { error: "no session file" },
-		};
+		});
 	}
 
-	// Launch the subagent (creates pane, sends command)
 	const parentThinking = pi.getThinkingLevel();
 	if (
 		parentThinking !== "off" &&
@@ -5800,11 +6524,319 @@ async function startSubagentRun(
 	) {
 		throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
 	}
-	const noLaunchFailures: ModelFailure[] = [];
+	// What an automatic tuple replaces comes from the role as declared,
+	// before projection dropped a pin that belongs to another harness.
+	const replaced =
+		auto && role ? autoReplacedDefaults(role, selection.harness) : undefined;
 	// Native harnesses pass their own model IDs through; Pi routing never applies.
 	const runtimePlans = nativeSpec
 		? []
-		: resolveSubagentRuntimePlans(params, ctx, parentThinking, selectedDefs);
+		: resolveSubagentRuntimePlans(
+				params,
+				ctx,
+				parentThinking,
+				selectedDefs,
+				auto && replaced ? { authorization: auto, replaced } : undefined,
+			);
+	// Native CLI and hook prerequisites are read-only checks, made here after
+	// the Herdr, session, and runtime checks, and again by the launch itself.
+	if (nativePlan)
+		(reads.nativeOperations ?? nativeHarnessOperations()).assertAvailable(
+			nativePlan.spec.harness,
+		);
+	const provenance: RuntimeProvenance | undefined = !(
+		nativeSpec && selectedDefs
+	)
+		? runtimePlans[0]?.provenance
+		: replaced
+			? {
+					version: 1,
+					model: automaticFieldProvenance(
+						replaced.model,
+						replaced.origin?.model,
+					),
+					thinking: automaticFieldProvenance(
+						replaced.thinking,
+						replaced.origin?.thinking ?? { source: "role" },
+					),
+				}
+			: {
+					version: 1,
+					model: nativeFieldProvenance(params.model, selectedDefs.model),
+					thinking: nativeFieldProvenance(
+						params.thinking,
+						selectedDefs.thinking,
+					),
+				};
+	if (!provenance)
+		throw new Error("Subagent runtime provenance could not be resolved.");
+
+	const preparedParams = { ...params };
+	if (params.worktree)
+		preparedParams.worktree = Object.freeze({ ...params.worktree });
+	const prepared: PreparedSubagentRun = Object.freeze({
+		params: Object.freeze(preparedParams),
+		role,
+		selection,
+		agentDefs: selectedDefs,
+		persistent,
+		forceLeaf,
+		parentThinking,
+		runtimePlans,
+		nativePlan,
+		provenance,
+		auto,
+		origin: preparedRunOrigin(ctx),
+	});
+	unlaunchedPreparedRuns.set(prepared, preparedRunKey(prepared));
+	return { ok: true, prepared };
+}
+
+/**
+ * The pending handle an automatic snapshot holds for a prepared run: the
+ * same plain data without native skill file bytes, which freezing cannot
+ * make immutable. It replaces the run as the one pending launch; the launch
+ * re-reads the skills privately and starts only if every hash is identical.
+ */
+function snapshotSafePreparedRun(
+	prepared: PreparedSubagentRun,
+): AutoPreparedSubagentRun {
+	const key = unlaunchedPreparedRuns.get(prepared);
+	unlaunchedPreparedRuns.delete(prepared);
+	const { nativePlan: native, ...run } = prepared;
+	const handle: AutoPreparedSubagentRun = Object.freeze(
+		native
+			? {
+					...run,
+					nativePlan: {
+						...native,
+						skills: native.skills.map(({ snapshot, ...skill }) =>
+							snapshot
+								? {
+										...skill,
+										snapshot: {
+											dir: snapshot.dir,
+											sha256: snapshot.sha256,
+											files: snapshot.files.map(
+												({ content: _content, ...file }) => file,
+											),
+										},
+									}
+								: skill,
+						),
+					},
+				}
+			: run,
+	);
+	if (key !== undefined) unlaunchedPreparedRuns.set(handle, key);
+	return handle;
+}
+
+/**
+ * The launch authority automatic candidate snapshots are built with: normal
+ * role discovery with its layered failures, installed skills, native
+ * prerequisites, the Pi registry, and prepareSubagentRun under an
+ * authorization minted from the loaded allowlist, returning snapshot-safe
+ * handles. Every member is read-only; none creates a Herdr resource, file,
+ * lease, or network request.
+ */
+function createAutoRoutingAuthority(
+	pi: ExtensionAPI,
+	ctx: Parameters<typeof launchSubagent>[1],
+): AutoRoutingAuthority<AutoPreparedSubagentRun, AutoAgentCatalog> {
+	return {
+		context: () => ({
+			origin: preparedRunOrigin(ctx),
+			herdrAvailable: terminalReady(),
+			parentRuntime: ctx.model
+				? {
+						provider: ctx.model.provider,
+						modelId: ctx.model.id,
+						thinking: pi.getThinkingLevel(),
+					}
+				: null,
+		}),
+		discoverRoles() {
+			const failures: AgentLayerFailure[] = [];
+			return {
+				...discoverAgentCatalog(runtime.pi, bundledRoleConfig, failures),
+				failures,
+			};
+		},
+		installedSkills: () =>
+			discoverInstalledSkills(pi, ctx.cwd ?? process.cwd()),
+		skillSnapshotRoot: () => nativeSkillSnapshotRoot(ctx),
+		nativeOperations: nativeHarnessOperations,
+		piModels: () => wrapPiModelRegistry(ctx.modelRegistry),
+		prepare(state, candidateId, params, reads) {
+			let auto: AutoLaunchAuthorization;
+			try {
+				auto = createAutoLaunchAuthorization(state, candidateId);
+			} catch (error) {
+				return {
+					ok: false,
+					error: "auto-authorization-invalid",
+					message: error instanceof Error ? error.message : String(error),
+				};
+			}
+			const preparation = prepareSubagentRun(pi, params, ctx, { auto }, reads);
+			if (preparation.ok)
+				return {
+					ok: true,
+					prepared: snapshotSafePreparedRun(preparation.prepared),
+				};
+			return {
+				ok: false,
+				error: String(preparation.result.details?.error ?? "launch-rejected"),
+				message: preparation.result.content
+					.flatMap((block) => (block.type === "text" ? [block.text] : []))
+					.join(""),
+			};
+		},
+	};
+}
+
+/**
+ * Consume a run prepared earlier: it launches at most once, and only when a
+ * fresh preparation with the same authority resolves identically.
+ */
+function consumePreparedRun(
+	pi: ExtensionAPI,
+	params: Static<typeof SubagentParams>,
+	ctx: Parameters<typeof launchSubagent>[1],
+	prepared: PendingPreparedRun,
+	options: StartSubagentOptions,
+): SubagentPreparation {
+	const key = unlaunchedPreparedRuns.get(prepared);
+	unlaunchedPreparedRuns.delete(prepared);
+	if (
+		key === undefined ||
+		params !== prepared.params ||
+		options.auto !== undefined ||
+		options.forceLeaf !== undefined
+	)
+		return rejected({
+			content: [
+				{
+					type: "text",
+					text: "Error: this prepared subagent run is not a pending preparation of these parameters. Prepare it again.",
+				},
+			],
+			details: { error: "prepared-run-invalid" },
+		});
+	// A prepared run never moves to another checkout or parent session.
+	if (
+		JSON.stringify(preparedRunOrigin(ctx)) !== JSON.stringify(prepared.origin)
+	)
+		return rejected({
+			content: [
+				{
+					type: "text",
+					text: "Error: this prepared subagent run belongs to another checkout or parent session; nothing was launched.",
+				},
+			],
+			details: { error: "prepared-run-context-changed" },
+		});
+	const fresh = prepareSubagentRun(pi, prepared.params, ctx, {
+		forceLeaf: prepared.forceLeaf,
+		auto: prepared.auto,
+	});
+	if (!fresh.ok) return fresh;
+	unlaunchedPreparedRuns.delete(fresh.prepared);
+	if (preparedRunKey(fresh.prepared) !== key)
+		return rejected({
+			content: [
+				{
+					type: "text",
+					text: "Error: the subagent's role, runtime, or prerequisites changed after preparation; nothing was launched.",
+				},
+			],
+			details: { error: "prepared-run-stale" },
+		});
+	return fresh;
+}
+
+/**
+ * Validate, launch, and start watching one subagent. Every rejection happens
+ * in prepareSubagentRun or the automatic binding check, before Herdr creates
+ * a pane, workspace, or worktree. Shared by the subagent tool, authenticated nested-spawn
+ * requests, and the routing coordinator's bound automatic prepared run.
+ */
+async function startSubagentRun(
+	pi: ExtensionAPI,
+	params: Static<typeof SubagentParams>,
+	ctx: Parameters<typeof launchSubagent>[1],
+	options: StartSubagentOptions = {},
+): Promise<AgentToolResult<any>> {
+	const { autoRun } = options;
+	const invalidBinding: AgentToolResult<any> = {
+		content: [
+			{
+				type: "text",
+				text: "Error: this automatic run binding does not match the prepared tuple; nothing was launched.",
+			},
+		],
+		details: { error: "auto-binding-invalid" },
+	};
+	// A binding authorizes only the one pending prepared handle the
+	// coordinator created it for; any other pairing consumes nothing.
+	if (
+		autoRun &&
+		(!options.prepared || !autoRunBindingAuthorizes(autoRun, options.prepared))
+	)
+		return invalidBinding;
+	const preparation = options.prepared
+		? consumePreparedRun(pi, params, ctx, options.prepared, options)
+		: prepareSubagentRun(pi, params, ctx, {
+				forceLeaf: options.forceLeaf,
+				auto: options.auto,
+			});
+	if (!preparation.ok) return preparation.result;
+	const {
+		selection,
+		agentDefs: selectedDefs,
+		forceLeaf,
+		parentThinking,
+		runtimePlans,
+		nativePlan,
+		provenance,
+		auto,
+	} = preparation.prepared;
+	// This launch consumes the preparation; it never starts a second run.
+	unlaunchedPreparedRuns.delete(preparation.prepared);
+	// An automatic tuple creates resources only under the coordinator's
+	// binding; preparing one alone stays resource-free.
+	if (auto && !autoRun)
+		return {
+			content: [
+				{
+					type: "text",
+					text: "Error: an automatic run launches only under its routing decision's run binding; nothing was launched.",
+				},
+			],
+			details: { error: "auto-binding-required" },
+		};
+	// The handle's fresh preparation must still be the binding's exact tuple.
+	if (
+		autoRun &&
+		(!auto ||
+			autoRun.approvalId !== auto.candidate.id ||
+			autoRun.receipt.configHash !== auto.configDigest ||
+			(nativePlan ? nativePlan.models.length : runtimePlans.length) !== 1)
+	)
+		return invalidBinding;
+	// Automatic children suppress inherited routing and the Jev credential;
+	// a bound launch also runs the coordinator's guards and cancellation.
+	const automatic: AutomaticLaunch | undefined = auto
+		? { guard: autoRun }
+		: undefined;
+	const nativeSignal =
+		autoRun && options.signal
+			? AbortSignal.any([autoRun.signal, options.signal])
+			: (autoRun?.signal ?? options.signal);
+
+	// Launch the subagent (creates pane, sends command)
+	const noLaunchFailures: ModelFailure[] = [];
 	const worktreeLaunchWarning = resolveWorktreeLaunchWarning(
 		params,
 		runtime.pi,
@@ -5818,7 +6850,8 @@ async function startSubagentRun(
 				running: await launchNativeFromParams(params, ctx, nativePlan, {
 					agentDefs: selectedDefs,
 					parentThinking,
-					signal: options.signal,
+					signal: nativeSignal,
+					automatic,
 				}),
 				index: 0,
 				launchFailures: noLaunchFailures,
@@ -5828,12 +6861,22 @@ async function startSubagentRun(
 				ctx,
 				parentThinking,
 				runtimePlans,
-				{ forceLeaf: options.forceLeaf, agentDefs: selectedDefs },
+				{
+					forceLeaf,
+					agentDefs: selectedDefs,
+					automatic,
+					signal: autoRun?.signal,
+				},
 			);
 
 	let running = initialRunning;
 	running.selection = selection;
+	running.runtimeProvenance = provenance;
+	if (autoRun) running.autoRouting = autoRun.receipt;
 	if (options.nestedOf) running.nestedOf = options.nestedOf;
+	// Before the watcher exists, so even an instant result settles a child
+	// the coordinator already accounts for as started.
+	autoRun?.recordStarted(running.id);
 
 	// Create a separate AbortController for the watcher
 	// (the tool's signal completes when we return)
@@ -5869,7 +6912,7 @@ async function startSubagentRun(
 				watcherAbort.signal,
 				completedPanes,
 				initialLaunchFailures,
-				{ forceLeaf: options.forceLeaf, agentDefs: selectedDefs },
+				{ forceLeaf, agentDefs: selectedDefs },
 			)
 	)
 		.then(({ running: completedRunning, result }) => {
@@ -5964,6 +7007,10 @@ async function startSubagentRun(
 				if (result.worktree) pingDetails.worktree = result.worktree;
 				if (completedRunning.selection)
 					pingDetails.selection = completedRunning.selection;
+				if (completedRunning.runtimeProvenance)
+					pingDetails.runtimeProvenance = completedRunning.runtimeProvenance;
+				if (completedRunning.autoRouting)
+					pingDetails.autoRouting = completedRunning.autoRouting;
 				completionApi.sendMessage(
 					{
 						customType: "subagent_ping",
@@ -5981,6 +7028,7 @@ async function startSubagentRun(
 				result,
 				completedRunning.name,
 				completedRunning.runtimePlan?.runtimeMismatch,
+				completedRunning.selection,
 			);
 
 			const resultDetails: SubagentResultDetails = {
@@ -6007,7 +7055,12 @@ async function startSubagentRun(
 			if (result.native) resultDetails.native = result.native;
 			if (completedRunning.selection)
 				resultDetails.selection = completedRunning.selection;
+			if (completedRunning.runtimeProvenance)
+				resultDetails.runtimeProvenance = completedRunning.runtimeProvenance;
+			if (completedRunning.autoRouting)
+				resultDetails.autoRouting = completedRunning.autoRouting;
 			sendSubagentResult(completionApi, presentation, resultDetails);
+			closePaneAfterLateExit(completedRunning, result.native);
 			shouldCloseTemporaryPanes = true;
 		})
 		.catch((err) => {
@@ -6062,6 +7115,9 @@ async function startSubagentRun(
 				sessionFile: running.sessionFile,
 			};
 			if (running.selection) errDetails.selection = running.selection;
+			if (running.runtimeProvenance)
+				errDetails.runtimeProvenance = running.runtimeProvenance;
+			if (running.autoRouting) errDetails.autoRouting = running.autoRouting;
 			if (nativeSettlement) {
 				errDetails.native = nativeSettlement.native;
 				if (nativeSettlement.worktree)
@@ -6082,9 +7138,15 @@ async function startSubagentRun(
 						),
 				errDetails,
 			);
+			if (nativeSettlement?.native.processExit === "confirmed") {
+				if (!running.worktree) completedPanes.add(running.surface);
+			} else closePaneAfterLateExit(running, nativeSettlement?.native);
 			shouldCloseTemporaryPanes = true;
 		})
 		.finally(() => {
+			// Every delivery, error, and suppression path settles the automatic
+			// slot once; uncertain dispatch never reaches this watcher.
+			autoRun?.recordSettled();
 			if (shouldCloseTemporaryPanes) closeCompletedPanes(completedPanes);
 		});
 
@@ -6100,8 +7162,10 @@ async function startSubagentRun(
 		thinking: running.runtimePlan?.thinking,
 		runtimePlan: running.runtimePlan,
 		selection,
+		runtimeProvenance: provenance,
 		status: "started",
 	};
+	if (running.autoRouting) startedDetails.autoRouting = running.autoRouting;
 	if (nativePlan) {
 		startedDetails.harness = nativePlan.spec.harness;
 		startedDetails.model = running.native?.model ?? undefined;
@@ -6140,14 +7204,168 @@ async function startSubagentRun(
 	};
 }
 
+/**
+ * The automatic-routing launch handoff: consume the revalidated snapshot's
+ * pending prepared run through the ordinary startSubagentRun path, whose
+ * watcher and result delivery are unchanged. A returned rejection happened in
+ * preparation, before any Herdr resource; a throw may follow a resource or
+ * dispatch and is reported as uncertain, never as no work.
+ */
+async function launchAutoRoutedRun(
+	pi: ExtensionAPI,
+	handoff: AutoLaunchHandoff<AutoPreparedSubagentRun, ExtensionContext>,
+): Promise<AutoLaunchOutcome> {
+	const prepared = handoff.candidate.prepared;
+	const binding = handoff.binding;
+	// Only the latch proves no process: before `dispatch-attempted` no
+	// runScript ran, and a native run whose exit is unconfirmed is never
+	// known no-work.
+	const undispatched = () => {
+		const state = binding.dispatchState();
+		return state === "uncommitted" || state === "resources-created";
+	};
+	const uncertain: AutoLaunchOutcome = {
+		status: "uncertain",
+		detail: "The launch failed after its dispatch may have been attempted.",
+	};
+	let result: AgentToolResult<any>;
+	try {
+		result = await startSubagentRun(pi, prepared.params, handoff.ctx, {
+			prepared,
+			autoRun: binding,
+		});
+	} catch (error) {
+		if (undispatched() && !(error instanceof NativeLaunchUnresolvedError))
+			return {
+				status: "rejected",
+				detail:
+					error instanceof AutoLaunchStoppedError
+						? error.reason
+						: "launch-failed-before-dispatch",
+			};
+		return uncertain;
+	}
+	const details = result.details;
+	if (details?.status === "started" && isString(details.id))
+		return {
+			status: "started",
+			childId: details.id,
+			name: prepared.params.name,
+		};
+	if (!undispatched()) return uncertain;
+	return {
+		status: "rejected",
+		detail: isString(details?.error) ? details.error : "launch-rejected",
+	};
+}
+
+/** Test and embedding seams for automatic routing; never tool parameters. */
+type AutoRoutingExtensionOptions = Partial<
+	Pick<
+		AutoRoutingCoordinatorOptions<
+			AutoPreparedSubagentRun,
+			AutoAgentCatalog,
+			ExtensionContext
+		>,
+		| "env"
+		| "loadConfig"
+		| "herdrAvailable"
+		| "transport"
+		| "launch"
+		| "now"
+		| "setTimer"
+	>
+>;
+
+/** Render one routing message view in the shared custom-message box. */
+function renderAutoMessageView(
+	view: AutoMessageView,
+	expanded: boolean,
+	theme: Theme,
+) {
+	return {
+		invalidate() {},
+		render(width: number): string[] {
+			const lineWidth = Math.max(1, width - 6);
+			const contentLines = [
+				`${theme.fg(view.tone, "•")} ${theme.fg("toolTitle", theme.bold(view.title))}`,
+				// Expanded views wrap to show the full text; previews truncate.
+				...view.lines.map((line) =>
+					expanded ? line : theme.fg("dim", truncateToWidth(line, lineWidth)),
+				),
+			];
+			if (view.omitted > 0)
+				contentLines.push(
+					theme.fg(
+						"muted",
+						expanded
+							? `… ${view.omitted} more lines not shown (the stored message is complete)`
+							: `… ${view.omitted} more lines`,
+					),
+				);
+			if (!expanded)
+				contentLines.push(
+					theme.fg("muted", keyHint("app.tools.expand", "to expand")),
+				);
+			const box = new Box(1, 1, (text: string) =>
+				theme.bg("customMessageBg", text),
+			);
+			box.addChild(new Text(contentLines.join("\n"), 0, 0));
+			return ["", ...box.render(width)];
+		},
+	};
+}
+
 export default function subagentsExtension(
 	pi: ExtensionAPI,
 	options: {
 		cleanupOperations?: (ctx: ExtensionContext) => WorktreeCleanupOperations;
+		autoRouting?: AutoRoutingExtensionOptions;
 	} = {},
 ) {
 	runtime.pi = pi;
 	const parentSession = !process.env.PI_SUBAGENT_ID;
+	const autoRoutingSeams = options.autoRouting ?? {};
+	// One package decision at a time; manual paths never consult it.
+	const autoRouting = createAutoRoutingCoordinator<
+		AutoPreparedSubagentRun,
+		AutoAgentCatalog,
+		ExtensionContext
+	>({
+		pi,
+		env: autoRoutingSeams.env,
+		loadConfig: autoRoutingSeams.loadConfig ?? loadAutoRoutingConfig,
+		herdrAvailable: autoRoutingSeams.herdrAvailable ?? terminalReady,
+		managedWorkOutstanding: () =>
+			runningSubagents.size > 0 ||
+			unresolvedNativeRuns().size > 0 ||
+			(runtime.plannedNativeDispatches?.size ?? 0) > 0,
+		isChildRunning: (childId) => runningSubagents.has(childId),
+		authority: (ctx) => createAutoRoutingAuthority(pi, ctx),
+		transport:
+			autoRoutingSeams.transport ??
+			((ctx) => createJevTransport({ registry: ctx.modelRegistry })),
+		launch:
+			autoRoutingSeams.launch ??
+			((handoff) => launchAutoRoutedRun(pi, handoff)),
+		now: autoRoutingSeams.now,
+		setTimer: autoRoutingSeams.setTimer,
+		// Survives /reload with the shared runtime: dispatched work stays busy.
+		retained: {
+			get: () => runtime.autoRoutingRetained,
+			set: (work) => {
+				runtime.autoRoutingRetained = work;
+			},
+			resolved: {
+				has: (decisionId) =>
+					runtime.autoRoutingResolved?.has(decisionId) === true,
+				add: (decisionId) => {
+					runtime.autoRoutingResolved ??= new Set();
+					runtime.autoRoutingResolved.add(decisionId);
+				},
+			},
+		},
+	});
 	const cleanupInput = (ctx: ExtensionContext) => ({
 		cwd: ctx.cwd,
 		operations:
@@ -6205,10 +7423,72 @@ export default function subagentsExtension(
 		return true;
 	};
 
+	/**
+	 * A compact startup indicator for the routing config this load
+	 * initialized, and for durable unknown work recovery found on the active
+	 * branch. Nothing contacts Jev at startup, and no command can enable
+	 * routing.
+	 */
+	const announceAutoRouting = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return;
+		try {
+			const loaded = autoRouting.configuration();
+			if (loaded.status === "enabled") {
+				ctx.ui.setStatus(
+					"subagents-routing",
+					`auto-route: ${loaded.config.mode}`,
+				);
+				ctx.ui.notify(
+					`Automatic routing is ${loaded.config.mode}: eligible idle TUI input, as this extension sees it, is sent with reviewed routing profiles to TypeSafe AI${loaded.config.mode === "shadow" ? " for observation only" : ""}. RPC, JSON, print, extension, and streaming input bypass it. See /subagents-routing status.`,
+					"warning",
+				);
+			} else {
+				ctx.ui.setStatus("subagents-routing", undefined);
+				if (loaded.status === "invalid")
+					ctx.ui.notify(
+						"The automatic routing configuration is invalid, so automatic routing is disabled; manual subagents are unaffected.",
+						"warning",
+					);
+			}
+			const recovery = autoRouting.snapshotStatus().recovery;
+			if (recovery && recovery.status !== "clear")
+				ctx.ui.notify(
+					"Automatic routing found earlier automatic work it cannot account for on this branch, so new automatic routing is disabled here; nothing is replayed or retried. See /subagents-routing status.",
+					"warning",
+				);
+		} catch {
+			// The indicator is best effort; routing keeps its loaded snapshot.
+		}
+	};
+
+	if (parentSession) {
+		// Idle top-level TUI input only; the coordinator gates everything else.
+		pi.on("input", (event, ctx) => autoRouting.onInput(event, ctx));
+		pi.on("agent_start", () => autoRouting.onLifecycle("agent_start"));
+		// Invalidate when a transition starts, so a delayed, failed, or
+		// cancelled one still stops an undispatched decision; never cancel it.
+		pi.on("session_before_tree", () => {
+			autoRouting.onLifecycle("session_before_tree");
+		});
+		pi.on("session_tree", () => autoRouting.onLifecycle("session_tree"));
+		pi.on("session_before_compact", () => {
+			autoRouting.onLifecycle("session_before_compact");
+		});
+		pi.on("session_compact", () => autoRouting.onLifecycle("session_compact"));
+	}
+
 	// Capture the UI context for widget updates and restore presentation for
 	// subagents whose watchers survived a reload.
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.latestCtx = ctx;
+		autoRouting.onLifecycle("session_start");
+		if (parentSession) {
+			// Before any admission: durable unknown work from an earlier
+			// process blocks new automatic routing on this branch.
+			if (autoRouting.configuration().status === "enabled")
+				autoRouting.recover(ctx);
+			announceAutoRouting(ctx);
+		}
 		try {
 			// A crash between a persistent first task's plan and its commit
 			// leaves it `planned`; resolve it from process evidence.
@@ -6250,6 +7530,7 @@ export default function subagentsExtension(
 
 	// Clean up on session shutdown
 	pi.on("session_shutdown", async (event, _ctx) => {
+		autoRouting.onLifecycle("session_shutdown");
 		if (widgetInterval) {
 			clearInterval(widgetInterval);
 			widgetInterval = null;
@@ -6272,6 +7553,8 @@ export default function subagentsExtension(
 			// In-flight native launches stop before dispatching a process.
 			runtime.nativeLaunchAbort?.abort();
 			runtime.nativeLaunchAbort = undefined;
+			clearTimeout(runtime.lateExitRecheck);
+			runtime.lateExitRecheck = undefined;
 			runtime.supervision?.close();
 			runtime.supervision = undefined;
 		}
@@ -7478,6 +8761,48 @@ export default function subagentsExtension(
 			},
 		};
 	});
+
+	pi.registerMessageRenderer(
+		AUTO_REQUEST_CUSTOM_TYPE,
+		(message, options, theme) =>
+			renderAutoMessageView(
+				autoRequestView(message, options.expanded),
+				options.expanded,
+				theme,
+			),
+	);
+	pi.registerMessageRenderer(
+		AUTO_STATUS_CUSTOM_TYPE,
+		(message, options, theme) =>
+			renderAutoMessageView(
+				autoStatusView(message, options.expanded),
+				options.expanded,
+				theme,
+			),
+	);
+
+	// Local diagnostics only: never enables routing or writes approvals.
+	if (parentSession)
+		pi.registerCommand("subagents-routing", {
+			description:
+				"Automatic routing diagnostics: /subagents-routing status | cancel (local only; cannot enable routing, approve, or stop a running child)",
+			handler: async (args, ctx) => {
+				const action = args.trim();
+				if (action === "" || action === "status") {
+					ctx.ui.notify(
+						formatAutoRoutingStatus(autoRouting.snapshotStatus()),
+						"info",
+					);
+					return;
+				}
+				if (action === "cancel") {
+					const report = autoRouting.cancel();
+					ctx.ui.notify(report.message, report.cancelled ? "info" : "warning");
+					return;
+				}
+				ctx.ui.notify("Usage: /subagents-routing status|cancel", "warning");
+			},
+		});
 
 	// /plan command — start the full planning workflow
 	pi.registerCommand("plan", {

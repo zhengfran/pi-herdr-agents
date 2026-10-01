@@ -42,6 +42,17 @@ Phase 7: Review
 
 Set `model` and `thinking` on every spawn. For non-review roles, prefer a configured `task:<category>` or its curated shortlist: `recon` for scouts, `architecture` for planning and diagnosis, `coding` for workers, `qa` for runners, and `docs` for documentation. Phase 7 uses ordinary review. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Use an exact authenticated provider/model-id when the author family is known; do not use `task:review` for that exclusion. Do not omit `model` in this workflow.
 
+## Automatic routing is separate
+
+`/plan` and these explicit launches never consult Jev. Task-model preferences do
+not enable or authorize automatic routing. If the operator separately opts in,
+v1 can choose only one approved standalone autonomous shared-checkout leaf; it
+never creates worktrees, forks, persistent specialists, nested planners or
+review-purpose children. Phase 7 stays a parent-owned pinned manual review.
+Automatic children inherit a recursion guard and must not claim the user requested
+their selected runtime. See `README.md#automatic-input-routing` and ADR-0014 when
+this package's guides are available; do not widen consent or tuple approvals.
+
 ## Fire-and-forget completion
 
 `subagent` is fire-and-forget. After each spawn:

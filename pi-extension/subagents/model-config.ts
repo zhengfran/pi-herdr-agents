@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { findDuplicateAutoRoutingMember } from "./auto-routing-json.ts";
 import { getSubagentsConfigPath } from "./config-path.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
 
@@ -310,7 +311,7 @@ export interface SavedTaskModelConfig {
 	missingCategories: TaskCategory[];
 }
 
-/** Atomically replace only models.tasks and models.tasksMeta in the durable user config. */
+/** Atomically replace task preferences; refuse ambiguous autoRouting before rewriting. */
 export function writeTaskModelConfig(
 	configPath: string,
 	examplePath: string,
@@ -335,18 +336,31 @@ export function writeTaskModelConfig(
 			}
 		}
 	}
-	mkdirSync(dirname(configPath), { recursive: true });
 	const current = readFileIfExists(configPath);
+	const sourcePath = current == null ? examplePath : configPath;
 	const source = current ?? readFileSync(examplePath, "utf8");
 	let parsed: any;
 	try {
 		parsed = JSON.parse(source);
 	} catch (error) {
-		const path = current == null ? examplePath : configPath;
 		throw new Error(
-			`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in subagent config ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+	// Inspect the original accepted JSON text before last-member-wins parsing
+	// can be normalized into a different routing authorization on disk.
+	let duplicate: string | undefined;
+	try {
+		duplicate = findDuplicateAutoRoutingMember(source);
+	} catch (error) {
+		throw new Error(
+			`Cannot check subagent auto-routing config in ${sourcePath} for duplicate JSON members: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (duplicate !== undefined)
+		throw new Error(
+			`Invalid subagent auto-routing config in ${sourcePath}: ${duplicate} is a duplicate JSON member`,
+		);
 	if (!isPlainObject(parsed))
 		throw new Error(
 			`Invalid JSON in subagent config ${configPath}: root must be an object`,
@@ -355,6 +369,7 @@ export function writeTaskModelConfig(
 	models.tasks = candidateConfig.tasks;
 	models.tasksMeta = candidateConfig.tasksMeta;
 	const output = JSON.stringify({ ...parsed, models }, null, 2) + "\n";
+	mkdirSync(dirname(configPath), { recursive: true });
 	const temporary = join(
 		dirname(configPath),
 		`.${Date.now()}-${process.pid}-config.tmp`,

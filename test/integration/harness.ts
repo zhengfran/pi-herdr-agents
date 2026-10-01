@@ -13,15 +13,16 @@ import {
 	mkdtempSync,
 	mkdirSync,
 	readdirSync,
+	rmdirSync,
 	rmSync,
 	existsSync,
 	readFileSync,
 	writeFileSync,
 	unlinkSync,
 } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { basename, join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
 	TEST_MODEL as FIXTURE_MODEL,
 	TEST_PROVIDER_URL,
@@ -250,6 +251,15 @@ function restoreEnv(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
+/** Remove only this fixture's empty Herdr worktree container. */
+function removeEmptyManagedWorktreeRoot(dir: string): void {
+	try {
+		rmdirSync(join(homedir(), ".herdr", "worktrees", basename(dir)));
+	} catch {
+		// Missing and nonempty directories need no action; never remove retained work.
+	}
+}
+
 /**
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
@@ -328,6 +338,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
 		} catch {
 			// Best effort after closing the owned workspace.
 		}
+		removeEmptyManagedWorktreeRoot(dir);
 		throw error;
 	}
 }
@@ -368,6 +379,7 @@ export function cleanupTestEnv(env: TestEnv): void {
 	} catch {
 		// Best effort after owned processes and workspaces are closed.
 	}
+	removeEmptyManagedWorktreeRoot(env.dir);
 }
 
 /**
@@ -420,7 +432,7 @@ export function startPi(
 	surface: string,
 	testDir: string,
 	task: string,
-	opts?: { model?: string; extraArgs?: string },
+	opts?: { model?: string; extraArgs?: string; extension?: string },
 ): void {
 	const model = opts?.model ?? TEST_MODEL;
 	const extra = opts?.extraArgs ?? "";
@@ -435,7 +447,7 @@ export function startPi(
 		agentDir ? `PI_CODING_AGENT_DIR=${shellQuote(agentDir)}` : "",
 		`pi`,
 		`-ne`,
-		`-e ${shellQuote(EXTENSION_SOURCE)}`,
+		`-e ${shellQuote(opts?.extension ?? EXTENSION_SOURCE)}`,
 		`--model ${shellQuote(model)}`,
 		extra,
 		shellQuote(task),
@@ -446,6 +458,45 @@ export function startPi(
 	runScriptInPane(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
 		scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
 	});
+}
+
+/** Start a genuine idle TUI: no startup prompt or RPC prompt surrogate. */
+export function startIdleTui(
+	surface: string,
+	testDir: string,
+	opts: { extension: string; extraArgs?: string },
+): void {
+	startPi(surface, testDir, "", {
+		...opts,
+		extraArgs: `--offline --no-skills --no-prompt-templates --no-context-files --approve ${opts.extraArgs ?? ""}`,
+	});
+}
+
+/** Literal editor input followed by a real terminal key, never a hook call. */
+export function submitEditorInput(
+	surface: string,
+	text: string,
+	key = "enter",
+): void {
+	execFileSync("herdr", ["pane", "send-text", surface, text], {
+		encoding: "utf8",
+	});
+	execFileSync("herdr", ["pane", "send-keys", surface, key], {
+		encoding: "utf8",
+	});
+}
+
+/** Bounded event/predicate wait; intervals are observation cadence, not delays. */
+export async function waitForPredicate(
+	check: () => boolean,
+	label: string,
+	timeout = PI_TIMEOUT,
+): Promise<void> {
+	const deadline = Date.now() + timeout;
+	while (!check()) {
+		if (Date.now() >= deadline) throw new Error(`Timeout waiting for ${label}`);
+		await sleep(50);
+	}
 }
 
 // ── Polling helpers ──

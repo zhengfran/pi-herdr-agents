@@ -475,6 +475,22 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 	const user = lastUserText(request);
 	const lastRole = request.messages?.at(-1)?.role;
 
+	// Automatic routing never asks the provider to dispatch a child. The package
+	// input coordinator owns that launch; this fixture only answers/synthesizes.
+	const auto = source.match(/INTEGRATION_AUTO_ROUTE:([A-Za-z0-9_-]+)/)?.[1];
+	if (auto) {
+		await waitForIntegrationGate(source);
+		return {
+			text: names.has("subagent")
+				? /subagent_result|Sub-agent.*(?:result|completed)|Claude fixture result|Kiro fixture result|AUTO_CHILD_/is.test(
+						user,
+					)
+					? `AUTO_SYNTHESIS_${auto}`
+					: `AUTO_PARENT_${auto}`
+				: `AUTO_CHILD_${auto}`,
+		};
+	}
+
 	const resumeRestriction = resumeRestrictionResponse(request);
 	if (resumeRestriction) return resumeRestriction;
 

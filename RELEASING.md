@@ -17,13 +17,15 @@ You need:
 - Permission to manage this repository's GitHub Actions settings and npm package access for `pi-herdr-agents`
 - A clean local `main` branch
 
-Automated release gates (run by the workflow and required locally):
+Local release gates (the workflow runs format, lint, unit tests and package
+preview; the dedicated synthetic eval command is also required locally):
 
 ```bash
 npm ci
 npm run format:check
 npm run lint
 npm test
+npm run test:eval:jev-routing
 npm pack --dry-run
 ```
 
@@ -33,7 +35,41 @@ Manual deterministic Herdr integration (required before you push a release commi
 npm run test:integration
 ```
 
-Run that suite from inside Herdr. It uses real Pi and Herdr processes with the local deterministic provider, so it needs no provider credentials or network access.
+Run that suite from inside Herdr, only one suite at a time per instance. It is
+designed to use real Pi/Herdr processes with deterministic local providers and
+offline native executables, not live model credentials. This setup requirement is
+not a claim that all historical implementation activity was network-free.
+
+For automatic routing, also run these focused gates from the source checkout:
+
+```bash
+node --experimental-strip-types --test test/auto-routing-*.test.ts test/jev-client.test.ts test/jev-questions.test.ts
+node --experimental-strip-types --test test/evals/jev-routing-*.test.mjs
+# Inside Herdr, with no other suite running:
+node --experimental-strip-types --test test/integration/auto-routing.test.ts
+```
+
+Handler units are not real TUI evidence: automatic integration submits actual
+idle editor input into a persisted session; separate RPC/JSON/print processes
+prove bypass, never routing. Use the isolated fake classifier/offline native setup,
+not host Claude/Kiro executables. The automatic suite is deterministic-only and
+skips in live mode. Pi 0.99.1 idle local cancel and pre-dispatch public `newSession`
+are two explicit blockers/skips (events queued until awaited input resolved);
+Escape was observed reaching timeout, not cancellation. Report exact pass/fail/skip
+counts and unresolved coverage, never treat these skips as passing release evidence.
+The known Pi 0.99.1 BTW snapshot baseline failure also remains a failure to disclose,
+not a silently waived gate.
+
+The T11 eval is synthetic mechanical consistency only; thresholds, profiles and
+quality are uncalibrated, not measured service/model performance. Release verification
+must **not** enable automatic routing, grant consent, approve tuples or capture live
+prompts. Shadow needs the same explicit egress consent as pilot/auto. Separate live
+capture requires its own informed approval and stays outside the package. See
+[ADR-0014](docs/adr/0014-jev-auto-input-dispatch.md) and
+[the source-checkout contributor integration workflow](https://github.com/zhengfran/pi-herdr-agents/blob/main/.pi/skills/run-integration-tests/SKILL.md)
+for limitations and test-owned cleanup (the skill is excluded from the installed
+package). Preserve historical network incident evidence for the
+parent's final disclosure; do not replace it with a blanket network-free claim.
 
 The optional live-provider smoke test is not a release gate:
 
@@ -41,7 +77,16 @@ The optional live-provider smoke test is not a release gate:
 PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:integration:live
 ```
 
-Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, `skills/orchestrate/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes plans, journals, sessions, prototypes, generated evidence, local `config.json` and `openspec/`, and that the worktree integration tests leave no test workspace behind. Durable user configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`; package-root configuration is ignored, so users must move an older file manually or re-run `/subagents-init`.
+Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, `skills/orchestrate/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes tests/evals/fixtures and generated captures, plans, journals,
+sessions, prototypes, generated evidence, local `config.json` and `openspec/`.
+Verify before/after inventories of test-owned Herdr workspaces, processes, temporary
+repositories and worktrees; remove only positively test-owned residue after checking
+ownership/exit, never unrelated baseline residue. Run changed-TypeScript language
+service diagnostics, `git diff --check`, and the root empty-directory check from
+`AGENTS.md`. Confirm the disabled example contains no consent or enabled tuples.
+Durable user configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`;
+package-root configuration is ignored, so users must move an older file manually
+or re-run `/subagents-init`.
 
 ## npm authentication
 

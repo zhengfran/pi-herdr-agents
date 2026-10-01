@@ -21,12 +21,77 @@ export function isThinkingLevel(value: string): value is ThinkingLevel {
 }
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-export type RuntimeSource = "request" | "agent" | "parent";
+/**
+ * Per-field source. `agent` flattens a role's own value and a configured
+ * default; the additive `provenance` record tells them apart.
+ */
+export type RuntimeSource = "request" | "agent" | "parent" | "auto";
+
+/** Canonical origin of one runtime field. */
+export type RuntimeFieldSource =
+	| "request"
+	| "role"
+	| "default"
+	| "parent"
+	| "auto";
+
+/** Where a value below the request came from. */
+export type RuntimeDefaultOrigin = (
+	| { source: "role" }
+	| { source: "default"; defaultKey: string }
+) & {
+	/** The harness the value belongs to, when another harness runs. */
+	harness?: "pi" | "claude" | "kiro";
+};
+
+export interface RuntimeFieldProvenance {
+	source: RuntimeFieldSource;
+	/** The configured default that applied, such as `models.default`. */
+	defaultKey?: string;
+	/** Automatic selections only: the default the approved tuple replaced. */
+	replaced?: { value: string } & RuntimeDefaultOrigin;
+}
+
+/** Versioned per-field provenance, additive to the legacy source fields. */
+export interface RuntimeProvenance {
+	version: 1;
+	model: RuntimeFieldProvenance;
+	thinking: RuntimeFieldProvenance;
+}
 
 export interface RuntimeRequest {
 	model?: string;
 	thinking?: ThinkingLevel;
+	/**
+	 * Who chose these fields; omitted means the caller's request. `auto` is
+	 * an administrator-approved exact tuple set only by trusted internal
+	 * callers: both fields are required and validated as explicit exact
+	 * selections on a physical model, thinking is never clamped, and no
+	 * default is a fallback: defaults are recorded only as `replaced`.
+	 */
+	source?: "request" | "auto";
 }
+
+/** Role and configured values below the request in precedence. */
+export interface RuntimeDefaults {
+	model?: string;
+	thinking?: ThinkingLevel;
+	/**
+	 * Canonical origin of `model`, which the legacy `agent` source flattens,
+	 * and of `thinking` (the role when omitted). Supplying it records
+	 * per-field `provenance` on the plan.
+	 */
+	origin?: {
+		model: RuntimeDefaultOrigin | undefined;
+		thinking?: RuntimeDefaultOrigin;
+	};
+}
+
+/**
+ * API id of Pi's virtual catalog entries, which route each request to some
+ * physical model; mirrors `VIRTUAL_MODEL_API` of pi-coding-agent.
+ */
+export const VIRTUAL_MODEL_API = "pi-virtual";
 
 export interface ParentRuntime {
 	provider: string;
@@ -37,6 +102,8 @@ export interface ParentRuntime {
 export interface RoutingModel {
 	provider: string;
 	id: string;
+	/** Model API id; `pi-virtual` marks a routing (virtual) catalog entry. */
+	api?: string;
 	reasoning: boolean;
 	thinkingLevelMap?: Model<any>["thinkingLevelMap"];
 	input?: string[];
@@ -63,8 +130,10 @@ export interface ResolvedRuntimePlan {
 	thinking: ThinkingLevel;
 	modelSource: RuntimeSource;
 	thinkingSource: RuntimeSource;
+	/** Set for caller and role/config selections, never automatic ones. */
 	requestedModel?: string;
 	requestedThinking?: ThinkingLevel;
+	provenance?: RuntimeProvenance;
 	thinkingAdjustment?: {
 		from: ThinkingLevel;
 		to: ThinkingLevel;
@@ -99,7 +168,7 @@ function toRoutingModel(value: any): RoutingModel | undefined {
 	if (!value || !isString(value.provider) || !isString(value.id)) {
 		return undefined;
 	}
-	return {
+	const model: RoutingModel = {
 		provider: value.provider,
 		id: value.id,
 		reasoning: value.reasoning ?? false,
@@ -111,6 +180,8 @@ function toRoutingModel(value: any): RoutingModel | undefined {
 		maxTokens: isFiniteNumber(value.maxTokens) ? value.maxTokens : undefined,
 		cost: value.cost,
 	};
+	if (isString(value.api)) model.api = value.api;
+	return model;
 }
 
 export function wrapPiModelRegistry(registry: {
@@ -195,7 +266,10 @@ interface FieldSelection {
 function selectField(
 	requestValue: string | undefined,
 	agentValue: string | undefined,
+	requestSource: RuntimeRequest["source"] = "request",
 ): FieldSelection {
+	// An automatic tuple supplies every field; no default is a fallback.
+	if (requestSource === "auto") return { value: requestValue, source: "auto" };
 	if (requestValue != null && requestValue !== "") {
 		return { value: requestValue, source: "request" };
 	}
@@ -215,13 +289,62 @@ export function parseModelFallbacks(reference: string): string[] {
 	return candidates;
 }
 
+/** An automatic tuple names one exact model and one exact thinking level. */
+function assertAutomaticRequest(request: RuntimeRequest): void {
+	const model = request.model ?? "";
+	if (
+		/^task:/i.test(model) ||
+		/[\s,]/u.test(model) ||
+		!parseExactModelRef(model)
+	)
+		throw new RuntimeResolutionError(
+			`automatic model ${JSON.stringify(model)} must be one exact provider/model-id; lists, task: references, and defaults are never automatic selections`,
+		);
+	if (!request.thinking || !isThinkingLevel(request.thinking))
+		throw new RuntimeResolutionError(
+			`automatic thinking ${JSON.stringify(request.thinking ?? "")} must be one exact level: ${THINKING_LEVELS.join(", ")}`,
+		);
+}
+
+/** An automatic field, with the value it replaced when one would apply. */
+export function automaticFieldProvenance(
+	replacedValue: string | undefined,
+	replacedOrigin: RuntimeDefaultOrigin | undefined,
+): RuntimeFieldProvenance {
+	return replacedValue && replacedOrigin
+		? { source: "auto", replaced: { value: replacedValue, ...replacedOrigin } }
+		: { source: "auto" };
+}
+
+function fieldProvenance(
+	source: RuntimeSource,
+	defaultValue: string | undefined,
+	defaultOrigin: RuntimeDefaultOrigin | undefined,
+): RuntimeFieldProvenance | undefined {
+	switch (source) {
+		case "request":
+		case "parent":
+			return { source };
+		case "agent":
+			return defaultOrigin && { ...defaultOrigin };
+		case "auto":
+			return automaticFieldProvenance(defaultValue, defaultOrigin);
+	}
+}
+
 export function resolveRuntimePlan(
 	request: RuntimeRequest,
-	agentDefaults: RuntimeRequest,
+	agentDefaults: RuntimeDefaults,
 	parent: ParentRuntime,
 	registry: ModelRegistryAdapter,
 ): ResolvedRuntimePlan {
-	const modelSelection = selectField(request.model, agentDefaults.model);
+	const automatic = request.source === "auto";
+	if (automatic) assertAutomaticRequest(request);
+	const modelSelection = selectField(
+		request.model,
+		agentDefaults.model,
+		request.source,
+	);
 	let provider = parent.provider;
 	let modelId = parent.modelId;
 	let selectedModel = registry.find(provider, modelId);
@@ -247,6 +370,27 @@ export function resolveRuntimePlan(
 				`model ${JSON.stringify(modelSelection.value)} has no configured authentication`,
 			);
 		}
+		if (
+			automatic &&
+			(found.provider !== parsed.provider || found.id !== parsed.modelId)
+		)
+			throw new RuntimeResolutionError(
+				`automatic model ${JSON.stringify(modelSelection.value)} resolved to ${JSON.stringify(`${found.provider}/${found.id}`)}; an exact registry identity is required`,
+			);
+		// A virtual entry routes each request elsewhere, and an unknown API
+		// cannot prove otherwise: automatic tuples need a physical model.
+		if (automatic && found.api === VIRTUAL_MODEL_API)
+			throw new RuntimeResolutionError(
+				`automatic model ${JSON.stringify(modelSelection.value)} is a virtual routing model; an exact physical model is required`,
+			);
+		if (automatic && !found.api)
+			throw new RuntimeResolutionError(
+				`automatic model ${JSON.stringify(modelSelection.value)} has no known model API; an exact physical model is required`,
+			);
+		if (automatic && found.input && !found.input.includes("text"))
+			throw new RuntimeResolutionError(
+				`automatic model ${JSON.stringify(modelSelection.value)} does not accept text input`,
+			);
 		provider = found.provider;
 		modelId = found.id;
 		selectedModel = found;
@@ -255,6 +399,7 @@ export function resolveRuntimePlan(
 	const thinkingSelection = selectField(
 		request.thinking,
 		agentDefaults.thinking,
+		request.source,
 	);
 	const preferredThinking = thinkingSelection.value ?? parent.thinking;
 	if (!isThinkingLevel(preferredThinking)) {
@@ -296,8 +441,25 @@ export function resolveRuntimePlan(
 		modelSource: modelSelection.source,
 		thinkingSource: thinkingSelection.source,
 	};
-	if (modelSelection.value) plan.requestedModel = modelSelection.value;
-	if (thinkingSelection.value) plan.requestedThinking = preferredThinking;
+	// An automatic choice is recorded as `auto`, never as a caller request.
+	if (modelSelection.value && !automatic)
+		plan.requestedModel = modelSelection.value;
+	if (thinkingSelection.value && !automatic)
+		plan.requestedThinking = preferredThinking;
+	if (automatic || agentDefaults.origin) {
+		const model = fieldProvenance(
+			modelSelection.source,
+			agentDefaults.model,
+			agentDefaults.origin?.model,
+		);
+		// Thinking below the request only ever comes from the role.
+		const thinking = fieldProvenance(
+			thinkingSelection.source,
+			agentDefaults.thinking,
+			agentDefaults.origin?.thinking ?? { source: "role" },
+		);
+		if (model && thinking) plan.provenance = { version: 1, model, thinking };
+	}
 	if (thinkingAdjustment) plan.thinkingAdjustment = thinkingAdjustment;
 	return plan;
 }
@@ -305,14 +467,19 @@ export function resolveRuntimePlan(
 /** Resolve every configured fallback before launching the first child. */
 export function resolveRuntimePlans(
 	request: RuntimeRequest,
-	agentDefaults: RuntimeRequest,
+	agentDefaults: RuntimeDefaults,
 	parent: ParentRuntime,
 	registry: ModelRegistryAdapter,
 	taskPreferences?: TaskPreferences,
 	worktree = false,
 ): ResolvedRuntimePlan[] {
-	const selection = selectField(request.model, agentDefaults.model);
-	if (!selection.value)
+	const selection = selectField(
+		request.model,
+		agentDefaults.model,
+		request.source,
+	);
+	// An automatic tuple is one exact plan: no list, task expansion, or fallback.
+	if (!selection.value || selection.source === "auto")
 		return [resolveRuntimePlan(request, agentDefaults, parent, registry)];
 
 	let references: string[];

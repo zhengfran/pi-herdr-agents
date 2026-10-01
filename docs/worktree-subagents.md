@@ -2,6 +2,10 @@
 
 This guide is the operational reference for running writing agents in isolated Git worktrees with `pi-herdr-agents`. For the complete tool API, installation, and status model, see the [README](../README.md). For the product and open-source research behind these choices, see the [research report](research/worktree-subagent-orchestration.md).
 
+[Automatic input routing v1](../README.md#automatic-input-routing) rejects and
+never creates worktrees; it uses one ordinary-pane shared-checkout leaf. The
+normal worktree contract below remains manually requested and unchanged.
+
 ## Quick start
 
 Run Pi inside Herdr from a Git checkout, then give each independent writing task a unique branch:
@@ -54,7 +58,7 @@ For a worktree launch:
 
 For an explicit interactive handoff, use `/worktree <worktree> [task]`. It creates the worktree from the current committed branch, forks the active conversation branch into the target-cwd session, launches a normal long-lived Pi process in the returned root pane, and focuses the destination workspace only after Herdr confirms Pi is running with the expected session and worktree cwd. Use `/worktree list` to inspect managed worktrees whose source repositories are inside the current cwd subtree, including cross-session orphans. The original process and session remain intact; pane movement is not used to change a running shell's cwd.
 
-`worktree` cannot be set in agent frontmatter and is not exposed by the `/subagent <agent> <task>` shorthand. It is selected per call to the `subagent` tool. Ordered Pi model fallback lists are not supported for worktree subagents: a failed attempt retains its worktree and branch for review, so a retry cannot safely reuse the requested branch. Native (`cli: claude|kiro`) roles may retry only under the strict reuse rule below. A persistent specialist either holds one worktree lease for its full lifetime or runs read-only in an ordinary pane; it cannot be re-bound.
+`worktree` cannot be set in agent frontmatter and is not exposed by the `/subagent <agent> <task>` shorthand. It is selected per call to the `subagent` tool. Ordered Pi model fallback lists are not supported for worktree subagents: a failed attempt retains its worktree and branch for review, so a retry cannot safely reuse the requested branch. Native (`cli: claude|kiro`) roles may retry only under the strict reuse rule below. A persistent specialist either holds one worktree lease for its full lifetime or runs in an ordinary pane under its assigned tool/task policy; it cannot be re-bound. An ordinary pane is not a read-only sandbox.
 
 ## Parent and worker responsibilities
 
@@ -159,7 +163,15 @@ For parallel read-only review, prepare one stable existing checkout of the pull 
 
 A `read,bash` tool allowlist does not enforce read-only behavior because Bash can mutate the checkout. Tell public reviewers to use only safe inspection, avoid artifact-generating verification, and consume supplied mechanical evidence. Public completion reports above 16,000 characters are abbreviated; when a completed report is needed, retrieve its final assistant message once from the supplied session path with bounded output. This is evidence retrieval, not live-session polling.
 
-For a committed candidate, prefer the `/skill:orchestrate` adversarial procedure. Its approved runner creates one detached checkout pinned to the review head. Effective tools are the resolved role allowlist intersected with the runner maximum (`read`, `grep`, `find`, and `ls`) and deny rules; an override can reduce that set. The parent must materialize the changed-file inventory and unified diff, or complete before/after excerpts, because head-checkout reads cannot recover deleted or base-only blobs. Parent dirty and untracked state is absent. Use the `adversarial-reviewer` compatibility coordinator only when its weaker public-child boundary is intentional and project policy permits it.
+For a committed candidate, prefer the `/skill:orchestrate` adversarial procedure.
+It uses fresh public reviewer children in ordinary panes, not an approved private
+runner or automatically created detached checkout. The resolved role tool
+allowlist is the available enforcement boundary; Bash is not read-only. The parent
+must materialize the changed-file inventory and unified diff, or complete
+before/after excerpts, because head-checkout reads cannot recover deleted or
+base-only blobs. Include dirty/untracked state only when explicitly pinned. The
+`adversarial-reviewer` compatibility coordinator follows the same public fan-out
+and parent-synthesis contract; project review policy still applies.
 
 ```typescript
 subagent({

@@ -42,7 +42,11 @@ import {
 	supervisedCommand,
 	terminateProcessRun,
 } from "../pi-extension/subagents/process-run.ts";
-import { NativeLaunchUnresolvedError } from "../pi-extension/subagents/launch.ts";
+import {
+	launchNativeSubagent,
+	nativeSessionMarkerPath,
+	NativeLaunchUnresolvedError,
+} from "../pi-extension/subagents/launch.ts";
 import {
 	acquireRunLease,
 	currentLeaseParent,
@@ -73,9 +77,12 @@ import {
 	type WorktreeInventoryEntry,
 } from "../pi-extension/subagents/worktree-cleanup.ts";
 import {
+	fakeHerdr,
 	initRepo,
 	killGroup,
 	linux,
+	nativeOperations,
+	nativeRequest,
 	parentSession,
 	scratch,
 	waitFor,
@@ -89,6 +96,7 @@ import {
 	resultFor,
 	resume,
 	running,
+	beforeSend,
 	sendFailures,
 	sent,
 	shutdownParent,
@@ -656,6 +664,306 @@ describe("finding 6: owned descendants keep a run unresolved", () => {
 			false,
 			"released after exit",
 		);
+	});
+});
+
+describe("late exit confirmation closes accepted ordinary panes", () => {
+	const lingeringPid = (log: string): number =>
+		fixtureEvents(log).find((event) => event.lingering)?.lingering;
+	const settle = () => new Promise((resolve) => setTimeout(resolve, 150));
+	/**
+	 * When the parent is first handed this child's result, end the lingering
+	 * descendant and let a reconciliation release the run, all before the
+	 * send returns: reconciliation wins between settlement and acceptance.
+	 */
+	const reconcileOnResult = (name: string, log: string, child: any) => {
+		const raced = { won: false };
+		beforeSend.hook = (message) => {
+			if (message.customType !== "subagent_result") return;
+			if (message.details?.name !== name) return;
+			beforeSend.hook = undefined;
+			process.kill(lingeringPid(log), "SIGKILL");
+			const sleeper = new Int32Array(new SharedArrayBuffer(4));
+			const deadline = Date.now() + 5_000;
+			while (
+				confirmProcessExit(child.native.processRun).kind !== "confirmed" &&
+				Date.now() < deadline
+			)
+				Atomics.wait(sleeper, 0, 0, 20);
+			testApi.reconcileUnresolvedNativeRuns();
+			raced.won = !testApi.unresolvedNativeRuns().has(child.id);
+		};
+		return raced;
+	};
+
+	it("closes the pane exactly once after accepted delivery and late exit", async (t) => {
+		if (!linux) return t.skip("descendant scans use /proc");
+		const project = scratch("late-close");
+		const log = join(project, "..", "late-close.json");
+		const herdr = useHerdr(
+			{ log, env: { FAKE_LINGER: "1" } },
+			{ lateExitRecheckMs: 20 },
+		);
+		await start(project, {
+			name: "late-close",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const child = running("late-close");
+		assert.ok(child);
+		const result = await resultFor("late-close");
+		const surface = result.details.native.surface;
+		assert.equal(result.details.native.processExit, "unconfirmed");
+		assert.equal(surface, child.surface);
+		await settle();
+		assert.deepEqual(herdr.closed, [], "re-checks keep a live run's pane");
+		assert.equal(existsSync(`${result.details.sessionFile}.lease`), true);
+		process.kill(lingeringPid(log), "SIGKILL");
+		// No inventory call: the scheduled re-check alone closes the pane.
+		await waitFor(() => herdr.closed.includes(surface));
+		assert.equal(existsSync(`${result.details.sessionFile}.lease`), false);
+		testApi.closePaneAfterLateExit(child, result.details.native);
+		testApi.reconcileUnresolvedNativeRuns();
+		await settle();
+		assert.deepEqual(herdr.closed, [surface], "closed once, nothing else");
+	});
+
+	it("closes once when reconciliation wins before accepted delivery", async (t) => {
+		if (!linux) return t.skip("descendant scans use /proc");
+		const project = scratch("late-race");
+		const log = join(project, "..", "late-race.json");
+		const herdr = useHerdr({ log, env: { FAKE_LINGER: "1" } });
+		await start(project, {
+			name: "late-race",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const child = running("late-race");
+		assert.ok(child);
+		const raced = reconcileOnResult("late-race", log, child);
+		try {
+			const result = await resultFor("late-race");
+			assert.equal(raced.won, true, "released before the send returned");
+			assert.equal(result.details.native.processExit, "unconfirmed");
+			assert.equal(existsSync(`${result.details.sessionFile}.lease`), false);
+			await waitFor(() => herdr.closed.includes(child.surface));
+			testApi.closePaneAfterLateExit(child, result.details.native);
+			testApi.reconcileUnresolvedNativeRuns();
+			await settle();
+			assert.deepEqual(herdr.closed, [child.surface], "closed once");
+		} finally {
+			beforeSend.hook = undefined;
+		}
+	});
+
+	it("closes a resumed pane once when reconciliation wins first", async (t) => {
+		if (!linux) return t.skip("descendant scans use /proc");
+		const project = scratch("late-race-resume");
+		useHerdr({ log: join(project, "..", "first.json") });
+		await start(project, {
+			name: "late-resume",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const first = await resultFor("late-resume");
+		assert.equal(first.details.native.processExit, "confirmed");
+		const log = join(project, "..", "late-race-resume.json");
+		const herdr = useHerdr({ log, env: { FAKE_LINGER: "1" } });
+		const resumed = await resume(project, {
+			sessionPath: first.details.sessionFile,
+			name: "late-resume-2",
+			message: "Continue",
+		});
+		assert.equal(resumed.details.status, "started", resumed.content[0].text);
+		const child = running("late-resume-2");
+		assert.ok(child);
+		const raced = reconcileOnResult("late-resume-2", log, child);
+		try {
+			const result = await resultFor("late-resume-2");
+			assert.equal(raced.won, true);
+			assert.equal(result.details.native.processExit, "unconfirmed");
+			await waitFor(() => herdr.closed.includes(child.surface));
+			await settle();
+			assert.deepEqual(herdr.closed, [child.surface], "closed once");
+		} finally {
+			beforeSend.hook = undefined;
+		}
+	});
+
+	it("keeps the pane when the raced delivery is rejected", async (t) => {
+		if (!linux) return t.skip("descendant scans use /proc");
+		const project = scratch("late-race-rejected");
+		const log = join(project, "..", "late-race-rejected.json");
+		const herdr = useHerdr(
+			{ log, env: { FAKE_LINGER: "1" } },
+			{ lateExitRecheckMs: 20 },
+		);
+		await start(project, {
+			name: "late-rejected",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const child = running("late-rejected");
+		assert.ok(child);
+		const raced = reconcileOnResult("late-rejected", log, child);
+		sendFailures.match = (message) => message.details?.name === "late-rejected";
+		sendFailures.remaining = 1;
+		try {
+			await waitFor(() => sendFailures.remaining === 0, 15_000);
+			await waitFor(() => !running("late-rejected"));
+			assert.equal(raced.won, true);
+			await settle();
+			assert.equal(
+				sent.some((message) => message.details?.name === "late-rejected"),
+				false,
+				"the send was rejected and nothing else was delivered",
+			);
+			testApi.closePaneAfterLateExit(child, {
+				harness: "claude",
+				markerFile: child.native.markerFile,
+				processExit: "unconfirmed",
+			});
+			await settle();
+			assert.deepEqual(herdr.closed, [], "a rejected result keeps its pane");
+		} finally {
+			beforeSend.hook = undefined;
+			sendFailures.remaining = 0;
+		}
+	});
+
+	it("keeps the pane when the parent never accepted the result", async (t) => {
+		if (!linux) return t.skip("descendant scans use /proc");
+		const project = scratch("late-suppressed");
+		const log = join(project, "..", "late-suppressed.json");
+		const herdr = useHerdr(
+			{ log, env: { FAKE_LINGER: "1" } },
+			{ lateExitRecheckMs: 20 },
+		);
+		await start(project, {
+			name: "late-suppressed",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const child = running("late-suppressed");
+		assert.ok(child);
+		// As a non-preserving parent shutdown does before completion.
+		child.lifecycle = { ...child.lifecycle, delivery: "suppressed" };
+		await waitFor(() => !running("late-suppressed"), 15_000);
+		const entry = testApi.unresolvedNativeRuns().get(child.id);
+		assert.ok(entry, "retained as unresolved");
+		assert.equal(entry.closePaneOnExit, undefined);
+		process.kill(lingeringPid(log), "SIGKILL");
+		await waitFor(() =>
+			testApi.reconcileUnresolvedNativeRuns().every((other) => other !== entry),
+		);
+		await settle();
+		assert.equal(existsSync(`${entry.run.markerFile}.lease`), false);
+		assert.equal(
+			sent.some((message) => message.details?.name === "late-suppressed"),
+			false,
+		);
+		assert.deepEqual(herdr.closed, [], "an unaccepted result keeps its pane");
+	});
+
+	it("never marks worktree, persistent, interactive, nested, or other runs", () => {
+		const herdr = useHerdr({ log: join(scratch("late-ineligible"), "x.json") });
+		const result = (processExit: string): any => ({ processExit });
+		const unconfirmed = result("unconfirmed");
+		const fake = (
+			id: string,
+			extra: {
+				worktree?: { path: string };
+				persistent?: boolean;
+				nestedOf?: { requesterId: string };
+			},
+			mode = "autonomous",
+		): any => ({
+			id,
+			surface: `pane-${id}`,
+			native: { driver: { mode } },
+			...extra,
+		});
+		const cases = [
+			fake("tree", { worktree: { path: "/tmp/tree" } }),
+			fake("persistent", { persistent: true }),
+			fake("interactive", {}, "interactive"),
+			fake("nested", { nestedOf: { requesterId: "parent" } }),
+		];
+		const runs = testApi.unresolvedNativeRuns();
+		try {
+			for (const child of cases) {
+				runs.set(child.id, { run: child.native });
+				testApi.closePaneAfterLateExit(child, unconfirmed);
+				assert.equal(runs.get(child.id)?.closePaneOnExit, undefined, child.id);
+			}
+			// Another run under the same ID, a confirmed exit, and an
+			// already released run never take this pane.
+			const other = fake("other", {});
+			runs.set(other.id, { run: fake("other-run", {}).native });
+			testApi.closePaneAfterLateExit(other, unconfirmed);
+			assert.equal(runs.get(other.id)?.closePaneOnExit, undefined);
+			const confirmed = fake("confirmed", {});
+			runs.set(confirmed.id, { run: confirmed.native });
+			testApi.closePaneAfterLateExit(confirmed, result("confirmed"));
+			assert.equal(runs.get(confirmed.id)?.closePaneOnExit, undefined);
+			testApi.closePaneAfterLateExit(fake("released", {}), unconfirmed);
+			assert.equal(runs.has("released"), false);
+			assert.deepEqual(herdr.closed, []);
+		} finally {
+			for (const id of [
+				...cases.map((child) => child.id),
+				"other",
+				"confirmed",
+			])
+				runs.delete(id);
+		}
+	});
+
+	it("closes a released run's pane only after its exit is confirmed again", () => {
+		let confirm: () => any = () => ({ kind: "confirmed", unreadableCount: 0 });
+		const herdr = useHerdr(
+			{ log: join(scratch("late-released"), "x.json") },
+			{ watch: { confirmExit: () => confirm() } },
+		);
+		const accepted = (surface?: string): any => ({
+			processExit: "unconfirmed",
+			surface,
+		});
+		const late = testApi.lateReleasedNativeRuns();
+		const released = (id: string, mode = "autonomous"): any => {
+			const child = {
+				id,
+				surface: `pane-${id}`,
+				native: { driver: { mode }, processRun: { id } },
+			};
+			late.add(child.native);
+			return child;
+		};
+		const unconfirmed = released("unconfirmed");
+		confirm = () => ({ kind: "unconfirmed", reason: "still running" });
+		testApi.closePaneAfterLateExit(unconfirmed, accepted());
+		const throwing = released("throwing");
+		confirm = () => {
+			throw new Error("scan failed");
+		};
+		testApi.closePaneAfterLateExit(throwing, accepted());
+		confirm = () => ({ kind: "confirmed", unreadableCount: 0 });
+		const elsewhere = released("elsewhere");
+		testApi.closePaneAfterLateExit(elsewhere, accepted("pane-other"));
+		testApi.closePaneAfterLateExit(
+			released("interactive", "interactive"),
+			accepted(),
+		);
+		assert.deepEqual(
+			herdr.closed,
+			[],
+			"unproven or ineligible runs keep panes",
+		);
+		const confirmed = released("confirmed");
+		testApi.closePaneAfterLateExit(confirmed, accepted(confirmed.surface));
+		testApi.closePaneAfterLateExit(confirmed, accepted(confirmed.surface));
+		testApi.closePaneAfterLateExit(unconfirmed, accepted());
+		assert.deepEqual(herdr.closed, ["pane-confirmed"], "closed exactly once");
 	});
 });
 
@@ -2847,5 +3155,184 @@ describe("acceptance: a persistent first task is durable before its process", ()
 		// Idempotent: a second session start changes nothing.
 		await startParentSession(project);
 		assert.deepEqual(outcomes(never.markerFile), ["planned", "abandoned"]);
+	});
+});
+
+describe("automatic native launch guards and environment", () => {
+	/** A package guard recording boundaries and the latch it holds. */
+	function recordingGuard(
+		events: string[],
+		stopAt?: "beforeResources" | "commitDispatch",
+	) {
+		const guard = {
+			state: "uncommitted",
+			beforeResources() {
+				events.push("guard:resources");
+				if (stopAt === "beforeResources")
+					throw new Error("stale before resources");
+			},
+			resourcesCreated() {
+				events.push("guard:created");
+				guard.state = "resources-created";
+			},
+			commitDispatch() {
+				events.push("guard:dispatch");
+				if (stopAt === "commitDispatch")
+					throw new Error("stale before dispatch");
+				guard.state = "dispatch-attempted";
+			},
+		};
+		return guard;
+	}
+	const markerFor = (request: ReturnType<typeof nativeRequest>) =>
+		nativeSessionMarkerPath(request.parent, request.id!);
+	const settleChildren = async (herdr: ReturnType<typeof fakeHerdr>) => {
+		for (const child of herdr.children) killGroup(child.pid);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	};
+
+	it("creates no pane when the guard is stale before resources", async () => {
+		const project = scratch("auto-native-stale");
+		const herdr = fakeHerdr({ log: join(project, "..", "stale.json") });
+		const guard = recordingGuard(herdr.events, "beforeResources");
+		await assert.rejects(
+			launchNativeSubagent(
+				nativeRequest(project, "claude", { automatic: { guard } }),
+				herdr.operations,
+				nativeOperations,
+			),
+			/stale before resources/,
+		);
+		assert.deepEqual(herdr.events, ["guard:resources"]);
+		assert.deepEqual(herdr.closed, []);
+		assert.equal(guard.state, "uncommitted");
+	});
+
+	it("dispatches no process when aborted during the shell wait", async () => {
+		const project = scratch("auto-native-abort");
+		const controller = new AbortController();
+		let leaseDuringWait = false;
+		const herdr = fakeHerdr({
+			log: join(project, "..", "abort.json"),
+			// The shell never becomes ready on its own.
+			waitForShellReady: () => {
+				leaseDuringWait = existsSync(nativeLeaseFile(markerFor(request)));
+				setTimeout(() => controller.abort(), 20);
+				return new Promise<void>(() => {});
+			},
+		});
+		const guard = recordingGuard(herdr.events);
+		const request = nativeRequest(project, "claude", {
+			automatic: { guard },
+			signal: controller.signal,
+		});
+		await assert.rejects(
+			launchNativeSubagent(request, herdr.operations, nativeOperations),
+			/Native launch cancelled before its process was dispatched/,
+		);
+		assert.deepEqual(herdr.events, [
+			"guard:resources",
+			"create:Native worker",
+			"guard:created",
+			"ready",
+		]);
+		assert.equal(guard.state, "resources-created");
+		assert.equal(herdr.children.length, 0);
+		// Never dispatched: exit is confirmed, so the owned pane and session
+		// lease are released through the existing confirmed-exit cleanup.
+		assert.deepEqual(herdr.closed, ["pane-1"]);
+		assert.equal(leaseDuringWait, true, "the prepared run held its lease");
+		assert.equal(existsSync(nativeLeaseFile(markerFor(request))), false);
+	});
+
+	it("dispatches no process when the guard fails after readiness", async () => {
+		const project = scratch("auto-native-drift");
+		const herdr = fakeHerdr({ log: join(project, "..", "drift.json") });
+		const guard = recordingGuard(herdr.events, "commitDispatch");
+		const request = nativeRequest(project, "kiro", { automatic: { guard } });
+		await assert.rejects(
+			launchNativeSubagent(request, herdr.operations, nativeOperations),
+			/stale before dispatch/,
+		);
+		assert.deepEqual(herdr.events.slice(-2), ["ready", "guard:dispatch"]);
+		assert.equal(herdr.events.includes("run"), false);
+		assert.equal(herdr.children.length, 0);
+		assert.deepEqual(herdr.closed, ["pane-1"]);
+		assert.equal(existsSync(nativeLeaseFile(markerFor(request))), false);
+		assert.equal(existsSync(join(project, ".kiro")), false, "profile removed");
+	});
+
+	it("keeps the latch when runScript throws after sending", async () => {
+		const project = scratch("auto-native-lost");
+		const herdr = fakeHerdr({
+			log: join(project, "..", "lost.json"),
+			failAfterRun: true,
+		});
+		const guard = recordingGuard(herdr.events);
+		await assert.rejects(
+			launchNativeSubagent(
+				nativeRequest(project, "claude", { automatic: { guard } }),
+				herdr.operations,
+				nativeOperations,
+			),
+			/acknowledgement was lost/,
+		);
+		assert.equal(guard.state, "dispatch-attempted");
+		assert.equal(herdr.events.filter((event) => event === "run").length, 1);
+		await settleChildren(herdr);
+	});
+
+	it("rejects an automatic resume, reuse, or caller surface before resources", async () => {
+		const project = scratch("auto-native-shape");
+		const herdr = fakeHerdr({ log: join(project, "..", "shape.json") });
+		await assert.rejects(
+			launchNativeSubagent(
+				nativeRequest(project, "claude", {
+					automatic: { guard: recordingGuard(herdr.events) },
+					surface: "caller-pane",
+				}),
+				herdr.operations,
+				nativeOperations,
+			),
+			/only a fresh launch in its own ordinary pane/,
+		);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("strips the Jev key and marks only automatic native children", async () => {
+		const observed = new Map<
+			string,
+			{ typesafeKey: string | null; autoRoutingDisabled: string | null }
+		>();
+		for (const kind of ["manual", "automatic"] as const) {
+			const project = scratch(`auto-native-env-${kind}`);
+			const log = join(project, "..", `env-${kind}.json`);
+			const herdr = fakeHerdr({
+				log,
+				env: { TYPESAFE_API_KEY: "parent-secret" },
+			});
+			const running = await launchNativeSubagent(
+				nativeRequest(
+					project,
+					"claude",
+					kind === "automatic" ? { automatic: {} } : {},
+				),
+				herdr.operations,
+				nativeOperations,
+			);
+			await waitFor(() => existsSync(log));
+			observed.set(kind, JSON.parse(readFileSync(log, "utf8")));
+			const script = readFileSync(running.launchScriptFile, "utf8");
+			assert.equal(
+				script.includes("unset TYPESAFE_API_KEY"),
+				kind === "automatic",
+			);
+			await settleChildren(herdr);
+		}
+		assert.equal(observed.get("manual")?.typesafeKey, "parent-secret");
+		assert.equal(observed.get("manual")?.autoRoutingDisabled, null);
+		assert.equal(observed.get("automatic")?.typesafeKey, null);
+		assert.equal(observed.get("automatic")?.autoRoutingDisabled, "1");
+		assert.equal(process.env.PI_HERDR_AUTO_ROUTING_DISABLED, undefined);
 	});
 });

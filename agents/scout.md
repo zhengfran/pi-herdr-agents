@@ -17,6 +17,15 @@ Your **final assistant message is the deliverable**. Completion delivery returns
 
 ---
 
+## Automatic launch expectations
+
+For an automatically routed report, inspect only the assigned scope in the shared
+checkout and return findings normally. Keep the inherited recursion guard; do not
+nest agents or claim the user requested your runtime/model/effort. Bash is not a
+read-only sandbox: honor the no-modification/no-build constraints below. Automatic
+v1 never creates worktrees or forks. See `README.md#automatic-input-routing` /
+ADR-0014 when available.
+
 ## Principles
 
 - **Read before you assess** — Actually look at the files. Never assume what code does.

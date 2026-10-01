@@ -1,0 +1,225 @@
+{
+	"version": "jev-routing-catalog-synthetic-v1",
+	"synthetic": true,
+	"thresholdsStatus": "uncalibrated",
+	"roles": [
+		{
+			"id": "r00",
+			"agent": "synthetic-research",
+			"intent": "report",
+			"purpose": "task",
+			"responsibility": "Explain code, logs, or local reference material.",
+			"deliverable": "An informational report.",
+			"excludes": "No workspace changes or independent review guarantees."
+		},
+		{
+			"id": "r01",
+			"agent": "synthetic-build",
+			"intent": "modify",
+			"purpose": "task",
+			"responsibility": "Inspect and implement explicit local code or artifact changes.",
+			"deliverable": "Updated workspace artifacts and local verification.",
+			"excludes": "No publishing, deployment, or privilege widening."
+		},
+		{
+			"id": "r02",
+			"agent": "synthetic-plan",
+			"intent": "report",
+			"purpose": "task",
+			"responsibility": "Analyze a self-contained request and report an implementation plan.",
+			"deliverable": "A plan in the response only.",
+			"excludes": "No saved artifacts or workspace mutation."
+		},
+		{
+			"id": "r03",
+			"agent": "synthetic-review",
+			"intent": "report",
+			"purpose": "review",
+			"responsibility": "Review a local diff for correctness.",
+			"deliverable": "Review findings.",
+			"excludes": "No implementation; automatic launch requires trusted provenance unavailable in v1."
+		}
+	],
+	"tuples": [
+		{
+			"id": "c000",
+			"roleId": "r00",
+			"harness": "pi",
+			"model": "synthetic/fast-20260901",
+			"effort": "low",
+			"tier": "fast",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c001",
+			"roleId": "r00",
+			"harness": "pi",
+			"model": "synthetic/mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c002",
+			"roleId": "r00",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "high",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c003",
+			"roleId": "r00",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "xhigh",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c004",
+			"roleId": "r00",
+			"harness": "claude",
+			"model": "synthetic-mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-beta"
+		},
+		{
+			"id": "c005",
+			"roleId": "r01",
+			"harness": "pi",
+			"model": "synthetic/fast-20260901",
+			"effort": "low",
+			"tier": "fast",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c006",
+			"roleId": "r01",
+			"harness": "pi",
+			"model": "synthetic/mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c007",
+			"roleId": "r01",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "high",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c008",
+			"roleId": "r01",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "xhigh",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c009",
+			"roleId": "r01",
+			"harness": "claude",
+			"model": "synthetic-mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-beta"
+		},
+		{
+			"id": "c010",
+			"roleId": "r02",
+			"harness": "pi",
+			"model": "synthetic/fast-20260901",
+			"effort": "low",
+			"tier": "fast",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c011",
+			"roleId": "r02",
+			"harness": "pi",
+			"model": "synthetic/mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c012",
+			"roleId": "r02",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "high",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c013",
+			"roleId": "r02",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "xhigh",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c014",
+			"roleId": "r02",
+			"harness": "claude",
+			"model": "synthetic-mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-beta"
+		},
+		{
+			"id": "c015",
+			"roleId": "r03",
+			"harness": "pi",
+			"model": "synthetic/fast-20260901",
+			"effort": "low",
+			"tier": "fast",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c016",
+			"roleId": "r03",
+			"harness": "pi",
+			"model": "synthetic/mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c017",
+			"roleId": "r03",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "high",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c018",
+			"roleId": "r03",
+			"harness": "pi",
+			"model": "synthetic/frontier-20260901",
+			"effort": "xhigh",
+			"tier": "frontier",
+			"family": "fictional-alpha"
+		},
+		{
+			"id": "c019",
+			"roleId": "r03",
+			"harness": "claude",
+			"model": "synthetic-mid-20260901",
+			"effort": "medium",
+			"tier": "mid",
+			"family": "fictional-beta"
+		}
+	]
+}

@@ -9,6 +9,12 @@ import { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	SessionManager,
+	type ExtensionContext,
+	type InputEvent,
+	type InputEventResult,
+} from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
 	readNativeSessionMarker,
@@ -48,6 +54,8 @@ interface SendFailures {
 
 /** Messages matching this predicate throw from sendMessage (transient failure). */
 export const sendFailures: SendFailures = { remaining: 0 };
+/** Runs synchronously when sendMessage is entered, before any failure. */
+export const beforeSend: { hook?: (message: any) => void } = {};
 /** Installed Pi skills reported by the mock API's getCommands(). */
 export const skillCommands: Array<{
 	name: string;
@@ -55,23 +63,30 @@ export const skillCommands: Array<{
 	sourceInfo: { path: string };
 }> = [];
 
-export function createApi(sink: any[] = sent): any {
+export function createApi(
+	sink: any[] = sent,
+	registry = handlers,
+	localTools = registered,
+	localCommands = commands,
+	localUserMessages = userMessages,
+): any {
 	// SAFETY: a partial ExtensionAPI with only the members these flows use.
 	return {
 		on(event: string, handler: Function) {
-			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+			registry.set(event, [...(registry.get(event) ?? []), handler]);
 		},
 		registerTool(tool: any) {
-			registered.push(tool);
+			localTools.push(tool);
 		},
 		registerCommand(name: string, command: any) {
-			commands.set(name, command);
+			localCommands.set(name, command);
 		},
 		registerMessageRenderer() {},
 		registerShortcut() {},
 		events: { on() {}, emit() {} },
 		getThinkingLevel: () => "medium",
 		sendMessage(message: any) {
+			beforeSend.hook?.(message);
 			if (sendFailures.remaining > 0 && sendFailures.match?.(message)) {
 				sendFailures.remaining--;
 				throw new Error("transient parent delivery failure");
@@ -79,10 +94,158 @@ export function createApi(sink: any[] = sent): any {
 			sink.push(message);
 		},
 		sendUserMessage(message: string) {
-			userMessages.push(message);
+			localUserMessages.push(message);
 		},
 		getAllTools: () => [],
 		getCommands: () => skillCommands,
+	};
+}
+
+/**
+ * Pi's public ordered input contract, without original-input metadata: each
+ * transform feeds the next handler, handled stops the chain, and continue
+ * never discards a transform another handler has already made.
+ */
+export async function runOrderedInput(
+	registry: Map<string, Function[]>,
+	input: InputEvent,
+	ctx: ExtensionContext,
+): Promise<InputEventResult> {
+	let text = input.text;
+	let images = input.images;
+	for (const handler of registry.get("input") ?? []) {
+		const result: InputEventResult | undefined = await handler(
+			{ ...input, text, images },
+			ctx,
+		);
+		if (result?.action === "handled") return result;
+		if (result?.action === "transform") {
+			text = result.text;
+			images = result.images ?? images;
+		}
+	}
+	return text !== input.text || images !== input.images
+		? { action: "transform", text, images }
+		: { action: "continue" };
+}
+
+/** Isolated registrations and real host-owned session appends for input flows. */
+export function inputHost(
+	project: string,
+	persisted = true,
+	session?: SessionManager,
+) {
+	const manager =
+		session ?? SessionManager.create(project, join(project, "sessions"));
+	if (persisted && !session) {
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Earlier question." }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Earlier answer." }],
+			api: "openai-completions",
+			provider: "fake",
+			model: "parent",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+	}
+	const registry = new Map<string, Function[]>();
+	const messages: Array<{ message: any; options: any }> = [];
+	const tools: any[] = [];
+	const localCommands = new Map<string, any>();
+	const injectedUserMessages: string[] = [];
+	const localApi = createApi(
+		[],
+		registry,
+		tools,
+		localCommands,
+		injectedUserMessages,
+	);
+	const state = { idle: true, pending: false, signalReads: 0 };
+	const models = ["parent", "exact-2"].map((id) => ({
+		provider: "fake",
+		id,
+		api: "openai-completions",
+		reasoning: true,
+		input: ["text"],
+	}));
+	const notices: string[] = [];
+	// SAFETY: UI and registry are offline stand-ins; the session manager is
+	// the real host implementation. No private session mutation/flush API.
+	const ctx: ExtensionContext = {
+		mode: "tui",
+		cwd: project,
+		hasUI: true,
+		isIdle: () => state.idle,
+		hasPendingMessages: () => state.pending,
+		get signal() {
+			state.signalReads++;
+			return undefined;
+		},
+		sessionManager: manager,
+		model: models[0],
+		modelRegistry: {
+			find: (provider: string, id: string) =>
+				models.find((m) => m.provider === provider && m.id === id),
+			getAvailable: () => models,
+			hasConfiguredAuth: () => true,
+			findOfType: () => {
+				throw new Error("unexpected classifier lookup");
+			},
+			classify: () => {
+				throw new Error("unexpected classifier call");
+			},
+		},
+		ui: {
+			notify: (text: string) => notices.push(text),
+			confirm: async () => false,
+			setWidget() {},
+			setStatus() {},
+			setFooter() {},
+		},
+	} as any;
+	const emit = async (event: string, data: any = {}) => {
+		for (const handler of registry.get(event) ?? []) await handler(data, ctx);
+	};
+	localApi.appendEntry = (customType: string, data: any) =>
+		manager.appendCustomEntry(customType, data);
+	localApi.sendMessage = (message: any, options: any = {}) => {
+		messages.push({ message, options });
+		// Idle non-triggering sendMessage appends synchronously in Pi 0.99.1.
+		manager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display ?? true,
+			message.details,
+		);
+		if (options.triggerTurn) void emit("agent_start");
+	};
+	const input = (event: InputEvent) => runOrderedInput(registry, event, ctx);
+	return {
+		api: localApi,
+		ctx,
+		manager,
+		registry,
+		messages,
+		tools,
+		commands: localCommands,
+		userMessages: injectedUserMessages,
+		state,
+		notices,
+		input,
+		emit,
 	};
 }
 

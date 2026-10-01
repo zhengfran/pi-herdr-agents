@@ -6,6 +6,17 @@ These instructions apply to humans and coding agents changing `pi-herdr-agents`.
 
 `pi-herdr-agents` (Pi Herdr Agents) is a Pi extension that launches asynchronous Pi child agents exclusively in Herdr. Ordinary runs group child panes in extension-owned `Agents` tabs by default. Writing tasks may opt into one isolated Herdr-managed Git worktree per branch. Roles may opt into a native Claude Code or Kiro harness with `cli: claude|kiro` in autonomous, interactive, or persistent mode, with exact-loadout resume, queued follow-ups, verified interrupts, fork/lineage context, Pi skills, native model fallback, and allowlisted nested delegation (ADR-0013). A spawn may run a named role on another harness with `harness: pi|claude|kiro` as a strictly validated role projection (explicit request → role `cli` → Pi). Unknown CLIs, unrepresentable native capabilities, and unrepresentable projections fail before Herdr creates resources.
 
+Off-by-default automatic input routing uses public Pi 0.99.1 APIs, pinned Jev
+evidence and durable administrator-approved exact tuples (ADR-0014). It admits
+only eligible idle top-level TUI/interactive current-view input, undefined streaming
+behavior, no current images and an existing persisted session. RPC/JSON/print,
+extension-source and steer/followUp bypass; fresh unpersisted first prompts bypass.
+Automatic children are shared-checkout standalone autonomous leaves, never
+worktrees/forks/persistent/nested agents or review-purpose launches. Manual APIs
+and task model preferences never enable/authorize auto. Shadow also sends data
+and requires consent. Use [the canonical disclosure and operator contract](README.md#automatic-input-routing),
+not stronger original-provenance, idle Escape, read-only or exactly-once claims.
+
 The extension is fire-and-forget: `subagent` returns an acknowledgement, and completion is delivered to the parent automatically. Never add polling guidance that tells callers to sleep, tail sessions, or repeatedly check status.
 
 ## Read these first
@@ -16,6 +27,7 @@ The extension is fire-and-forget: `subagent` returns an acknowledgement, and com
 - [`docs/adr/0003-installable-role-packs.md`](docs/adr/0003-installable-role-packs.md) — installable role-pack discovery, precedence, and collision contract
 - [`docs/worktree-subagents.md`](docs/worktree-subagents.md) — canonical worktree operating, review, recovery, and cleanup guide
 - [`RELEASING.md`](RELEASING.md) — release checks and publishing procedure
+- [`docs/adr/0014-jev-auto-input-dispatch.md`](docs/adr/0014-jev-auto-input-dispatch.md) — automatic evidence/authority, ownership, egress and residual host limits
 
 Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrate` public-review fan-out skill lives at [`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md). The `/plan` orchestration prompt lives at [`pi-extension/subagents/plan-skill.md`](pi-extension/subagents/plan-skill.md).
 
@@ -27,6 +39,7 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `pi-extension/subagents/lifecycle.ts`, `status.ts`, `activity.ts` — process/turn state and widget projection
 - `pi-extension/subagents/wake.ts`, `supervision.ts`, `supervision-config.ts` — file wake-ups, shared pane reconciliation, polling fallback, and supervision configuration
 - `pi-extension/subagents/persistent-config.ts` — strict persistent-specialist cap configuration
+- `pi-extension/subagents/auto-routing-{config,candidates,policy,input}.ts`, `jev-{questions,client}.ts` — strict durable approvals, local snapshots, full-distribution policy, current-view input ownership/persistence, and pinned authenticated classifier transport
 - `pi-extension/subagents/completion.ts`, `session.ts`, `subagent-done.ts` — child completion, transcript handling, `caller_ping`, and `subagent_done`
 - `pi-extension/subagents/native-harness.ts`, `claude.ts`, `kiro.ts`, `process-run.ts`, `plugin/hooks/` — native `cli: claude|kiro` capability validation, pre-resource launch planning, owned hook/state files, correlated completion, and durable process receipts (ported from zhengfran/pi-interactive-subagents, MIT)
 - `pi-extension/subagents/native-turns.ts` — harness-neutral tagged-turn driver: verified idle points, follow-up queue, interrupts, interactive/persistent/autonomous exit policy
@@ -39,6 +52,9 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `test/test.ts` — unit tests for public subagent extension seams
 - `test/native-harness.test.ts`, `test/native-stage2.test.ts`, `test/native-flows.test.ts`, `test/native-regressions.test.ts` — native harness unit, end-to-end, and review-regression tests using offline `test/fixtures/native-bin/` CLI stand-ins, `test/native-fixtures.ts`, and `test/native-flow-harness.ts` (flows run through the extension's tool handlers with a fake Herdr test seam)
 - `test/harness-selection.test.ts` — spawn-time harness selection and role projection through the public `subagent`/`subagent_resume` tools, `startSubagentRun`, and the registered `/subagent` command, using the fake Herdr seam and offline native fixtures
+- `test/auto-routing-*.test.ts`, `test/jev-client.test.ts`, `test/jev-questions.test.ts` — offline contracts/public-handler flows (not real TUI evidence)
+- `test/integration/auto-routing.test.ts` — isolated real TUI routing, real RPC/noninteractive bypass, fake classifier and offline native executables; deterministic-only, live skipped
+- `test/evals/jev-routing-README.md` — synthetic uncalibrated fixtures/evaluator; no live capture
 - `test/package-skill.test.js` — bundled skill and package manifest contract test
 - `test/integration/` — real Herdr and Pi lifecycle tests using the deterministic provider by default
 - `test/bench/supervision-bench.mjs` — manual isolated-Herdr supervision transport benchmark; raw samples stay in `/tmp/issue29-bench/`
@@ -77,6 +93,7 @@ Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing 
 When behavior changes, update every affected surface in the same commit:
 
 - public tool parameters, role-pack protocol, or lifecycle → `README.md`
+- automatic input/consent/config/ownership contract → `README.md`, ADR-0014 and affected contributor/policy surfaces; keep `config.json.example` disabled/model-neutral without consent or tuples
 - role-pack discovery, precedence, or collision policy → `docs/adr/0003-installable-role-packs.md`
 - worktree behavior, handoff, recovery, or cleanup → `docs/worktree-subagents.md`
 - agent operating expectations → relevant files in `agents/`
@@ -102,6 +119,20 @@ git diff --check
 
 Run LSP diagnostics on every changed TypeScript file; lint and tests do not catch every TypeScript error.
 
+Automatic-routing focused offline gates (use a parent test environment, not inherited
+`PI_SUBAGENT_ID`/`PI_HERDR_AUTO_ROUTING_DISABLED`):
+
+```bash
+node --experimental-strip-types --test test/auto-routing-*.test.ts test/jev-client.test.ts test/jev-questions.test.ts
+node --experimental-strip-types --test test/evals/jev-routing-*.test.mjs
+npm run test:eval:jev-routing
+```
+
+The evaluator is synthetic mechanical evidence, not achieved Jev/execution-model
+quality; thresholds remain uncalibrated. No network/live capture or automatic opt-in
+belongs in these tests or release checks. Separate live capture requires explicit
+egress approval outside the package.
+
 For Herdr or lifecycle changes, run the deterministic suite from inside Herdr. `test/integration/native-harness.test.ts` drives the offline native fixtures through real Herdr panes; it needs no Claude or Kiro credentials and never contacts a model. Run only one integration suite at a time on a Herdr instance; concurrent suites compete for terminal focus and process capacity and can cause false timeouts or leaked test resources.
 
 When a test reports that a `pi-integ-*` worktree path already exists, first check whether the same test already created that worktree and the deterministic provider dispatched the tool twice after asynchronous completion. Deterministic providers must make each requested tool call one-shot after its started result appears. Remove only verified test-owned residue after confirming that no workspace or process owns it.
@@ -110,12 +141,22 @@ When a test reports that a `pi-integ-*` worktree path already exists, first chec
 npm run test:integration
 ```
 
-Use `PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:integration:live` only for optional provider-compatibility smoke coverage. Do not use skipped Herdr tests as passing evidence.
+Focused real TUI command: `node --experimental-strip-types --test test/integration/auto-routing.test.ts`.
+Actual idle editor submission into an existing persisted session is routing evidence;
+direct registered-handler units and RPC are not routing proxies. Separate real RPC
+processes prove bypass. T10's isolated fake classifier/native setup must not resolve
+host Claude/Kiro or contact live Jev. Pi 0.99.1 queued idle local cancel and public
+`newSession` until awaited input resolved: these two scenarios are honest
+blockers/skips, not passes. Escape reached timeout, not cancellation. Keep prior
+implementation-time network incident evidence for parent disclosure; deterministic
+setup requirements do not rewrite history as globally network-free.
+
+Use `PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:integration:live` only for optional provider-compatibility smoke coverage. The automatic suite skips in live mode. Do not use skipped Herdr tests as passing evidence. Report pass/fail/skip counts, limitations and restored test-owned resource inventory; clean only verified test-owned residue after process/workspace ownership checks.
 
 Before committing:
 
 - inspect `git status` and the final diff;
-- confirm the package preview includes `CHANGELOG.md`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, and `skills/orchestrate/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, plans, journals, sessions, prototypes, generated evidence, local config, and `openspec/`;
+- confirm the package preview includes `CHANGELOG.md`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, and `skills/orchestrate/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, tests/evals/fixtures and generated captures, plans, journals, sessions, prototypes, generated evidence, local config, and `openspec/`;
 - run `npm pack --dry-run` when package contents or documentation paths changed; durable configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`, never package-root `config.json` (move old files manually or re-run `/subagents-init`);
 - confirm that no generated plans, journals, sessions, provider configuration, test scripts, or review artifacts are staged; and
 - confirm that no accidental empty directory exists at the repository root:
@@ -125,5 +166,9 @@ test -z "$(find . -mindepth 1 -maxdepth 1 -type d -empty -print)"
 ```
 
 ## Release safety
+
+Release verification must not enable auto routing, grant consent, approve tuples or
+collect live prompts. Off/reload blocks later egress/launch, not running children;
+unknown owned work requires explicit recovery, never automatic replay.
 
 Do not bump `package.json` merely to land documentation or implementation work. A version change on `main` triggers the release workflow. Never commit npm credentials, generated review artifacts, session artifacts, or local `config.json`.

@@ -33,7 +33,10 @@ prompt = args[-1]
 assert prompt.startswith("[pi-subagent-turn:")
 pathlib.Path(log).write_text(
     json.dumps({"harness": "claude", "args": args, "cwd": os.getcwd(), "tools": tools,
-                "resumed": resumed})
+                "resumed": resumed,
+                # Launch environment hygiene, observed by the child itself.
+                "typesafeKey": os.environ.get("TYPESAFE_API_KEY"),
+                "autoRoutingDisabled": os.environ.get("PI_HERDR_AUTO_ROUTING_DISABLED")})
 )
 model = args[args.index("--model") + 1] if "--model" in args else None
 failing = os.environ.get("FAKE_FAIL_MODEL", "").split(",")
