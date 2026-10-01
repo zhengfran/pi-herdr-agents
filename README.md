@@ -186,6 +186,7 @@ See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
 | **worker** | Leaf agent role | Config, then parent | Implements bounded tasks and verifies the result. |
 | **reviewer** | Leaf agent role | Config, then parent | Reviews changes for correctness, security, and maintainability. |
 | **visual-tester** | Leaf agent role | Config, then parent | Performs visual QA through the `chrome-cdp` skill. |
+| **researcher** | Leaf agent role | Config, then parent | Searches the web and returns a sourced brief through `pi-web-access` tools. |
 | **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, delegates independent work, and verifies. |
 | **adversarial-reviewer** | Coordinator role | Exact eligible authenticated Pi models selected by risk and project policy | Runs two routine or three high-risk discovery reviewers, candidate-dependent cross-family verification, and parent synthesis through public asynchronous children. |
 
@@ -201,6 +202,7 @@ creates a pane or worktree.
 Optional prerequisites fail closed and are not bundled:
 
 - `visual-tester` needs an external `chrome-cdp` skill that provides `scripts/cdp.mjs`.
+- `researcher` needs the [`pi-web-access`](https://www.npmjs.com/package/pi-web-access) package for `web_search`, `fetch_content`, `get_search_content`, and `source_check`; Pi ignores missing tool names, so without it the role reports the missing package instead of researching.
 - Adversarial review needs a resolved standalone `reviewer` role, confirmed human-only authorship or known author model families, and enough distinct exact authenticated Pi models to satisfy project author-family exclusion and cross-family verification. Routine discovery uses two distinct IDs; concrete high-risk surfaces use three distinct lenses. The parent materializes pinned evidence before public fan-out. A project-approved reduced topology must disclose omitted coverage.
 - `/plan` uses the bundled scout and planner roles and records ordered tasks in
   `plan.md`; it does not require a researcher role, todo tool, or `write-todos` skill.

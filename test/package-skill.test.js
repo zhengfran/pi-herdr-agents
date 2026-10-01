@@ -112,6 +112,7 @@ describe("bundled orchestration skill", () => {
 			"agents/adversarial-reviewer.md",
 			"agents/planner.md",
 			"agents/poteto.md",
+			"agents/researcher.md",
 			"agents/reviewer.md",
 			"agents/scout.md",
 			"agents/visual-tester.md",
