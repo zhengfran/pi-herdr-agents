@@ -820,7 +820,7 @@ describe("late exit confirmation closes accepted ordinary panes", () => {
 			);
 			testApi.closePaneAfterLateExit(child, {
 				harness: "claude",
-				markerFile: child.native.markerFile,
+				markerFile: child.sessionFile,
 				processExit: "unconfirmed",
 			});
 			await settle();
@@ -830,6 +830,130 @@ describe("late exit confirmation closes accepted ordinary panes", () => {
 			sendFailures.remaining = 0;
 		}
 	});
+
+	it("closes an ordinary pane once after an accepted watcher error", async (t) => {
+		if (!linux) return t.skip("exit confirmation uses /proc");
+		const project = scratch("late-thrown");
+		const herdr = useHerdr(
+			{
+				log: join(project, "..", "late-thrown.json"),
+				env: { FAKE_EXIT_AFTER_STOP: "1" },
+				waitForExit: true,
+			},
+			{
+				watch: {
+					// The settlement and the watcher's exit re-check both fail.
+					onTurnSettled(turn) {
+						if (turn.outcome === "completed")
+							throw new Error("injected settlement failure");
+					},
+					confirmExit() {
+						throw new Error("injected exit check failure");
+					},
+				},
+			},
+		);
+		await start(project, {
+			name: "late-thrown",
+			task: "Task",
+			agent: "native-claude",
+		});
+		const child = running("late-thrown");
+		assert.ok(child);
+		const result = await resultFor("late-thrown");
+		assert.match(result.content, /injected exit check failure/);
+		assert.equal(result.details.native.processExit, "confirmed");
+		await waitFor(() => herdr.closed.includes(child.surface));
+		await settle();
+		assert.deepEqual(herdr.closed, [child.surface], "closed once");
+	});
+
+	for (const failing of [false, true])
+		for (const rejected of [false, true])
+			it(`${rejected ? "keeps" : "closes"} a resumed pane when its ${failing ? "watcher error" : "result"} send is ${rejected ? "rejected" : "accepted"}`, async (t) => {
+				if (!linux) return t.skip("exit confirmation uses /proc");
+				const id = `resume-send-${failing ? "error" : "result"}-${rejected ? "rejected" : "accepted"}`;
+				const project = scratch(id);
+				useHerdr({ log: join(project, "..", `${id}-1.json`) });
+				await start(project, {
+					name: id,
+					task: "Task",
+					agent: "native-claude",
+				});
+				const first = await resultFor(id);
+				assert.equal(first.details.native.processExit, "confirmed");
+				const herdr = useHerdr(
+					{
+						log: join(project, "..", `${id}-2.json`),
+						env: { FAKE_EXIT_AFTER_STOP: "1" },
+						waitForExit: true,
+					},
+					failing
+						? {
+								watch: {
+									onTurnSettled(turn) {
+										if (turn.outcome === "completed")
+											throw new Error("injected settlement failure");
+									},
+									confirmExit() {
+										throw new Error("injected exit check failure");
+									},
+								},
+							}
+						: {},
+				);
+				const name = `${id}-2`;
+				let attempts = 0;
+				const unhandled: unknown[] = [];
+				const onUnhandled: NodeJS.UnhandledRejectionListener = (reason) =>
+					unhandled.push(reason);
+				process.on("unhandledRejection", onUnhandled);
+				beforeSend.hook = (message) => {
+					if (message.details?.name === name) attempts++;
+				};
+				sendFailures.match = (message) => message.details?.name === name;
+				sendFailures.remaining = rejected ? 1 : 0;
+				try {
+					const resumed = await resume(project, {
+						sessionPath: first.details.sessionFile,
+						name,
+						message: "Continue",
+					});
+					assert.equal(
+						resumed.details.status,
+						"started",
+						resumed.content[0].text,
+					);
+					const child = running(name);
+					assert.ok(child);
+					await waitFor(() => attempts > 0 && !running(name), 15_000);
+					await settle();
+					assert.equal(attempts, 1, "sent exactly once, never re-sent");
+					assert.deepEqual(unhandled, []);
+					const delivered = sent.filter(
+						(message) => message.details?.name === name,
+					);
+					if (rejected) {
+						assert.deepEqual(delivered, []);
+						assert.deepEqual(
+							herdr.closed,
+							[],
+							"a rejected result keeps its pane",
+						);
+					} else {
+						assert.equal(delivered.length, 1);
+						assert.equal(delivered[0].details.native.processExit, "confirmed");
+						if (failing)
+							assert.match(delivered[0].content, /Native resume error/);
+						assert.deepEqual(herdr.closed, [child.surface], "closed once");
+					}
+				} finally {
+					process.off("unhandledRejection", onUnhandled);
+					beforeSend.hook = undefined;
+					sendFailures.remaining = 0;
+					sendFailures.match = undefined;
+				}
+			});
 
 	it("keeps the pane when the parent never accepted the result", async (t) => {
 		if (!linux) return t.skip("descendant scans use /proc");
@@ -931,13 +1055,9 @@ describe("late exit confirmation closes accepted ordinary panes", () => {
 		});
 		const late = testApi.lateReleasedNativeRuns();
 		const released = (id: string, mode = "autonomous"): any => {
-			const child = {
-				id,
-				surface: `pane-${id}`,
-				native: { driver: { mode }, processRun: { id } },
-			};
-			late.add(child.native);
-			return child;
+			const native: any = { driver: { mode }, processRun: { id } };
+			late.add(native);
+			return { id, surface: `pane-${id}`, native };
 		};
 		const unconfirmed = released("unconfirmed");
 		confirm = () => ({ kind: "unconfirmed", reason: "still running" });

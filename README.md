@@ -1689,10 +1689,14 @@ lease, until exit is later confirmed; then the owned files and leases are
 released. After the parent accepts the result of an autonomous, non-persistent,
 non-nested run, it re-checks exit in the background with backoff (2 to 60
 seconds). It closes that run's ordinary pane once, after exit is confirmed.
-Interactive, persistent, nested, worktree and never-delivered runs keep their
-panes. The re-check lives in the parent process: it survives `/reload` but
-not a parent restart, and panes retained before a restart need manual
-cleanup. Parent shutdown does not terminate native children. Launch scripts
+If a re-check released the run before the result was accepted, the pane closes
+once at acceptance, after a fresh check confirms that exit again. A failed
+watcher whose exit a fresh check confirms closes its ordinary pane after its
+error result is accepted. Interactive, persistent, nested, worktree,
+suppressed and rejected (failed parent send) runs keep their panes. The
+re-check lives in the parent process: it survives `/reload` but not a parent
+restart, and panes retained before a restart need manual cleanup. Parent
+shutdown does not terminate native children. Launch scripts
 embed task text and are staged `0600` in `0700` directories created for them.
 A parent shutdown or a cancelled `subagent`/`subagent_resume` call, while a
 native launch still waits for its shell, stops the launch before its process

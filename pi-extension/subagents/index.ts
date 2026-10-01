@@ -5916,61 +5916,72 @@ async function resumeNativeSession(
 	startStatusRefresh(pi);
 	const watcherAbort = new AbortController();
 	running.abortController = watcherAbort;
+	// The pane closes only after an accepted send or a suppressed completion.
 	let closePane = false;
 	watchSubagent(running, watcherAbort.signal)
-		.then((result) => {
-			runningSubagents.delete(running.id);
-			updateWidget();
-			if (!shouldDeliverSubagentCompletion(running)) {
-				running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+		.then(
+			(result) => {
+				runningSubagents.delete(running.id);
+				updateWidget();
+				if (!shouldDeliverSubagentCompletion(running)) {
+					running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+					closePane = result.native?.processExit !== "unconfirmed";
+					return;
+				}
+				running.lifecycle = markDelivery(running.lifecycle, "delivered");
+				const details: SubagentResultDetails = {
+					name,
+					task: message,
+					agent: running.agent,
+					exitCode: result.exitCode,
+					elapsed: result.elapsed,
+					sessionFile: markerFile,
+				};
+				if (result.errorMessage) details.errorMessage = result.errorMessage;
+				if (result.worktree) details.worktree = result.worktree;
+				if (result.native) details.native = result.native;
+				sendSubagentResult(
+					selectCompletionApi(pi, runtime.pi),
+					resolveResultPresentation(result, name),
+					details,
+				);
 				closePane = result.native?.processExit !== "unconfirmed";
-				return;
-			}
-			running.lifecycle = markDelivery(running.lifecycle, "delivered");
-			const details: SubagentResultDetails = {
-				name,
-				task: message,
-				agent: running.agent,
-				exitCode: result.exitCode,
-				elapsed: result.elapsed,
-				sessionFile: markerFile,
-			};
-			if (result.errorMessage) details.errorMessage = result.errorMessage;
-			if (result.worktree) details.worktree = result.worktree;
-			if (result.native) details.native = result.native;
-			sendSubagentResult(
-				selectCompletionApi(pi, runtime.pi),
-				resolveResultPresentation(result, name),
-				details,
-			);
-			closePane = result.native?.processExit !== "unconfirmed";
-			closePaneAfterLateExit(running, result.native);
-		})
-		.catch((err) => {
-			runningSubagents.delete(running.id);
-			updateWidget();
-			// Release the session and worktree leases only after a fresh exit
-			// check; an unconfirmed run is retained for reconciliation.
-			const settlement = settleThrownNativeWatcher(running, run);
-			closePane = settlement.native.processExit === "confirmed";
-			if (!shouldDeliverSubagentCompletion(running)) return;
-			running.lifecycle = markDelivery(running.lifecycle, "delivered");
-			const details: SubagentResultDetails = {
-				name,
-				error: err?.message,
-				sessionFile: markerFile,
-				native: settlement.native,
-			};
-			if (settlement.worktree) details.worktree = settlement.worktree;
-			sendSubagentResult(
-				selectCompletionApi(pi, runtime.pi),
-				boundResultPresentation(
-					`Native resume error for "${name}": ${err?.message ?? String(err)}`,
-					formatNativeSessionReference(settlement.native),
-				),
-				details,
-			);
-			closePaneAfterLateExit(running, settlement.native);
+				closePaneAfterLateExit(running, result.native);
+			},
+			(err) => {
+				runningSubagents.delete(running.id);
+				updateWidget();
+				// Release the session and worktree leases only after a fresh exit
+				// check; an unconfirmed run is retained for reconciliation.
+				const settlement = settleThrownNativeWatcher(running, run);
+				const confirmed = settlement.native.processExit === "confirmed";
+				if (!shouldDeliverSubagentCompletion(running)) {
+					closePane = confirmed;
+					return;
+				}
+				running.lifecycle = markDelivery(running.lifecycle, "delivered");
+				const details: SubagentResultDetails = {
+					name,
+					error: err?.message,
+					sessionFile: markerFile,
+					native: settlement.native,
+				};
+				if (settlement.worktree) details.worktree = settlement.worktree;
+				sendSubagentResult(
+					selectCompletionApi(pi, runtime.pi),
+					boundResultPresentation(
+						`Native resume error for "${name}": ${err?.message ?? String(err)}`,
+						formatNativeSessionReference(settlement.native),
+					),
+					details,
+				);
+				closePane = confirmed;
+				closePaneAfterLateExit(running, settlement.native);
+			},
+		)
+		.catch(() => {
+			// A rejected parent send is never retried; the pane stays for
+			// inspection.
 		})
 		.finally(() => {
 			if (closePane) closeCompletedPanes([running.surface]);

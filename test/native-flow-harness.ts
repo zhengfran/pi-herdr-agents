@@ -54,8 +54,12 @@ interface SendFailures {
 
 /** Messages matching this predicate throw from sendMessage (transient failure). */
 export const sendFailures: SendFailures = { remaining: 0 };
+interface SendHook {
+	hook?: (message: any) => void;
+}
+
 /** Runs synchronously when sendMessage is entered, before any failure. */
-export const beforeSend: { hook?: (message: any) => void } = {};
+export const beforeSend: SendHook = {};
 /** Installed Pi skills reported by the mock API's getCommands(). */
 export const skillCommands: Array<{
 	name: string;
