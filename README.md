@@ -1358,7 +1358,7 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ## Native Claude Code and Kiro roles
 
 A role with `cli: claude` or `cli: kiro` runs the native interactive Claude Code
-TUI or Kiro CLI 2.24.x V2 (`kiro-cli chat --v2`) instead of Pi. Herdr placement,
+TUI or Kiro CLI 2.24-2.26 V2 (`kiro-cli chat --v2`) instead of Pi. Herdr placement,
 managed worktrees, the widget, and the bounded `subagent_result` delivery are
 shared with Pi-backed children. Every orchestrator prompt is a *tagged turn*
 settled only by its own correlated native hook receipt; terminal text and Herdr
@@ -1396,7 +1396,7 @@ You are a worker agent. ...
   `--system-prompt` when `system-prompt` is set, otherwise in the first turn.
   Kiro always places it in the owned profile prompt; `system-prompt: replace`
   is rejected.
-- Prerequisites: `claude` or `kiro-cli` 2.24.x on `PATH`, and `python3`
+- Prerequisites: `claude` or `kiro-cli` 2.24-2.26 on `PATH`, and `python3`
   (the lifecycle hooks use `fcntl`; the delegation bridge is a stdio MCP
   server in Python).
 

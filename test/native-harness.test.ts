@@ -223,10 +223,15 @@ describe("native harness capability validation", () => {
 
 	it("rejects an unsupported Kiro CLI version before launch", () => {
 		assert.throws(
-			() => assertKiroAvailable(() => "kiro-cli 2.25.0"),
-			/requires kiro-cli 2\.24\.x/,
+			() => assertKiroAvailable(() => "kiro-cli 2.27.0"),
+			/requires kiro-cli 2\.24-2\.26/,
+		);
+		assert.throws(
+			() => assertKiroAvailable(() => "kiro-cli 2.23.9"),
+			/requires kiro-cli 2\.24-2\.26/,
 		);
 		assert.doesNotThrow(() => assertKiroAvailable(() => "kiro-cli 2.24.7\n"));
+		assert.doesNotThrow(() => assertKiroAvailable(() => "kiro-cli 2.26.1\n"));
 	});
 });
 
