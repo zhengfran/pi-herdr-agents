@@ -22,7 +22,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNativeUuid } from "./claude.ts";
-import { isNonEmptyString } from "./type-guards.ts";
+import type { KiroMcpSelection } from "./kiro-mcp.ts";
+import { isNonEmptyString, isString } from "./type-guards.ts";
 import { errorReceiptFile, type ProcessRun } from "./process-run.ts";
 import { shellQuote } from "./terminal.ts";
 import type { NativeHookState, NativeTurnAdapter } from "./native-turns.ts";
@@ -30,6 +31,10 @@ import type { NativeHookState, NativeTurnAdapter } from "./native-turns.ts";
 export const kiroHookPath = join(
 	dirname(fileURLToPath(import.meta.url)),
 	"plugin/hooks/kiro-lifecycle.py",
+);
+export const kiroPersonalMcpProxyPath = join(
+	dirname(fileURLToPath(import.meta.url)),
+	"plugin/mcp/kiro-personal-mcp.py",
 );
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 export const KIRO_ACK_MS = 30_000;
@@ -45,6 +50,36 @@ const KIRO_TOOL_MAP = new Map([
 	["grep", "grep"],
 	["find", "glob"],
 ]);
+const KIRO_MCP_SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const OWNED_KIRO_MCP_SERVER = "pi-subagents";
+
+/** Exact personal MCP server names selected by one Kiro role. */
+export function kiroMcpServers(value: string | undefined): string[] {
+	if (!value?.trim()) return [];
+	const servers = value
+		.split(",")
+		.map((server) => server.trim())
+		.filter(Boolean);
+	const invalid = servers.filter(
+		(server) =>
+			!KIRO_MCP_SERVER_NAME.test(server) || server === OWNED_KIRO_MCP_SERVER,
+	);
+	if (invalid.length)
+		throw new Error(
+			`Kiro MCP server names must match ${KIRO_MCP_SERVER_NAME.source} and cannot use the reserved ${OWNED_KIRO_MCP_SERVER} server: ${invalid.join(", ")}.`,
+		);
+	if (new Set(servers).size !== servers.length)
+		throw new Error("Kiro MCP server allowlist contains a duplicate name.");
+	return servers;
+}
+
+/** Kiro tool patterns that expose only the selected personal MCP servers. */
+export function kiroMcpToolPatterns(servers: readonly string[]): string[] {
+	if (!Array.isArray(servers) || servers.some((server) => !isString(server)))
+		throw new Error("Kiro MCP server allowlist must contain only strings.");
+	const validated = kiroMcpServers(servers.join(","));
+	return validated.map((server) => `@${server}`);
+}
 
 /** Fail closed when a Pi tool allowlist cannot be represented natively. */
 export function kiroTools(tools: string | undefined): string[] {
@@ -122,6 +157,11 @@ export interface KiroState {
 	untracked_turns?: number;
 }
 
+interface KiroProfileMcpServer {
+	command: string;
+	args: string[];
+}
+
 export interface KiroRun {
 	harness: "kiro";
 	id: string;
@@ -132,6 +172,7 @@ export interface KiroRun {
 	createdDirs: string[];
 	stateFile: string;
 	configFile: string;
+	personalMcpConfigFile?: string;
 	/** Published by the owned hook, or the saved identity when resuming. */
 	nativeSessionId?: string;
 	/** Reopen this native session with --resume-id. */
@@ -195,6 +236,7 @@ export function prepareKiroRun(options: {
 	/** Saved profile name and session identity for native resume. */
 	resume?: { agentName: string; sessionId: string };
 	mcpServer?: { name: string; command: string; args: string[] };
+	personalMcp?: KiroMcpSelection;
 }): KiroRun {
 	mkdirSync(options.runDir, { recursive: true, mode: 0o700 });
 	const cwd = resolve(options.cwd);
@@ -246,14 +288,48 @@ export function prepareKiroRun(options: {
 			{ flag: "wx", mode: 0o600 },
 		);
 		const command = `python3 ${shellQuote(kiroHookPath)} ${shellQuote(run.configFile)}`;
-		const mcpServers = options.mcpServer
-			? {
-					[options.mcpServer.name]: {
-						command: options.mcpServer.command,
-						args: options.mcpServer.args,
-					},
-				}
-			: {};
+		const selectedTools = options.personalMcp
+			? kiroMcpToolPatterns(
+					options.personalMcp.servers.map((server) => server.name),
+				)
+			: [];
+		for (const tool of selectedTools)
+			if (!options.tools.includes(tool))
+				throw new Error(
+					`Kiro MCP server selector ${tool} is missing from the recorded native tools.`,
+				);
+		const unexpectedSelectors = options.tools.filter(
+			(tool) => tool.startsWith("@") && !selectedTools.includes(tool),
+		);
+		if (unexpectedSelectors.length)
+			throw new Error(
+				`Kiro MCP selectors have no owned server definition: ${unexpectedSelectors.join(", ")}.`,
+			);
+		const mcpServers: Record<string, KiroProfileMcpServer> = {};
+		if (options.personalMcp) {
+			run.personalMcpConfigFile = join(options.runDir, "personal-mcp.json");
+			writeFileSync(
+				run.personalMcpConfigFile,
+				`${JSON.stringify({ version: 1, ...options.personalMcp }, null, 2)}\n`,
+				{ flag: "wx", mode: 0o600 },
+			);
+			for (const server of options.personalMcp.servers) {
+				const profileServer: KiroProfileMcpServer = {
+					command: "python3",
+					args: [
+						kiroPersonalMcpProxyPath,
+						run.personalMcpConfigFile,
+						server.name,
+					],
+				};
+				mcpServers[server.name] = profileServer;
+			}
+		}
+		if (options.mcpServer)
+			mcpServers[options.mcpServer.name] = {
+				command: options.mcpServer.command,
+				args: options.mcpServer.args,
+			};
 		const tools = options.mcpServer
 			? [...options.tools, `@${options.mcpServer.name}`]
 			: options.tools;

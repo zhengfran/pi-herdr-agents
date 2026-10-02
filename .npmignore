@@ -1,4 +1,6 @@
 .pi/
+__pycache__/
+*.pyc
 openspec/
 test/
 docs/assets/

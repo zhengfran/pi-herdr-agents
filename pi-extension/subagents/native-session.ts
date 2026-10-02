@@ -18,7 +18,8 @@ import {
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { claudeTools, isNativeUuid } from "./claude.ts";
-import { kiroTools } from "./kiro.ts";
+import { kiroMcpToolPatterns, kiroTools } from "./kiro.ts";
+import { kiroMcpSelectionNames, type KiroMcpSelection } from "./kiro-mcp.ts";
 import {
 	confirmProcessExit,
 	defaultProcessInspector,
@@ -79,6 +80,8 @@ export interface NativeLoadout {
 	skills: NativeSkillRecord[];
 	/** Nested-spawn allowlist; null when the native child cannot delegate. */
 	spawnAgents: string[] | null;
+	/** Kiro-only personal MCP selection; contains no credential values. */
+	kiroMcp?: KiroMcpSelection;
 	kiroAgentName?: string;
 	lineage?: NativeLineageRecord;
 	worktree?: NativeWorktreeBinding;
@@ -185,10 +188,17 @@ export function verifyNativeSessionMarker(
 	// The native grant must be exactly the strict mapping of the recorded
 	// allowlist; anything else could widen what the resumed CLI may do.
 	try {
+		if (marker.harness === "claude" && loadout.kiroMcp !== undefined)
+			return "its Claude loadout unexpectedly contains Kiro MCP servers";
 		const mapped =
 			marker.harness === "claude"
 				? claudeTools(loadout.tools).split(",")
-				: kiroTools(loadout.tools);
+				: [
+						...kiroTools(loadout.tools),
+						...kiroMcpToolPatterns(
+							loadout.kiroMcp ? kiroMcpSelectionNames(loadout.kiroMcp) : [],
+						),
+					];
 		if (canonicalJson(mapped) !== canonicalJson(loadout.nativeTools))
 			return "its native tools do not match the strict mapping of its recorded allowlist";
 	} catch {

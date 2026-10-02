@@ -1138,4 +1138,56 @@ describe("native loadout integrity", () => {
 			null,
 		);
 	});
+
+	it("binds selected personal Kiro MCP servers to the native tool grant", async () => {
+		const { verifyNativeSessionMarker, loadoutSha256 } = await import(
+			"../pi-extension/subagents/native-session.ts"
+		);
+		const loadout = {
+			tools: "read",
+			nativeTools: ["fs_read", "@jira-connector", "@github-connector"],
+			model: null,
+			thinking: null,
+			promptMode: "append" as const,
+			identitySha256: null,
+			mode: "autonomous" as const,
+			sessionMode: "standalone" as const,
+			skills: [],
+			spawnAgents: null,
+			kiroMcp: {
+				sourceFile: "/tmp/mcp.json",
+				servers: [
+					{ name: "jira-connector", definitionSha256: "a".repeat(64) },
+					{ name: "github-connector", definitionSha256: "b".repeat(64) },
+				],
+			},
+			kiroAgentName: "pi-subagent-12345678-1234-4234-8234-123456789012",
+		};
+		const marker = {
+			version: 2 as const,
+			type: "native_session" as const,
+			harness: "kiro" as const,
+			nativeSessionId: SID,
+			sessionKey: "k",
+			runId: "k",
+			name: "n",
+			cwd: "/tmp",
+			createdAt: 0,
+			loadout,
+			loadoutSha256: loadoutSha256(loadout),
+		};
+		assert.equal(verifyNativeSessionMarker(marker), null);
+		const widened = {
+			...loadout,
+			nativeTools: [...loadout.nativeTools, "@confluence-connector"],
+		};
+		assert.match(
+			verifyNativeSessionMarker({
+				...marker,
+				loadout: widened,
+				loadoutSha256: loadoutSha256(widened),
+			}) ?? "",
+			/do not match the strict mapping/,
+		);
+	});
 });

@@ -1248,8 +1248,8 @@ collision rules, and rejected alternatives.
 - `/subagent list` shows the expected source and a smoke launch succeeds.
 
 Capability declarations are strict: use the unquoted, unindented keys
-`tools:`, `deny-tools:`, `spawn-agents:`, and `spawning:` exactly once when present. Declare
-`tools`, `deny-tools`, and `spawn-agents` as non-empty inline comma-separated scalars, and
+`tools:`, `deny-tools:`, `spawn-agents:`, `kiro-mcp-servers:`, and `spawning:` exactly once when present. Declare
+`tools`, `deny-tools`, `spawn-agents`, and `kiro-mcp-servers` as non-empty inline comma-separated scalars, and
 `spawning` as exactly `true` or `false`. YAML lists, containers, multiline
 values, quotes, comments, empty values, duplicates, noncanonical key spelling,
 and invalid booleans are rejected. A role with an invalid capability declaration
@@ -1280,6 +1280,7 @@ Compare definitions against the reference below and verify them with
 | `disable-model-invocation` | boolean | Hide a role from discovery surfaces like `subagents_list`. The definition remains directly invocable by exact name via `subagent({ agent: "name", ... })`. |
 | `cli`         | string  | Optional native harness: `claude` or `kiro`. Omit for Pi-backed roles. Other values fail closed. It is the role's default harness; a spawn's `harness` can select another one. See [Native Claude Code and Kiro roles](#native-claude-code-and-kiro-roles) and [Spawn-time harness selection](#spawn-time-harness-selection). |
 | `spawn-agents` | string | Native roles only: one inline comma-separated allowlist of roles the native child may delegate to through its owned bridge (see [Nested delegation](#nested-delegation)). Pi-backed roles declaring it are rejected. |
+| `kiro-mcp-servers` | string | Kiro roles only: exact comma-separated configured Kiro MCP server names exposed through `@server` tool selectors. `includeMcpJson` remains false; Pi/Claude roles, invalid or duplicate names, and the reserved `pi-subagents` name are rejected. |
 
 ---
 
@@ -1384,8 +1385,30 @@ You are a worker agent. ...
   `write`+`edit→fs_write` (both required), `bash→execute_bash`, `grep`,
   `find→glob`. Any other tool fails closed. Approval prompts are bypassed only
   for this mapped set. Claude loads no MCP servers except the owned delegation
-  bridge (`--strict-mcp-config`); the Kiro profile sets `includeMcpJson: false`
-  and lists only that bridge, if any.
+  bridge (`--strict-mcp-config`). The Kiro profile keeps `includeMcpJson: false`.
+  By default it lists only that owned bridge, if any; a Kiro role may additionally
+  expose exact stdio servers from the user's global
+  `~/.kiro/settings/mcp.json` with `kiro-mcp-servers: server-a, server-b`. The
+  profile adds only the corresponding `@server-a` / `@server-b` selectors and
+  owned proxy definitions for those names. The proxy re-reads the personal
+  configuration at server start, verifies a loadout-bound digest of command,
+  arguments and environment key names, then launches with a minimal inherited
+  process environment plus the definition's live values. The inherited set is
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, temporary-directory and locale
+  variables, XDG paths, and `SSL_CERT_FILE`/`SSL_CERT_DIR`; proxy, custom CA,
+  cloud and Git settings must be declared explicitly in the server's `env`.
+  The native run owner, Herdr/Pi internals and unrelated inherited credentials
+  are not forwarded. Selected server processes are deliberately outside the
+  managed run's durable process identity, so exit confirmation does not account
+  for a server that outlives Kiro. Secrets are never copied into the checkout
+  profile or native marker; absent,
+  disabled, unsupported or changed definitions fail closed. Values—including
+  credentials, endpoints and application-specific behavior—may rotate because
+  all values are excluded from the digest; generic executable-search, loader and
+  managed-run environment keys are rejected. Remote URL servers and definitions
+  requiring `timeout` or `disabledTools` passthrough are not supported. Because native runs
+  use `--trust-all-tools`, every tool from an allowed server is non-interactive
+  and must be treated as an explicit external-action capability.
 - `model` is a native CLI model ID, an ordered comma-separated native list, or
   `task:<category>` from `models.native.<cli>.tasks` (see
   [Native models and fallback](#native-models-and-fallback)). Pi model config
@@ -1524,8 +1547,9 @@ reject `subagent_send`.
 Every fresh native run writes a v2 marker with its complete loadout and a
 SHA-256 integrity hash. The loadout covers tools and their native mapping,
 model, thinking, prompt mode, role-identity hash (identity text in a 0600
-file), mode, session mode, skills, nested-spawn allowlist, Kiro agent name,
-lineage, and worktree binding.
+file), mode, session mode, skills, nested-spawn allowlist, selected Kiro MCP
+server names and non-secret definition digests, Kiro agent name, lineage, and
+worktree binding.
 `subagent_resume({ sessionPath: <marker>, message, name? })` replays exactly
 that loadout, including its recorded mode: it never reads the current role and
 cannot widen or narrow anything. An `autoExit` that disagrees with the recorded
@@ -1656,6 +1680,8 @@ carries the run's owner token. It then launches the role only when it is on
 the allowlist, has an explicit `tools` allowlist within the requester's own
 tools, is `auto-exit: true`, and is not persistent. The launch is a standalone
 ordinary-pane leaf in the requester's cwd with every spawning tool denied.
+Roles declaring `kiro-mcp-servers` are not eligible for nested delegation;
+external MCP capability is never inherited or introduced by the bridge.
 Limits are 4 concurrent and 16 total per run. The nested result
 returns to the requester as one correlated follow-up turn marked as untrusted
 data; an autonomous requester does not exit while results are owed. If the
@@ -1669,15 +1695,17 @@ same-user process that reads the run's 0600 files.
 Rejected before any pane, workspace, or worktree is created: Pi child tools
 (`caller_ping`, `subagent_done`) and Pi orchestration tools in `tools`;
 unmappable tools; `cli-model`; unknown `cli` values; unsupported thinking
-levels; `system-prompt: replace` for Kiro; `spawning: true` without
-`spawn-agents`; delegation by persistent specialists or without `/proc`;
+levels; `system-prompt: replace` for Kiro; invalid/duplicate
+`kiro-mcp-servers`, that field on Pi or Claude roles, or the reserved
+`pi-subagents` server name; `spawning: true` without `spawn-agents`;
+delegation by persistent specialists or without `/proc`;
 unknown task categories or missing native candidates; Pi provider/model refs;
 uninstalled or non-portable skills; fork without a persisted parent session;
 and initial prompts over 120 KiB. `deny-tools` has no effect because the native
 tool set is exactly the mapped allowlist. Spawn-time harness selection adds:
 `harness` without `agent`; an unresolved role; switching a role with a pinned
-`model` without an explicit destination model; and a role with `spawn-agents`
-projected to Pi.
+`model` without an explicit destination model; a role with `spawn-agents`
+projected to Pi; and a role with `kiro-mcp-servers` projected away from Kiro.
 
 ### Receipts, ownership, and cleanup
 

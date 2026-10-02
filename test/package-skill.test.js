@@ -130,6 +130,7 @@ describe("bundled orchestration skill", () => {
 			"pi-extension/subagents/native-harness.ts",
 			"pi-extension/subagents/claude.ts",
 			"pi-extension/subagents/kiro.ts",
+			"pi-extension/subagents/kiro-mcp.ts",
 			"pi-extension/subagents/process-run.ts",
 			"pi-extension/subagents/plugin/hooks/claude-lifecycle.py",
 			"pi-extension/subagents/plugin/hooks/kiro-lifecycle.py",
@@ -138,6 +139,7 @@ describe("bundled orchestration skill", () => {
 			"pi-extension/subagents/native-context.ts",
 			"pi-extension/subagents/native-bridge.ts",
 			"pi-extension/subagents/plugin/mcp/subagent-bridge.py",
+			"pi-extension/subagents/plugin/mcp/kiro-personal-mcp.py",
 		]) {
 			assert.equal(
 				packageFiles.has(path),
@@ -146,8 +148,10 @@ describe("bundled orchestration skill", () => {
 			);
 		}
 		for (const path of packageFiles) {
-			// The removed legacy Claude plugin adapter must not return.
+			// The removed legacy Claude plugin adapter and generated Python cache
+			// artifacts must not return.
 			assert.doesNotMatch(path, /(^|\/)\.claude-plugin(?:\/|$)/);
+			assert.doesNotMatch(path, /(^|\/)__pycache__(?:\/|$)|\.pyc$/);
 		}
 		assert.equal(
 			packageFiles.has("pi-extension/subagents/workflow-worker.js"),

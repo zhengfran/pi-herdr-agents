@@ -32,12 +32,19 @@ import {
 	cleanupKiroRun,
 	kiroAdapter,
 	kiroCommand,
+	kiroMcpServers,
+	kiroMcpToolPatterns,
 	kiroTools,
 	prepareKiroRun,
 	validateKiroProfile,
 	type ExecFile,
 	type KiroRun,
 } from "./kiro.ts";
+import {
+	revalidateKiroMcpSelection,
+	resolveKiroMcpSelection,
+	type KiroMcpSelection,
+} from "./kiro-mcp.ts";
 import {
 	confirmProcessExit,
 	createProcessRun,
@@ -149,6 +156,8 @@ export interface NativeRoleDefinition {
 	spawning?: boolean;
 	/** Comma-separated roles this native child may delegate to. */
 	spawnAgents?: string;
+	/** Kiro only: exact personal MCP server names exposed through @server tools. */
+	kiroMcpServers?: string;
 	persistent?: boolean;
 	autoExit?: boolean;
 	interactive?: boolean;
@@ -199,6 +208,8 @@ export interface NativeLaunchSpec {
 	skills: string[];
 	/** Nested-spawn allowlist, or null when delegation is not granted. */
 	spawnAgents: string[] | null;
+	/** Exact personal Kiro MCP server names, or null on other harnesses. */
+	kiroMcpServers: string[] | null;
 }
 
 export class NativeCapabilityError extends Error {
@@ -289,10 +300,25 @@ export function resolveNativeLaunchSpec(
 		fail(
 			`cannot receive Pi orchestration tools (${spawningTools.join(", ")}). Remove them from tools; grant nested delegation with a spawn-agents allowlist instead.`,
 		);
+	if (role.cli === "claude" && role.kiroMcpServers?.trim())
+		fail(
+			"cannot use kiro-mcp-servers on Claude Code; it is a Kiro-only capability.",
+		);
+	let selectedKiroMcpServers: string[] = [];
+	if (role.cli === "kiro")
+		try {
+			selectedKiroMcpServers = kiroMcpServers(role.kiroMcpServers);
+		} catch (error) {
+			fail(
+				`has invalid kiro-mcp-servers: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	let nativeTools: string[] = [];
 	try {
 		nativeTools =
-			role.cli === "claude" ? claudeTools(tools).split(",") : kiroTools(tools);
+			role.cli === "claude"
+				? claudeTools(tools).split(",")
+				: [...kiroTools(tools), ...kiroMcpToolPatterns(selectedKiroMcpServers)];
 	} catch (error) {
 		fail(
 			`requires a strictly mappable tools allowlist: ${error instanceof Error ? error.message : String(error)}`,
@@ -359,6 +385,10 @@ export function resolveNativeLaunchSpec(
 		sessionMode,
 		skills: parseSkillNames(overrides.skills ?? role.skills),
 		spawnAgents: spawnAgents.length ? spawnAgents : null,
+		kiroMcpServers:
+			role.cli === "kiro" && selectedKiroMcpServers.length
+				? selectedKiroMcpServers
+				: null,
 	};
 }
 
@@ -419,6 +449,8 @@ export interface NativeLaunchPlan {
 		parentSessionFile: string;
 		context?: InheritedContext;
 	};
+	/** Selected personal Kiro MCP definitions, with no credential values. */
+	kiroMcp?: KiroMcpSelection;
 	/** Complete initial turn text, before the per-turn tag. */
 	initialText: string;
 }
@@ -434,6 +466,8 @@ export interface NativePlanContext {
 	inspector?: Pick<ProcessInspector, "procRoot">;
 	/** Pre-rendered parent context entries (tests); defaults to the file. */
 	parentEntries?: () => readonly any[];
+	/** Test/config override; defaults to ~/.kiro/settings/mcp.json. */
+	kiroMcpConfigFile?: string;
 	/**
 	 * Private directory for content-addressed skill snapshots. Without it,
 	 * skills with supporting files are rejected.
@@ -481,6 +515,19 @@ export function planNativeLaunch(
 			);
 	// Persistent specialists never advance to another model after launch.
 	if (spec.mode === "persistent") models = models.slice(0, 1);
+
+	let kiroMcp: KiroMcpSelection | undefined;
+	if (spec.kiroMcpServers?.length) {
+		try {
+			kiroMcp = resolveKiroMcpSelection(spec.kiroMcpServers, {
+				sourceFile: context.kiroMcpConfigFile,
+			});
+		} catch (error) {
+			fail(
+				`cannot load its selected personal MCP servers: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
 
 	if (
 		spec.spawnAgents &&
@@ -547,7 +594,7 @@ export function planNativeLaunch(
 		fail(
 			`cannot deliver a ${bytes}-byte initial prompt; the native limit is ${MAX_INITIAL_PROMPT_BYTES} bytes including role, skills, and inherited context.`,
 		);
-	return { spec, models, skills, lineage, initialText };
+	return { spec, models, skills, lineage, kiroMcp, initialText };
 }
 
 export interface NativeRun {
@@ -586,6 +633,8 @@ export interface NativeResumeRequest {
 	markerFile: string;
 	message: string;
 	mode: "autonomous" | "interactive";
+	/** Revalidated personal Kiro MCP definitions, with no credential values. */
+	kiroMcp?: KiroMcpSelection;
 }
 
 /**
@@ -720,6 +769,7 @@ export function prepareNativeRun(options: {
 		const spec = plan?.spec;
 		const tools = loadout?.tools ?? spec!.tools;
 		const nativeTools = loadout?.nativeTools ?? spec!.nativeTools;
+		const kiroMcp = resume?.kiroMcp ?? plan?.kiroMcp;
 		const thinking = loadout ? loadout.thinking : spec!.thinking;
 		const promptMode = loadout ? loadout.promptMode : spec!.promptMode;
 		// Claude receives the identity through its prompt channel only when the
@@ -758,6 +808,7 @@ export function prepareNativeRun(options: {
 						}
 					: undefined,
 				mcpServer: run.bridge?.server,
+				personalMcp: kiroMcp,
 			});
 			command = kiroCommand(run.kiro, tagged, { model, thinking });
 		}
@@ -807,7 +858,14 @@ export function prepareNativeRun(options: {
 				}),
 				spawnAgents,
 			};
-			if (run.kiro) newLoadout.kiroAgentName = run.kiro.profileName;
+			if (run.kiro) {
+				newLoadout.kiroAgentName = run.kiro.profileName;
+				if (kiroMcp)
+					newLoadout.kiroMcp = {
+						sourceFile: kiroMcp.sourceFile,
+						servers: kiroMcp.servers.map((server) => ({ ...server })),
+					};
+			}
 			if (lineage) newLoadout.lineage = lineage;
 			if (options.worktree) newLoadout.worktree = options.worktree;
 			// A marker, not a fabricated Pi transcript: it anchors identity,
@@ -852,7 +910,11 @@ export function prepareNativeRun(options: {
 }
 
 export type NativeResumeCheck =
-	| { ok: true; marker: NativeSessionMarker }
+	| {
+			ok: true;
+			marker: NativeSessionMarker;
+			kiroMcp?: KiroMcpSelection;
+	  }
 	| { ok: false; error: string };
 
 /**
@@ -880,13 +942,24 @@ export function checkNativeResume(
 			error:
 				"its nested-spawn grant needs verified process ownership (Linux /proc)",
 		};
+	let kiroMcp: KiroMcpSelection | undefined;
+	if (current.loadout.kiroMcp) {
+		try {
+			kiroMcp = revalidateKiroMcpSelection(current.loadout.kiroMcp);
+		} catch (error) {
+			return {
+				ok: false,
+				error: `its personal Kiro MCP grant is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
 	const lease = inspectNativeSessionLease(markerFile, inspector);
 	if (lease.kind === "held" || lease.kind === "invalid")
 		return {
 			ok: false,
 			error: `the native session is still leased: ${lease.reason}`,
 		};
-	return { ok: true, marker: current };
+	return { ok: true, marker: current, kiroMcp };
 }
 
 /** Native session identity, from the parent choice (Claude) or owned hook (Kiro). */

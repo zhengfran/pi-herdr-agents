@@ -61,6 +61,12 @@ writeRole("native-claude", [
 	"tools: read, bash",
 ]);
 writeRole("native-kiro", ["cli: kiro", "auto-exit: true", "tools: read"]);
+writeRole("native-mcp", [
+	"cli: kiro",
+	"auto-exit: true",
+	"tools: read",
+	"kiro-mcp-servers: jira-connector",
+]);
 writeRole("native-persistent", [
 	"cli: claude",
 	"persistent: true",
@@ -953,6 +959,7 @@ describe("native nested delegation", () => {
 					"pi-open",
 					"native-persistent",
 					"native-interactive",
+					"native-mcp",
 					"native-delegator",
 				],
 				cwd: project,
@@ -982,6 +989,7 @@ describe("native nested delegation", () => {
 				["pi-open", /no explicit tools allowlist/],
 				["native-persistent", /persistent roles/],
 				["native-interactive", /only autonomous/],
+				["native-mcp", /nested roles cannot receive external MCP/],
 				["native-delegator", /its own role/],
 			] as const) {
 				const response = await testApi.handleNestedSpawnRequest(

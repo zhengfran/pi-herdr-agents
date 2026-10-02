@@ -288,6 +288,8 @@ const CAPABILITY_KEYS = new Set([
 	"interactive",
 	"spawnagents",
 	"spawn-agents",
+	"kiromcpservers",
+	"kiro-mcp-servers",
 	"systemprompt",
 	"system-prompt",
 	"env",

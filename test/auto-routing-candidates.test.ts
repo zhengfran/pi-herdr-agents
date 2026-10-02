@@ -86,6 +86,7 @@ writeRole("ar-lineage", [...LEAF, "session-mode: lineage-only"]);
 writeRole("ar-hidden", [...LEAF, "disable-model-invocation: true"]);
 writeRole("ar-skilled", [...LEAF, "skills: ar-skill"]);
 writeRole("ar-skilled-claude", ["cli: claude", ...LEAF, "skills: ar-skill"]);
+writeRole("ar-mcp", ["cli: kiro", ...LEAF, "kiro-mcp-servers: jira-connector"]);
 
 const SKILL_BODY = "SECRET-SKILL-BODY: read notes.md first.";
 const skillRoot = scratch("ar-skills");
@@ -693,6 +694,7 @@ describe("automatic candidate snapshot", () => {
 			["interactive", "ar-interactive", /not an autonomous, standalone/],
 			["notools", "ar-notools", /not a declared leaf/],
 			["lineage", "ar-lineage", /not an autonomous, standalone/],
+			["mcp", "ar-mcp", /personal Kiro MCP servers/],
 		] as const;
 		const config = enabled(
 			[
@@ -701,7 +703,9 @@ describe("automatic candidate snapshot", () => {
 			],
 			[
 				...agents.map(([id], index) =>
-					tuple(`${id}-pi`, id, "pi", "fake/exact-2", "high", index),
+					id === "mcp"
+						? tuple("mcp-kiro", id, "kiro", "kiro-dest-2", "high", index)
+						: tuple(`${id}-pi`, id, "pi", "fake/exact-2", "high", index),
 				),
 				tuple("hidden-pi", "hidden", "pi", "fake/exact-2", "high", 99),
 			],
@@ -714,8 +718,9 @@ describe("automatic candidate snapshot", () => {
 			result.filtered.map((entry) => [entry.approvalId, entry]),
 		);
 		for (const [id, , message] of agents) {
-			assert.equal(byId.get(`${id}-pi`)?.reason, "role-ineligible", id);
-			assert.match(byId.get(`${id}-pi`)!.detail, message, id);
+			const tupleId = id === "mcp" ? "mcp-kiro" : `${id}-pi`;
+			assert.equal(byId.get(tupleId)?.reason, "role-ineligible", id);
+			assert.match(byId.get(tupleId)!.detail, message, id);
 		}
 		// A hidden role never runs automatically, even when approved by name.
 		assert.equal(byId.get("hidden-pi")?.reason, "role-hidden");

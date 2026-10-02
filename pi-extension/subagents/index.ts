@@ -486,6 +486,8 @@ interface AgentDefaults {
 	spawning?: boolean;
 	/** Native roles only: comma-separated roles this child may delegate to. */
 	spawnAgents?: string;
+	/** Kiro roles only: exact personal MCP server names exposed to the child. */
+	kiroMcpServers?: string;
 	persistent?: boolean;
 	autoExit?: boolean;
 	interactive?: boolean;
@@ -800,6 +802,12 @@ function resolveRoleProjection(
 			error: "harness-projection-unsupported",
 			message: `Role "${role.name}" declares spawn-agents (native nested delegation), which has no equivalent bounded Pi policy. Run it on its ${roleHarness} harness, or use a role without spawn-agents.`,
 		};
+	if (role.kiroMcpServers && (roleHarness !== "kiro" || harness !== "kiro"))
+		return {
+			ok: false,
+			error: "harness-projection-unsupported",
+			message: `Role "${role.name}" declares kiro-mcp-servers, which is valid only when both the role and selected harness are Kiro. Use a Kiro role on Kiro, or a role without personal Kiro MCP access.`,
+		};
 	const projected: ListedAgentDefinition = { ...role, model: undefined };
 	if (harness === "pi") delete projected.cli;
 	else projected.cli = harness;
@@ -844,7 +852,8 @@ type CapabilityField =
 	| "deny-tools"
 	| "spawning"
 	| "persistent"
-	| "spawn-agents";
+	| "spawn-agents"
+	| "kiro-mcp-servers";
 
 function isCapabilityDeclaration(
 	line: string,
@@ -882,6 +891,7 @@ function validateCapabilityDeclarations(
 		"spawning",
 		"persistent",
 		"spawn-agents",
+		"kiro-mcp-servers",
 	] as const) {
 		const declarations = getCapabilityDeclarations(frontmatter, field);
 		if (declarations.hasNoncanonical) {
@@ -963,6 +973,7 @@ function parseAgentDefinition(
 			getFrontmatterValue(frontmatter, "spawning"),
 		),
 		spawnAgents: getFrontmatterValue(frontmatter, "spawn-agents"),
+		kiroMcpServers: getFrontmatterValue(frontmatter, "kiro-mcp-servers"),
 		persistent: parseOptionalBoolean(
 			getFrontmatterValue(frontmatter, "persistent"),
 		),
@@ -1024,10 +1035,17 @@ function nativeCliDiagnostic(
 		getFrontmatterValue(frontmatter, "name") ?? agentName;
 	if (!cli && !cliModel) {
 		// Pi-backed roles delegate with Pi's own tools and spawning policy.
-		return getFrontmatterValue(frontmatter, "spawn-agents")
+		if (getFrontmatterValue(frontmatter, "spawn-agents"))
+			return {
+				code: "native-harness-unsupported",
+				message: `Role "${resolvedAgentName}" declares spawn-agents in ${path}, which applies only to native roles (cli: claude or cli: kiro). Pi-backed roles use spawning and deny-tools.`,
+				path,
+				agentName: resolvedAgentName,
+			};
+		return getFrontmatterValue(frontmatter, "kiro-mcp-servers")
 			? {
 					code: "native-harness-unsupported",
-					message: `Role "${resolvedAgentName}" declares spawn-agents in ${path}, which applies only to native roles (cli: claude or cli: kiro). Pi-backed roles use spawning and deny-tools.`,
+					message: `Role "${resolvedAgentName}" declares kiro-mcp-servers in ${path}, which applies only to cli: kiro roles.`,
 					path,
 					agentName: resolvedAgentName,
 				}
@@ -1083,6 +1101,7 @@ function toNativeRoleDefinition(
 		thinking: agent.thinking,
 		spawning: agent.spawning,
 		spawnAgents: agent.spawnAgents,
+		kiroMcpServers: agent.kiroMcpServers,
 		persistent: agent.persistent,
 		autoExit: agent.autoExit,
 		interactive: agent.interactive,
@@ -4400,6 +4419,10 @@ async function handleNestedSpawnRequest(
 		);
 	const role = loadAgentDefaults(request.agent, pi);
 	if (!role) return reject(`agent "${request.agent}" is not available.`);
+	if (role.kiroMcpServers?.trim())
+		return reject(
+			`agent "${request.agent}" declares personal Kiro MCP servers; nested roles cannot receive external MCP capabilities.`,
+		);
 	const tools = (role.tools ?? "")
 		.split(",")
 		.map((tool) => tool.trim())
@@ -5909,7 +5932,13 @@ async function resumeNativeSession(
 				agentDir: getAgentConfigDir(),
 			},
 			behavior: { interactive: mode === "interactive" },
-			resume: { marker: check.marker, markerFile, message, mode },
+			resume: {
+				marker: check.marker,
+				markerFile,
+				message,
+				mode,
+				kiroMcp: check.kiroMcp,
+			},
 			boundWorktree,
 			signal,
 		});
@@ -6128,6 +6157,8 @@ interface PreparationReads {
 	catalog?: AgentCatalog;
 	installedSkills?: () => InstalledSkill[];
 	nativeOperations?: NativeHarnessOperations;
+	/** Test seam for a hermetic personal Kiro MCP configuration. */
+	kiroMcpConfigFile?: string;
 }
 
 /** Per-call launch options that are not tool parameters. */
@@ -6337,9 +6368,10 @@ function autoLaunchIneligibility(
 		tools.length === 0 ||
 		tools.some((tool) => SPAWNING_TOOLS.has(tool)) ||
 		agentDefs.spawning !== false ||
-		agentDefs.spawnAgents?.trim()
+		agentDefs.spawnAgents?.trim() ||
+		agentDefs.kiroMcpServers?.trim()
 	)
-		return `Role "${name}" is not a declared leaf (explicit tools without orchestration tools, spawning: false, no spawn-agents); an automatic spawn never strips a role capability.`;
+		return `Role "${name}" is not a declared leaf (explicit tools without orchestration tools, spawning: false, no spawn-agents or personal Kiro MCP servers); an automatic spawn never strips a role capability.`;
 	return undefined;
 }
 
@@ -6513,6 +6545,15 @@ function prepareSubagentRun(
 	// before the Herdr check and before any Herdr resource exists.
 	let nativePlan: NativeLaunchPlan | undefined;
 	if (nativeSpec) {
+		// Leaf-producing callers must reject external MCP capability rather than
+		// silently narrowing a role that declared it.
+		if (forceLeaf && nativeSpec.kiroMcpServers?.length)
+			return rejected(
+				nativeProjectionError(
+					selection,
+					"cannot force a role with personal Kiro MCP servers into leaf mode.",
+				),
+			);
 		// Nested children are leaves: a delegated native child never delegates.
 		if (forceLeaf) nativeSpec.spawnAgents = null;
 		try {
@@ -6525,6 +6566,7 @@ function prepareSubagentRun(
 				snapshotRoot: nativeSkillSnapshotRoot(ctx),
 				nativeTasks: modelConfig.native,
 				isPiModelRef: (value) => isPiModelRef(ctx.modelRegistry, value),
+				kiroMcpConfigFile: reads.kiroMcpConfigFile,
 			});
 		} catch (error) {
 			return rejected(

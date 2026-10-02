@@ -353,6 +353,7 @@ describe("parseAutoRoutingConfig", () => {
 			"persistent",
 			"interactive",
 			"spawnAgents",
+			"kiroMcpServers",
 			"systemPrompt",
 			"env",
 			"permissions",

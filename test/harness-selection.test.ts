@@ -129,6 +129,24 @@ writeRole("hs-kiro-pinned", [
 	"auto-exit: true",
 	"tools: read",
 ]);
+writeRole("hs-kiro-mcp", [
+	"cli: kiro",
+	"auto-exit: true",
+	"tools: read",
+	"kiro-mcp-servers: jira-connector",
+]);
+writeRole("hs-claude-mcp-invalid", [
+	"cli: claude",
+	"auto-exit: true",
+	"tools: read",
+	"kiro-mcp-servers: jira-connector",
+]);
+writeRole("hs-kiro-mcp-missing", [
+	"cli: kiro",
+	"auto-exit: true",
+	"tools: read",
+	"kiro-mcp-servers: definitely-not-configured",
+]);
 writeRole("hs-delegator", [
 	"cli: claude",
 	"auto-exit: true",
@@ -339,6 +357,94 @@ describe("harness selection rejects before any Herdr resource", () => {
 		assert.equal(result.details.error, "harness-projection-unsupported");
 		assert.match(textOf(result), /spawn-agents/);
 		assert.match(textOf(result), /no equivalent bounded Pi policy/);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("rejects personal Kiro MCP capability projected to another harness", async () => {
+		const project = scratch("hs-kiro-mcp");
+		const herdr = useHerdr({ log: join(project, "..", "kiro-mcp.json") });
+		for (const harness of ["pi", "claude"] as const) {
+			const result = await testApi.startSubagentRun(
+				api,
+				{
+					name: `hs-kiro-mcp-${harness}`,
+					task: "Task",
+					agent: "hs-kiro-mcp",
+					harness,
+					model: harness === "pi" ? "fake/pi-a" : "sonnet",
+				},
+				piCtx(project),
+			);
+			assert.equal(result.details.error, "harness-projection-unsupported");
+			assert.match(textOf(result), /kiro-mcp-servers/);
+		}
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("never activates Kiro MCP access declared on a Claude role through projection", async () => {
+		const project = scratch("hs-claude-mcp-invalid");
+		const herdr = useHerdr({ log: join(project, "..", "claude-mcp.json") });
+		const result = await testApi.startSubagentRun(
+			api,
+			{
+				name: "hs-claude-mcp-invalid",
+				task: "Task",
+				agent: "hs-claude-mcp-invalid",
+				harness: "kiro",
+				model: "kiro-model",
+			},
+			piCtx(project),
+		);
+		assert.equal(result.details.error, "native-harness-unsupported");
+		assert.match(textOf(result), /Kiro-only capability/);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("rejects an unavailable personal Kiro MCP server before Herdr resources", () => {
+		const project = scratch("hs-kiro-mcp-missing");
+		const herdr = useHerdr({
+			log: join(project, "..", "kiro-mcp-missing.json"),
+		});
+		const configFile = join(project, "personal-mcp.json");
+		writeFileSync(configFile, JSON.stringify({ mcpServers: {} }));
+		const result = testApi.prepareSubagentRun(
+			api,
+			{
+				name: "hs-kiro-mcp-missing",
+				task: "Task",
+				agent: "hs-kiro-mcp-missing",
+			},
+			piCtx(project),
+			{},
+			{ kiroMcpConfigFile: configFile },
+		);
+		assert.equal(result.ok, false);
+		assert.ok(!result.ok);
+		assert.equal(result.result.details.error, "native-harness-unsupported");
+		assert.match(textOf(result.result), /not present/);
+		assert.deepEqual(herdr.events, []);
+	});
+
+	it("rejects personal Kiro MCP capability at the leaf-enforcement boundary", () => {
+		const project = scratch("hs-kiro-mcp-leaf");
+		const herdr = useHerdr({ log: join(project, "..", "kiro-mcp-leaf.json") });
+		const configFile = join(project, "personal-mcp.json");
+		writeFileSync(
+			configFile,
+			JSON.stringify({
+				mcpServers: { "jira-connector": { command: "jira-server" } },
+			}),
+		);
+		const result = testApi.prepareSubagentRun(
+			api,
+			{ name: "hs-kiro-mcp-leaf", task: "Task", agent: "hs-kiro-mcp" },
+			piCtx(project),
+			{ forceLeaf: true },
+			{ kiroMcpConfigFile: configFile },
+		);
+		assert.equal(result.ok, false);
+		assert.ok(!result.ok);
+		assert.match(textOf(result.result), /cannot force .* personal Kiro MCP/i);
 		assert.deepEqual(herdr.events, []);
 	});
 

@@ -122,6 +122,25 @@ with assets above 256 KiB (512 KiB total). A skill is also rejected when it
 contains links or special files, declares tools the role lacks, has supporting
 files without `read`, or ships scripts without `bash`.
 
+**Selected Kiro MCP servers.** A Kiro role may expose exact configured personal
+MCP server names through a strict `kiro-mcp-servers` allowlist. The generated
+profile keeps `includeMcpJson: false` and adds only the corresponding `@server`
+tool selectors plus owned secret-free proxy definitions; invalid, duplicate and
+reserved bridge names fail before any resource. The proxy re-reads the global
+personal config at server start and verifies command, arguments and environment
+key names against non-secret digests bound into the native loadout. It starts the
+server with a minimal inherited process environment plus the definition's live
+values, never the native owner token, Herdr/Pi internals or unrelated inherited
+credentials. Values—including credentials, endpoints and application-specific
+behavior—may rotate without changing the grant; generic executable-search,
+loader and managed-run environment keys are rejected. Missing, disabled,
+unsupported, remote URL or changed definitions fail closed, as do definitions
+requiring `timeout` or `disabledTools` passthrough. Pi and Claude roles reject
+this Kiro-only capability.
+Because Kiro runs with `--trust-all-tools`, every tool supplied by a selected
+server is an explicit non-interactive external-action grant. Automatic routing
+v1 rejects roles with personal Kiro MCP access.
+
 **Nested delegation.** A native role may delegate only through an explicit
 `spawn-agents` allowlist. The child receives one owned stdio MCP server with a
 single `subagent` tool. Requests are HMAC-signed with a per-run secret. The
@@ -129,7 +148,9 @@ parent claims each request atomically and verifies run identity, nonce
 freshness, age, and that the sender PID carries the run's owner token. It
 then enforces policy: allowlisted role, explicit tools that are a subset of
 the requester's, autonomous, not persistent, standalone ordinary pane, and a
-leaf with spawning denied. Limits are four concurrent and 16 total per run.
+leaf with spawning denied. A role that declares personal Kiro MCP servers is
+ineligible; nested delegation never introduces that external capability.
+Limits are four concurrent and 16 total per run.
 Nested results return to the requester as one correlated, untrusted-data
 follow-up turn. An autonomous requester does not exit while results are owed.
 Delegation requires Linux `/proc` and is rejected for persistent specialists.
@@ -233,8 +254,22 @@ namespace.
 
 ## Consequences
 
-Native runs gain Pi-level orchestration without a Pi transcript. The residual
-risks are explicit: same-user processes can read owned 0600 files, so the
+Native runs gain Pi-level orchestration without a Pi transcript. Selected
+personal Kiro MCP servers remain ambient user configuration: exact server names
+and non-secret definition digests are authorization, while live environment
+values are read only by the owned proxy and are not copied into the marker or
+checkout profile. Those values can change endpoints or application-specific
+behavior without digest drift; loader/search/run-internal keys are rejected.
+The proxy forwards only a small launcher environment plus explicitly configured
+values, not the native owner token or unrelated parent credentials. The inherited
+set is path/home/user/shell, temporary-directory and locale variables, XDG paths,
+and standard OpenSSL certificate-file/directory variables; proxy, custom CA,
+cloud and Git settings must be explicit server `env` entries. Selected server
+processes are deliberately outside the managed run's durable process identity,
+so exit confirmation does not account for a server that outlives Kiro. Same-user
+processes can still inspect credentials in the source configuration or launched
+server environment. Operators must review changes to configured servers separately. The residual risks are explicit: same-user
+processes can read owned 0600 files, so the
 bridge secret and receipts resist confusion, staleness, and misdirected
 siblings, not a malicious same-user process. Claude fires no hook for a user
 interrupt, so an interrupted autonomous turn usually ends by verified

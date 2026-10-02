@@ -3864,6 +3864,17 @@ describe("subagent discovery", () => {
 				"invalid-spawning",
 				["description: Invalid spawning boolean", "spawning: maybe"].join("\n"),
 			);
+			writeAgentFile(
+				projectAgentsDir,
+				"duplicate-kiro-mcp",
+				[
+					"description: Duplicate Kiro MCP declarations",
+					"cli: kiro",
+					"tools: read",
+					"kiro-mcp-servers: jira-connector",
+					"kiro-mcp-servers: github-connector",
+				].join("\n"),
+			);
 			for (const [name, frontmatter] of [
 				[
 					"quoted-deny-tools",
@@ -3946,6 +3957,7 @@ describe("subagent discovery", () => {
 				"duplicate-tools",
 				"invalid-deny-tools",
 				"invalid-spawning",
+				"duplicate-kiro-mcp",
 				"quoted-deny-tools",
 				"comment-deny-tools",
 				"quoted-tools",
@@ -3981,7 +3993,7 @@ describe("subagent discovery", () => {
 					(diagnostic: any) =>
 						diagnostic.code === "invalid-capability-declaration",
 				).length,
-				13,
+				14,
 			);
 			assert.match(result.content[0].text, /tools must use a non-empty/i);
 			assert.match(result.content[0].text, /spawning must be true or false/i);
@@ -4285,6 +4297,7 @@ describe("subagent discovery", () => {
 					"cli: kiro",
 					"auto-exit: true",
 					"tools: read, write, edit, bash",
+					"kiro-mcp-servers: jira-connector, confluence-connector, github-connector",
 					"spawning: false",
 				].join("\n"),
 			);
@@ -4302,6 +4315,10 @@ describe("subagent discovery", () => {
 			);
 			assert.equal(claude?.cli, "claude");
 			assert.equal(kiro?.cli, "kiro");
+			assert.equal(
+				kiro?.kiroMcpServers,
+				"jira-connector, confluence-connector, github-connector",
+			);
 			assert.match(
 				result.content[0].text,
 				/claude-worker \(project\) \[cli: claude\] \[sonnet\]/,

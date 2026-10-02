@@ -167,9 +167,10 @@ _Avoid_: Transcript, current role definition
 **Native loadout**:
 Everything that bounds a native session: tools and their native mapping,
 model, thinking, prompt mode, identity hash, mode, session mode, skills with
-their snapshot hashes, nested-spawn allowlist, Kiro agent name, lineage, and
-worktree binding. Resume replays it exactly, including its mode, and never
-widens or narrows it.
+their snapshot hashes, nested-spawn allowlist, selected personal Kiro MCP
+server names and definition digests, Kiro agent name, lineage, and worktree
+binding. Resume replays it exactly, including its mode, and never widens or
+narrows it.
 _Avoid_: Role lookup at resume, per-call override, mode change on resume
 
 **Native session lease**:
@@ -202,6 +203,19 @@ following links, rechecks every traversed entry's identity and content after
 the walk, and verifies again immediately before launch. Oversized skills are
 rejected, never truncated.
 _Avoid_: Partial skill, live asset reference, Pi-only runtime assumption
+
+**Selected personal Kiro MCP grant**:
+A Kiro-only role capability naming exact servers from the user's global Kiro
+MCP configuration. The owned profile keeps bulk MCP import disabled and exposes
+only selected `@server` tools through secret-free proxy definitions. Executable
+fields and environment key names are digest-bound into the native loadout; live
+values remain in the personal configuration, may change endpoints or
+application behavior without digest drift, and are read only by the proxy at
+server start. The proxy forwards a minimal launcher environment, rejects generic
+loader/search/run-internal keys, and never gives the server the native owner
+token. Every selected server tool is non-interactive under
+`--trust-all-tools`; automatic and nested launches reject this capability.
+_Avoid_: `includeMcpJson: true`, copying credentials into the checkout, ambient MCP access
 
 **Nested-spawn bridge**:
 The owned stdio MCP server and signed request directory through which a native

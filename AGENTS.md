@@ -45,6 +45,7 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `pi-extension/subagents/native-turns.ts` — harness-neutral tagged-turn driver: verified idle points, follow-up queue, interrupts, interactive/persistent/autonomous exit policy
 - `pi-extension/subagents/native-session.ts` — v2 native session markers, loadout integrity, and the exclusive native session lease
 - `pi-extension/subagents/native-context.ts` — typed-input sanitization, bounded untrusted fork context, and materialized Pi skills
+- `pi-extension/subagents/kiro-mcp.ts`, `plugin/mcp/kiro-personal-mcp.py` — strict personal Kiro MCP selection, digest binding, and secret-free stdio proxy launch
 - `pi-extension/subagents/native-bridge.ts`, `plugin/mcp/subagent-bridge.py` — authenticated nested-spawn bridge (signed requests, owner-token sender check) for `spawn-agents` roles
 - `CONTEXT.md` — orchestration-domain glossary
 - `docs/adr/` — hard-to-reverse architectural decisions

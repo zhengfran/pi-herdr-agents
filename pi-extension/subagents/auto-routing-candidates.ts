@@ -794,6 +794,7 @@ function preparedRejection(
 		defs.tools !== role.role.tools ||
 		defs.denyTools !== role.role.denyTools ||
 		defs.skills !== role.role.skills ||
+		defs.kiroMcpServers !== role.role.kiroMcpServers ||
 		canonicalJson(prepared.origin) !== canonicalJson(context.origin)
 	)
 		return {
@@ -907,6 +908,7 @@ function capabilityFingerprint(
 			sessionMode: spec.sessionMode,
 			skills: spec.skills,
 			spawnAgents: spec.spawnAgents,
+			kiroMcpServers: spec.kiroMcpServers,
 		},
 		models: native.models,
 	});

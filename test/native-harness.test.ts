@@ -28,11 +28,16 @@ import {
 	kiroAdapter,
 	kiroCommand,
 	kiroHookPath,
+	kiroPersonalMcpProxyPath,
 	kiroTools,
 	prepareKiroRun,
 	readKiroState,
 	assertKiroAvailable,
 } from "../pi-extension/subagents/kiro.ts";
+import {
+	revalidateKiroMcpSelection,
+	resolveKiroMcpSelection,
+} from "../pi-extension/subagents/kiro-mcp.ts";
 import {
 	createNativeDriver,
 	nativeDriverOutcome,
@@ -143,6 +148,23 @@ describe("native harness capability validation", () => {
 			[{ thinking: "minimal" }, /thinking level minimal/],
 			[{ sessionMode: "sideways" }, /session-mode sideways/],
 			[{ cli: "kiro", tools: "read", systemPromptMode: "replace" }, /append/],
+			[{ kiroMcpServers: "jira-connector" }, /Kiro-only capability/],
+			[
+				{ cli: "kiro", tools: "read", kiroMcpServers: "bad name" },
+				/Kiro MCP server names/,
+			],
+			[
+				{
+					cli: "kiro",
+					tools: "read",
+					kiroMcpServers: "jira-connector,jira-connector",
+				},
+				/duplicate/,
+			],
+			[
+				{ cli: "kiro", tools: "read", kiroMcpServers: "pi-subagents" },
+				/reserved pi-subagents/,
+			],
 		];
 		for (const [overrides, pattern] of cases) {
 			assert.throws(
@@ -215,8 +237,25 @@ describe("native harness capability validation", () => {
 		);
 		assert.equal(appended.identity, "You are a native worker.");
 		assert.equal(appended.roleBlock, "");
-		const kiro = resolveNativeLaunchSpec(role({ cli: "kiro", tools: "read" }));
-		assert.deepEqual(kiro.nativeTools, ["fs_read"]);
+		const kiro = resolveNativeLaunchSpec(
+			role({
+				cli: "kiro",
+				tools: "read",
+				kiroMcpServers:
+					"jira-connector, confluence-connector, github-connector",
+			}),
+		);
+		assert.deepEqual(kiro.nativeTools, [
+			"fs_read",
+			"@jira-connector",
+			"@confluence-connector",
+			"@github-connector",
+		]);
+		assert.deepEqual(kiro.kiroMcpServers, [
+			"jira-connector",
+			"confluence-connector",
+			"github-connector",
+		]);
 		assert.equal(kiro.identity, "You are a native worker.");
 		assert.equal(kiro.promptMode, "append");
 	});
@@ -232,6 +271,81 @@ describe("native harness capability validation", () => {
 		);
 		assert.doesNotThrow(() => assertKiroAvailable(() => "kiro-cli 2.24.7\n"));
 		assert.doesNotThrow(() => assertKiroAvailable(() => "kiro-cli 2.26.1\n"));
+	});
+});
+
+describe("personal Kiro MCP selection", () => {
+	it("fails closed on missing, disabled, unsupported, and executable drift", () => {
+		const dir = scratch("kiro-mcp-selection");
+		const sourceFile = join(dir, "mcp.json");
+		const write = (server: any) =>
+			writeFileSync(
+				sourceFile,
+				JSON.stringify({ mcpServers: { jira: server } }),
+			);
+		write({
+			command: "jira-server",
+			args: ["--stdio"],
+			env: { JIRA_PAT: "first-secret" },
+			autoApprove: ["read_issue"],
+		});
+		const selection = resolveKiroMcpSelection(["jira"], { sourceFile });
+		assert.ok(selection);
+		assert.doesNotMatch(JSON.stringify(selection), /first-secret/);
+		write({
+			command: "jira-server",
+			args: ["--stdio"],
+			env: { JIRA_PAT: "rotated-secret" },
+			autoApprove: ["read_issue"],
+		});
+		assert.doesNotThrow(() => revalidateKiroMcpSelection(selection));
+		write({
+			command: "changed-server",
+			args: ["--stdio"],
+			env: { JIRA_PAT: "rotated-secret" },
+		});
+		assert.throws(
+			() => revalidateKiroMcpSelection(selection),
+			/changed after the session was created/,
+		);
+		write({ command: "jira-server", disabled: true });
+		assert.throws(
+			() => resolveKiroMcpSelection(["jira"], { sourceFile }),
+			/is disabled/,
+		);
+		for (const unsupported of [
+			{ command: "jira-server", timeout: 30_000 },
+			{ command: "jira-server", disabledTools: ["delete_issue"] },
+			{ url: "https://example.invalid/mcp" },
+		]) {
+			write(unsupported);
+			assert.throws(
+				() => resolveKiroMcpSelection(["jira"], { sourceFile }),
+				/unsupported field|stdio command/,
+			);
+		}
+		write({ command: "jira-server" });
+		assert.throws(
+			() => resolveKiroMcpSelection(["missing"], { sourceFile }),
+			/not present/,
+		);
+		write({ command: "jira-server", env: { "BAD-NAME": "value" } });
+		assert.throws(
+			() => resolveKiroMcpSelection(["jira"], { sourceFile }),
+			/portable environment names/,
+		);
+		write({ command: "jira-server", env: { NODE_OPTIONS: "--require=x" } });
+		assert.throws(
+			() => resolveKiroMcpSelection(["jira"], { sourceFile }),
+			/process-loader/,
+		);
+		write({ command: "jira-server" });
+		const linkedSource = join(dir, "linked-mcp.json");
+		symlinkSync(sourceFile, linkedSource);
+		assert.throws(
+			() => resolveKiroMcpSelection(["jira"], { sourceFile: linkedSource }),
+			/must be a regular file/,
+		);
 	});
 });
 
@@ -330,13 +444,70 @@ describe("native command construction", () => {
 
 	it("builds a strict interactive Kiro V2 command", () => {
 		const cwd = scratch("kiro-command");
+		const personalConfig = join(cwd, "..", "personal-mcp.json");
+		writeFileSync(
+			personalConfig,
+			JSON.stringify({
+				mcpServers: {
+					"jira-connector": {
+						command: "jira-server",
+						args: ["--stdio"],
+						env: { JIRA_PAT: "secret-must-not-be-copied" },
+						autoApprove: ["read_issue"],
+					},
+					"confluence-connector": {
+						command: "confluence-server",
+						args: [],
+						env: { CONFLUENCE_PAT: "another-secret" },
+					},
+					fetch: {
+						command: "unselected-server",
+						env: { FETCH_SECRET: "must-stay-unavailable" },
+					},
+				},
+			}),
+		);
+		const personalMcp = resolveKiroMcpSelection(
+			["jira-connector", "confluence-connector"],
+			{ sourceFile: personalConfig },
+		);
+		assert.ok(personalMcp);
 		const run = prepareKiroRun({
 			runDir: join(cwd, "..", "kiro-command-run"),
 			processRun: processRunIn(join(cwd, "..", "kiro-command-run")),
 			cwd,
 			markerFile: join(cwd, "..", "marker.json"),
-			tools: ["fs_read"],
+			tools: ["fs_read", "@jira-connector", "@confluence-connector"],
+			personalMcp,
+			mcpServer: {
+				name: "pi-subagents",
+				command: "python3",
+				args: ["/bridge.py", "/cfg.json"],
+			},
 		});
+		const profileText = readFileSync(run.profilePath, "utf8");
+		assert.doesNotMatch(
+			profileText,
+			/secret-must-not-be-copied|another-secret|must-stay-unavailable|unselected-server/,
+		);
+		assert.doesNotMatch(
+			readFileSync(run.personalMcpConfigFile!, "utf8"),
+			/secret-must-not-be-copied|another-secret|must-stay-unavailable|unselected-server|fetch/,
+		);
+		const profile = JSON.parse(profileText);
+		assert.deepEqual(profile.tools, [
+			"fs_read",
+			"@jira-connector",
+			"@confluence-connector",
+			"@pi-subagents",
+		]);
+		assert.equal(profile.includeMcpJson, false);
+		assert.deepEqual(Object.keys(profile.mcpServers).sort(), [
+			"confluence-connector",
+			"jira-connector",
+			"pi-subagents",
+		]);
+		assert.equal(profile.mcpServers["jira-connector"].command, "python3");
 		const command = kiroCommand(run, "[pi-subagent-turn:t] Inspect", {
 			model: "claude-sonnet-4.5",
 			thinking: "low",
@@ -346,6 +517,72 @@ describe("native command construction", () => {
 			`cd '${cwd}' && kiro-cli chat --v2 --agent '${run.profileName}' --trust-all-tools --model 'claude-sonnet-4.5' --effort 'low' '[pi-subagent-turn:t] Inspect'`,
 		);
 		cleanupKiroRun(run);
+	});
+
+	it("launches a selected personal MCP server through the secret-free proxy", () => {
+		const dir = scratch("kiro-personal-mcp-proxy");
+		const serverScript = join(dir, "server.mjs");
+		writeFileSync(
+			serverScript,
+			"process.stdout.write(`${process.env.TEST_MCP_SECRET}:${process.argv[2]}:${process.env.PI_NATIVE_RUN_OWNER ?? 'none'}:${process.env.UNRELATED_SECRET ?? 'none'}`);\n",
+		);
+		const sourceFile = join(dir, "mcp.json");
+		const writeConfig = (command = process.execPath) =>
+			writeFileSync(
+				sourceFile,
+				JSON.stringify({
+					mcpServers: {
+						jira: {
+							command,
+							args: [serverScript, "ready"],
+							env: { TEST_MCP_SECRET: "credential-value" },
+						},
+					},
+				}),
+			);
+		writeConfig();
+		const selection = resolveKiroMcpSelection(["jira"], { sourceFile });
+		assert.ok(selection);
+		const ownedFile = join(dir, "owned.json");
+		writeFileSync(ownedFile, JSON.stringify({ version: 1, ...selection }), {
+			mode: 0o600,
+		});
+		const launched = spawnSync(
+			"python3",
+			[kiroPersonalMcpProxyPath, ownedFile, "jira"],
+			{
+				encoding: "utf8",
+				env: {
+					...process.env,
+					PI_NATIVE_RUN_OWNER: "must-not-reach-server",
+					UNRELATED_SECRET: "must-not-reach-server",
+				},
+			},
+		);
+		assert.equal(launched.status, 0, launched.stderr);
+		assert.equal(launched.stdout, "credential-value:ready:none:none");
+		writeConfig("changed-command");
+		const drifted = spawnSync(
+			"python3",
+			[kiroPersonalMcpProxyPath, ownedFile, "jira"],
+			{ encoding: "utf8" },
+		);
+		assert.equal(drifted.status, 2);
+		assert.match(drifted.stderr, /changed after this run was prepared/);
+		writeConfig();
+		const linkedSource = join(dir, "linked-mcp.json");
+		symlinkSync(sourceFile, linkedSource);
+		writeFileSync(
+			ownedFile,
+			JSON.stringify({ version: 1, ...selection, sourceFile: linkedSource }),
+		);
+		const linked = spawnSync(
+			"python3",
+			[kiroPersonalMcpProxyPath, ownedFile, "jira"],
+			{ encoding: "utf8" },
+		);
+		assert.equal(linked.status, 2);
+		assert.match(linked.stderr, /configuration must be a regular file/);
 	});
 
 	it("recreates the saved Kiro agent name and session for resume", () => {
