@@ -96,6 +96,14 @@ before resources/dispatch. Known no-dispatch failures alone can attempt parent
 fallback; cancel, stale or uncertain work holds.
 _Avoid_: fsync guarantee, atomic host transaction, error fall-through
 
+**Advisory route recommendation**:
+A default-off parent-only `jev_router({task, context?})` result: uncalibrated
+pinned-Jev evidence over an explicit bounded brief and configured route names and
+descriptions only. It never launches or selects a model/effort, shares only the
+bounded transport with automatic routing, and needs separate `jevRouter` consent.
+The parent may override it and then uses the unchanged `subagent({route})`.
+_Avoid_: Auto route, route permission, model selection, review independence
+
 **Package decision ID**:
 Correlation for one local routing attempt, not a host submission identity.
 Repeated identical submissions are distinct decisions. A live dispatch latch

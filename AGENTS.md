@@ -17,6 +17,12 @@ and task model preferences never enable/authorize auto. Shadow also sends data
 and requires consent. Use [the canonical disclosure and operator contract](README.md#automatic-input-routing),
 not stronger original-provenance, idle Escape, read-only or exactly-once claims.
 
+A separate default-off `jevRouter` config enables the parent-only advisory
+`jev_router` tool (README [Advisory route recommendation](README.md#advisory-route-recommendation-jev_router)):
+it recommends configured route names from an explicit bounded brief, never launches,
+and shares only `jev-transport.ts` with automatic routing. Keep it independent of
+`autoRouting` consent, approvals, and question versions.
+
 The extension is fire-and-forget: `subagent` returns an acknowledgement, and completion is delivered to the parent automatically. Never add polling guidance that tells callers to sleep, tail sessions, or repeatedly check status.
 
 ## Read these first
@@ -40,6 +46,7 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `pi-extension/subagents/wake.ts`, `supervision.ts`, `supervision-config.ts` — file wake-ups, shared pane reconciliation, polling fallback, and supervision configuration
 - `pi-extension/subagents/persistent-config.ts` — strict persistent-specialist cap configuration
 - `pi-extension/subagents/auto-routing-{config,candidates,policy,input}.ts`, `jev-{questions,client}.ts` — strict durable approvals, local snapshots, full-distribution policy, current-view input ownership/persistence, and pinned authenticated classifier transport
+- `pi-extension/subagents/jev-transport.ts`, `jev-router{,-config,-questions,-evidence,-policy,-auth}.ts` — generic bounded classifier transport (`jev-client.ts` is the automatic-v1 facade) and the advisory `jev_router` config, frozen questions, strict Choice decoder, conservative policy, and request-local key fallback
 - `pi-extension/subagents/completion.ts`, `session.ts`, `subagent-done.ts` — child completion, transcript handling, `caller_ping`, and `subagent_done`
 - `pi-extension/subagents/native-harness.ts`, `claude.ts`, `kiro.ts`, `process-run.ts`, `plugin/hooks/` — native `cli: claude|kiro` capability validation, pre-resource launch planning, owned hook/state files, correlated completion, and durable process receipts (ported from zhengfran/pi-interactive-subagents, MIT)
 - `pi-extension/subagents/native-turns.ts` — harness-neutral tagged-turn driver: verified idle points, follow-up queue, interrupts, interactive/persistent/autonomous exit policy
@@ -54,6 +61,7 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 - `test/native-harness.test.ts`, `test/native-stage2.test.ts`, `test/native-flows.test.ts`, `test/native-regressions.test.ts` — native harness unit, end-to-end, and review-regression tests using offline `test/fixtures/native-bin/` CLI stand-ins, `test/native-fixtures.ts`, and `test/native-flow-harness.ts` (flows run through the extension's tool handlers with a fake Herdr test seam)
 - `test/harness-selection.test.ts` — spawn-time harness selection and role projection through the public `subagent`/`subagent_resume` tools, `startSubagentRun`, and the registered `/subagent` command, using the fake Herdr seam and offline native fixtures
 - `test/auto-routing-*.test.ts`, `test/jev-client.test.ts`, `test/jev-questions.test.ts` — offline contracts/public-handler flows (not real TUI evidence)
+- `test/jev-router*.test.ts`, `test/jev-router-fixtures.ts` — offline advisory router contracts over the real Pi adapter with fake registry/fetch/key source
 - `test/integration/auto-routing.test.ts` — isolated real TUI routing, real RPC/noninteractive bypass, fake classifier and offline native executables; deterministic-only, live skipped
 - `test/evals/jev-routing-README.md` — synthetic uncalibrated fixtures/evaluator; no live capture
 - `test/package-skill.test.js` — bundled skill and package manifest contract test

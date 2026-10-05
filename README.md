@@ -126,7 +126,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 9 parent-session tools + 8 commands, plus 2 child-only tools:
+**Subagents** — 10 parent-session tools + 8 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -137,6 +137,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `subagents_list`     | List available agent definitions                                                            |
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
+| `jev_router` | Parent-only, default-off advisory route recommendation from an explicit brief; never launches (see [Advisory route recommendation](#advisory-route-recommendation-jev_router)) |
 | `subagent_resume`    | Resume a previous Pi session, or a native session marker with its exact loadout, in a new ordinary pane (async) |
 | `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
 
@@ -889,6 +890,85 @@ child under its existing lifecycle. No threshold supplies universal read-only,
 secret isolation, zero retention, reliable Escape, original provenance, stable
 submission identity, a host transaction, cross-process exactly-once, or RPC
 routing guarantees.
+
+---
+
+## Advisory route recommendation (`jev_router`)
+
+`jev_router({ task, context? })` is a parent-only, **advisory** tool. It asks the
+pinned `jev-1.13.0` classifier which configured [route](#routes) best matches an
+explicit brief and returns a recommendation or an abstention with the full
+evidence. It never launches anything, never selects a model or effort, and is
+independent of [automatic input routing](#automatic-input-routing): the two
+share only a bounded transport. When enabled with at least one route, its prompt
+guidance tells the parent to call it first with a concise explicit brief, then
+call `subagent({ route, ... })`; it reads no task files or history automatically
+(it does read its own config and, per the authentication rules below, the key
+file). The parent may follow, override, or ignore the
+result, then calls the unchanged `subagent({ route, ... })`; manual launches
+never require a prior `jev_router` call.
+
+**Disabled by default.** Enable it only in the durable config, which is read at
+load (`/reload` after editing). The packaged example never supplies consent:
+
+```json
+{
+  "jevRouter": {
+    "version": 1,
+    "enabled": true,
+    "questionVersion": "jev-advisory-questions-v1",
+    "policyVersion": "jev-advisory-policy-v1",
+    "timeoutMs": 5000,
+    "consent": {
+      "disclosureVersion": "jev-advisory-egress-v1",
+      "acknowledgedAt": "2026-10-05T00:00:00Z",
+      "sendExplicitBriefAndRouteDescriptions": true
+    }
+  }
+}
+```
+
+`timeoutMs` is optional (default 5000, 500–15000). No credential, key path,
+endpoint, model pin, candidate override, or threshold is configurable. Unknown or
+duplicate members make the section invalid, which disables only this tool.
+
+**What leaves the machine.** Only the explicit `task` and optional `context`
+(each at most 4096 UTF-8 bytes, 8 KiB together) plus every configured route's
+name and description go to TypeSafe, in one batch of `5 + routes` Choice
+questions with opaque route IDs. No history, files, role bodies, candidates,
+harnesses, models, efforts, or route order are sent. If the request does not fit
+the 24 KiB / 16 KiB bounds it is refused whole (`request-too-large`); nothing is
+pruned or paginated. The call is subject to ordinary tool-call/session
+retention, possible charges, and TypeSafe's own retention; "no training" is not
+zero retention or residency. This is not a secret-isolation boundary.
+
+**Authentication.** Pi's configured TypeSafe authentication is used when
+present. Only when Pi has none, the tool reads the fixed `~/.jev/JEV_KEY` once
+per call (a bounded regular file, no final symlink, one line without whitespace
+or control characters; owner-only `0600` is recommended but not required or
+changed) and passes it as a request-local `apiKey`. Only an explicit "not
+configured" answer from Pi authorizes that read; an error or non-boolean answer
+is `auth-unavailable` with no key read. It is never written to the
+environment, Pi's credential store, a result, or a log. There is one attempt,
+no retry, and no fallback after an authentication or HTTP failure.
+
+**Result.** `schema: "jev-advisory-result-v1"` with `status`
+(`recommendation`, `uncertain`, `unavailable`, `cancelled`), an exact
+`recommendedRoute` or `null`, stable `reasonCodes`, and the complete validated
+distributions. Reported classifier token usage (and Pi's catalog cost only when
+Pi reports one) is also returned as the tool result's host `usage`; it is not
+actual billing. Thresholds are unvalidated heuristics: a route is recommended
+only when the primary choice is decisive, its independent fit is strong, no
+other route also claims coverage, the brief is a single bounded step with
+sufficient context, and the route has a description. Reasoning difficulty and
+consequence risk are informational and never change candidates. A `review`
+recommendation does not establish an independent author family; the parent
+still checks the actual candidates and project policy. Configuration drift,
+consent revocation, cancellation, reload, or the deadline before the request is
+forwarded returns `config-changed`/`cancelled` and sends nothing; cancelling
+after dispatch cannot retract transmitted data.
+
+Children, package side sessions, and native harnesses never receive the tool.
 
 ---
 

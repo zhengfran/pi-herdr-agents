@@ -26,7 +26,7 @@ current images and a persisted session can route; RPC/JSON/print/extension-sourc
 and steer/followUp bypass. Shadow also egresses and needs consent. Original input
 provenance, reliable idle Escape, atomic persistence/dispatch and cross-process
 exactly-once are not promised. See ADR-0014 for the two current-host cancellation
-blockers and recovery limits. Orchestrated review materializes pinned evidence,
+blockers and recovery limits. A separate default-off advisory `jev_router` tool (README: [Advisory route recommendation](../README.md#advisory-route-recommendation-jev_router)) recommends configured route names from an explicit bounded brief and never launches. Orchestrated review materializes pinned evidence,
 launches fresh public reviewers, receives automatic completion delivery, and
 has the parent synthesize outcomes. Role frontmatter tool allowlists are the
 available enforcement boundary; `read,bash` is not read-only. Automated package

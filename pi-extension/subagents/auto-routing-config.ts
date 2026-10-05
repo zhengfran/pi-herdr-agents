@@ -524,7 +524,7 @@ function numberField(
 	return value;
 }
 
-function isStrictIsoTimestamp(value: string): boolean {
+export function isStrictIsoTimestamp(value: string): boolean {
 	const match = ISO_TIMESTAMP.exec(value);
 	if (!match) return false;
 	const [year, month, day, hour, minute, second] = match

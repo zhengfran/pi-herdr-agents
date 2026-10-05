@@ -7,6 +7,8 @@ function memberPath(path: string, key: string): string {
 		: `${path}[${JSON.stringify(key)}]`;
 }
 
+export const JEV_ROUTER_CONFIG_KEY = "jevRouter";
+
 /**
  * `JSON.parse` silently keeps the last duplicate member. Report the first
  * duplicate inside the top-level `autoRouting` subtree, including a repeated
@@ -18,6 +20,19 @@ function memberPath(path: string, key: string): string {
  */
 export function findDuplicateAutoRoutingMember(
 	text: string,
+): string | undefined {
+	return findDuplicateTopLevelMember(text, AUTO_ROUTING_CONFIG_KEY);
+}
+
+/** The advisory router's equivalent for the top-level `jevRouter` subtree. */
+export function findDuplicateJevRouterMember(text: string): string | undefined {
+	return findDuplicateTopLevelMember(text, JEV_ROUTER_CONFIG_KEY);
+}
+
+/** The shared scanner for one named top-level subtree. */
+function findDuplicateTopLevelMember(
+	text: string,
+	subtreeKey: string,
 ): string | undefined {
 	const whitespace = " \t\n\r";
 	let index = 0;
@@ -139,11 +154,11 @@ export function findDuplicateAutoRoutingMember(
 	for (;;) {
 		const key = readString();
 		expect(":");
-		if (key !== AUTO_ROUTING_CONFIG_KEY) skipValue();
-		else if (seen) return AUTO_ROUTING_CONFIG_KEY;
+		if (key !== subtreeKey) skipValue();
+		else if (seen) return subtreeKey;
 		else {
 			seen = true;
-			const duplicate = findDuplicateIn(AUTO_ROUTING_CONFIG_KEY);
+			const duplicate = findDuplicateIn(subtreeKey);
 			if (duplicate !== undefined) return duplicate;
 		}
 		skip();

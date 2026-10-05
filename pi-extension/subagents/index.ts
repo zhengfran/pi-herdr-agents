@@ -84,6 +84,7 @@ import {
 	AUTO_REQUEST_CUSTOM_TYPE,
 	AUTO_ROUTING_DISABLED_ENV,
 	AUTO_STATUS_CUSTOM_TYPE,
+	isAutoRoutingChildEnvironment,
 	autoRequestView,
 	autoStatusView,
 	AutoLaunchStoppedError,
@@ -99,6 +100,17 @@ import {
 	type AutoRunReceipt,
 } from "./auto-routing-input.ts";
 import { createJevTransport } from "./jev-client.ts";
+import {
+	JEV_ROUTER_CONFIG_KEY,
+	loadJevRouterConfig,
+} from "./jev-router-config.ts";
+import {
+	createJevRouter,
+	formatJevRouterResult,
+	type JevRouterInputs,
+	type JevRouterOptions,
+} from "./jev-router.ts";
+import type { JevAdvisoryRoute } from "./jev-router-questions.ts";
 import {
 	loadModelConfig,
 	resolveModelDefault,
@@ -7556,6 +7568,115 @@ async function launchAutoRoutedRun(
 	};
 }
 
+/** Test and embedding seams for the advisory router; never tool parameters. */
+type JevRouterExtensionOptions = Partial<
+	Pick<JevRouterOptions, "fetch" | "now" | "keySource">
+> & {
+	env?: NodeJS.ProcessEnv;
+	/** Replaces the durable config and route reads, for offline tests. */
+	readInputs?: () => JevRouterInputs;
+};
+
+/** Only a route's name and description ever reach the advisory classifier. */
+function advisoryRoutes(config: RouteConfig): JevAdvisoryRoute[] {
+	return Object.entries(config.routes).map(([name, route]) => ({
+		name,
+		description: route.description,
+	}));
+}
+
+const JevRouterParams = Type.Object(
+	{
+		task: Type.String({
+			description:
+				"Concise explicit description of the work to delegate. At most 4096 UTF-8 bytes; sent to the classifier with the configured route names and descriptions.",
+		}),
+		context: Type.Optional(
+			Type.String({
+				description:
+					"Optional explicit reference text needed only for routing. At most 4096 UTF-8 bytes.",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
+
+const JevRouterChoiceSchema = Type.Object(
+	{
+		choice: Type.String(),
+		// Option names (including hostnames-like route names) are arbitrary keys;
+		// their count and values are bounded at runtime by the strict decoder.
+		probabilities: Type.Record(Type.String(), Type.Number()),
+		confidence: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
+const JevRouterEvidenceSchema = Type.Object(
+	{
+		primaryRoute: Type.Object(
+			{
+				route: Type.Union([Type.String(), Type.Null()]),
+				probabilities: Type.Array(
+					Type.Object(
+						{
+							route: Type.Union([Type.String(), Type.Null()]),
+							probability: Type.Number(),
+						},
+						{ additionalProperties: false },
+					),
+				),
+				confidence: Type.Number(),
+			},
+			{ additionalProperties: false },
+		),
+		routeFits: Type.Array(
+			Type.Object(
+				{ route: Type.String(), answer: JevRouterChoiceSchema },
+				{ additionalProperties: false },
+			),
+		),
+		taskStages: JevRouterChoiceSchema,
+		contextSufficiency: JevRouterChoiceSchema,
+		reasoningDifficulty: JevRouterChoiceSchema,
+		consequenceRisk: JevRouterChoiceSchema,
+	},
+	{ additionalProperties: false },
+);
+
+const JevRouterUsageSchema = Type.Object(
+	{
+		inputTokens: Type.Number(),
+		outputTokens: Type.Number(),
+		catalogCostUsd: Type.Union([Type.Number(), Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+
+const JevRouterOutputSchema = Type.Object(
+	{
+		schema: Type.Literal("jev-advisory-result-v1"),
+		advisory: Type.Literal(true),
+		questionVersion: Type.String(),
+		policyVersion: Type.String(),
+		calibration: Type.Literal("uncalibrated"),
+		status: Type.Union([
+			Type.Literal("recommendation"),
+			Type.Literal("uncertain"),
+			Type.Literal("unavailable"),
+			Type.Literal("cancelled"),
+		]),
+		recommendedRoute: Type.Union([Type.String(), Type.Null()]),
+		reasonCodes: Type.Array(Type.String()),
+		detail: Type.Union([Type.String(), Type.Null()]),
+		routeSnapshotHash: Type.Union([Type.String(), Type.Null()]),
+		evidence: Type.Union([JevRouterEvidenceSchema, Type.Null()]),
+		usage: Type.Union([JevRouterUsageSchema, Type.Null()]),
+		elapsedMs: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
 /** Test and embedding seams for automatic routing; never tool parameters. */
 type AutoRoutingExtensionOptions = Partial<
 	Pick<
@@ -7618,6 +7739,7 @@ export default function subagentsExtension(
 	options: {
 		cleanupOperations?: (ctx: ExtensionContext) => WorktreeCleanupOperations;
 		autoRouting?: AutoRoutingExtensionOptions;
+		jevRouter?: JevRouterExtensionOptions;
 	} = {},
 ) {
 	runtime.pi = pi;
@@ -7830,6 +7952,8 @@ export default function subagentsExtension(
 	// Clean up on session shutdown
 	pi.on("session_shutdown", async (event, _ctx) => {
 		autoRouting.onLifecycle("session_shutdown");
+		// Late advisory completions of this generation must send nothing.
+		jevRouterGeneration.abort();
 		// Clear only this module generation's handler. An older generation may
 		// shut down after a reload has already installed its replacement.
 		if (runtime.nestedSpawnHandler === handleNestedSpawnLocally)
@@ -7877,6 +8001,99 @@ export default function subagentsExtension(
 	);
 
 	const shouldRegister = (name: string) => !deniedTools.has(name);
+
+	// ── jev_router: advisory, parent-only, never launches ──
+	const jevSeams = options.jevRouter ?? {};
+	const jevEnv = jevSeams.env ?? process.env;
+	// Children and package side sessions are conservatively ineligible.
+	const jevParent = () => !isAutoRoutingChildEnvironment(jevEnv);
+	const readJevInputs =
+		jevSeams.readInputs ??
+		((): JevRouterInputs => {
+			let routes: JevAdvisoryRoute[] | undefined;
+			try {
+				routes = advisoryRoutes(loadRouteConfig());
+			} catch {
+				routes = undefined;
+			}
+			return { config: loadJevRouterConfig(), routes };
+		});
+	const loadedJevInputs: JevRouterInputs = jevSeams.readInputs
+		? jevSeams.readInputs()
+		: { config: loadJevRouterConfig(), routes: advisoryRoutes(routeConfig) };
+	const jevRouterGeneration = new AbortController();
+	const jevRouter = createJevRouter({
+		loaded: loadedJevInputs,
+		readCurrent: readJevInputs,
+		parent: jevParent,
+		generation: jevRouterGeneration.signal,
+		fetch: jevSeams.fetch,
+		now: jevSeams.now,
+		keySource: jevSeams.keySource,
+	});
+	const jevRouterGuidelines =
+		jevParent() &&
+		loadedJevInputs.config.status === "enabled" &&
+		(loadedJevInputs.routes?.length ?? 0) > 0
+			? [
+					"Before choosing a configured route for delegated work, call jev_router with a concise explicit task and only the context needed for routing. It sends that brief and the configured route names and descriptions to TypeSafe. Treat the result as advisory evidence, not permission or model selection. You may override it or proceed manually if it is unavailable or uncertain. Decompose multi-stage work yourself. Then call subagent with route, name, and a complete task, omitting agent, harness, model, and thinking. Preserve author-family, permission, workspace, and verification requirements.",
+				]
+			: [];
+	if (jevParent() && shouldRegister("jev_router"))
+		pi.registerTool({
+			name: "jev_router",
+			label: "Advisory route recommendation",
+			description: `Advisory only: recommend one configured subagent route for an explicit task, or abstain. Sends only the supplied task/context and configured route names and descriptions to the pinned TypeSafe classifier (config key ${JEV_ROUTER_CONFIG_KEY}, default off). Never launches anything, never selects a model or effort, and never reads task files or history automatically (it does read its own config and, only when Pi has no TypeSafe authentication, the fixed key file). You may override or ignore the result and then call subagent with route.`,
+			promptSnippet:
+				"Advisory configured-route recommendation from an explicit brief; never launches",
+			promptGuidelines: jevRouterGuidelines,
+			parameters: JevRouterParams,
+			outputSchema: JevRouterOutputSchema,
+
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				// Anything beyond the two explicit strings is not a valid brief.
+				const exact =
+					Object.keys(params).every(
+						(key) => key === "task" || key === "context",
+					) &&
+					(params.context === undefined || isString(params.context));
+				const result = await jevRouter.invoke({
+					task: exact ? params.task : undefined,
+					context: exact ? params.context : undefined,
+					signal,
+					registry: ctx.modelRegistry,
+				});
+				const output = {
+					content: [
+						{ type: "text" as const, text: formatJevRouterResult(result) },
+					],
+					details: result,
+					// SAFETY: the result is a frozen plain JSON object.
+					structuredContent: JSON.parse(JSON.stringify(result)),
+					isError:
+						result.status === "unavailable" || result.status === "cancelled",
+				};
+				// Host accounting shape; cost is only Pi's reported catalog cost.
+				if (result.usage === null) return output;
+				return {
+					...output,
+					usage: {
+						input: result.usage.inputTokens,
+						output: result.usage.outputTokens,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: result.usage.inputTokens + result.usage.outputTokens,
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: result.usage.catalogCostUsd ?? 0,
+						},
+					},
+				};
+			},
+		});
 
 	if (parentSession) {
 		pi.registerTool({

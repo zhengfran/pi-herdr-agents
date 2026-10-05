@@ -182,6 +182,14 @@ Low coverage, first-prompt bypass, manual crash recovery and cancellation blocke
 are accepted costs. Operators must leave routing off if privacy, extension order,
 shared-checkout or crash-window risk is unacceptable.
 
+## Boundary with the advisory router
+
+The separate advisory `jev_router` tool (README: Advisory route recommendation)
+reuses only the generic bounded transport in `jev-transport.ts`; `jev-client.ts`
+remains this ADR's auth-only facade and never supplies a fallback key. Advisory
+consent, questions, evidence and policy are independent, never authorize or
+approve automatic routing, and do not weaken any decision here.
+
 ## Verification boundary
 
 Offline config/candidate/transport/policy and public-handler tests exercise

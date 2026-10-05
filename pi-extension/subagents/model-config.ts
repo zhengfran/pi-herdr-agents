@@ -1,6 +1,9 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { findDuplicateAutoRoutingMember } from "./auto-routing-json.ts";
+import {
+	findDuplicateAutoRoutingMember,
+	findDuplicateJevRouterMember,
+} from "./auto-routing-json.ts";
 import { getSubagentsConfigPath } from "./config-path.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
 
@@ -360,6 +363,17 @@ export function writeTaskModelConfig(
 	if (duplicate !== undefined)
 		throw new Error(
 			`Invalid subagent auto-routing config in ${sourcePath}: ${duplicate} is a duplicate JSON member`,
+		);
+	try {
+		duplicate = findDuplicateJevRouterMember(source);
+	} catch (error) {
+		throw new Error(
+			`Cannot check subagent jevRouter config in ${sourcePath} for duplicate JSON members: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (duplicate !== undefined)
+		throw new Error(
+			`Invalid subagent jevRouter config in ${sourcePath}: ${duplicate} is a duplicate JSON member`,
 		);
 	if (!isPlainObject(parsed))
 		throw new Error(

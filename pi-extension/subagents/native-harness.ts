@@ -141,6 +141,7 @@ const PI_SPAWNING_TOOLS = new Set([
 	"subagent_send",
 	"subagent_stop",
 	"subagents_write_task_models",
+	"jev_router",
 	"worktree_list",
 	"worktree_remove",
 ]);

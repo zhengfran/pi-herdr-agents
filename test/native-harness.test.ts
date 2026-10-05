@@ -141,6 +141,7 @@ describe("native harness capability validation", () => {
 			[{ spawnAgents: "scout", persistent: true }, /persistent specialist/],
 			[{ tools: "read,caller_ping" }, /caller_ping/],
 			[{ tools: "read,subagent_send" }, /Pi orchestration tools/],
+			[{ tools: "read,jev_router" }, /Pi orchestration tools \(jev_router\)/],
 			[{ tools: "read,subagent" }, /spawn-agents allowlist instead/],
 			[{ tools: undefined }, /explicit tools allowlist/],
 			[{ model: "task:everything" }, /supported task categories/],

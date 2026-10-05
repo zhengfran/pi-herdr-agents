@@ -6,6 +6,10 @@
     "version": 1,
     "mode": "off"
   },
+  "jevRouter": {
+    "version": 1,
+    "enabled": false
+  },
   "models": {
     "agents": {}
   },
