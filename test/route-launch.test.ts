@@ -29,7 +29,18 @@ writeFileSync(
 					},
 				],
 			},
+			open: {
+				candidates: [
+					{
+						agent: "reviewer",
+						harness: "pi",
+						model: "fake/strong",
+						thinking: "high",
+					},
+				],
+			},
 		},
+		routePolicy: { requiredForAgents: { reviewer: ["review"] } },
 	}),
 );
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -102,7 +113,7 @@ describe("subagent route launch", () => {
 	});
 
 	const explicit = {
-		agent: "reviewer",
+		agent: "worker",
 		harness: "pi" as const,
 		model: "fake/other",
 		thinking: "high" as const,
@@ -140,6 +151,45 @@ describe("subagent route launch", () => {
 		assert.match(text, /no-such-role on pi fake\/strong \(high\): .*not found/);
 		// The second candidate resolved its role and stopped only at the Herdr check.
 		assert.match(text, /reviewer on pi fake\/strong \(high\): .*[Hh]erdr/);
+	});
+
+	it("rejects a direct launch of a protected agent before any resource", async () => {
+		const result = await run({ ...explicit, agent: "reviewer" });
+		assert.equal(result.details.error, "route-required");
+		assert.match(result.content[0].text, /allowed: review/);
+		assert.match(result.content[0].text, /Nothing was launched/);
+	});
+
+	it("leaves unprotected agents' direct launches unchanged", async () => {
+		const result = await run(explicit);
+		assert.notEqual(result.details.error, "route-required");
+		assert.match(result.content[0].text, /[Hh]erdr/);
+	});
+
+	it("skips candidates whose agent the route is not authorized for", async () => {
+		const result = await run({ route: "open" });
+		assert.equal(result.details.error, "route-unavailable");
+		assert.match(
+			result.content[0].text,
+			/route policy allows agent "reviewer" only through route review/,
+		);
+	});
+
+	it("launches a protected agent through its allowed route up to the Herdr check", async () => {
+		const result = await run({ route: "review" });
+		assert.match(
+			result.content[0].text,
+			/reviewer on pi fake\/strong \(high\): .*[Hh]erdr/,
+		);
+	});
+
+	it("states enforced mappings in the parent guidelines", () => {
+		const { tool, handlers } = registerSubagentTool();
+		handlers.get("session_start")?.[0]({}, ctx);
+		assert.match(
+			tool.promptGuidelines.join("\n"),
+			/agent "reviewer" launches only through route review.*route-required/,
+		);
 	});
 
 	it("lists configured routes in the parent guidelines", () => {

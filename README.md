@@ -435,6 +435,30 @@ Configured routes, with their candidates, are added to the parent's `subagent`
 guidelines at session start. Routes are manual-launch choices only: they do not
 enable or authorize automatic input routing.
 
+#### Required routes (opt-in)
+
+An optional top-level `routePolicy` makes a route mandatory for named agents.
+It is absent by default and is not in `config.json.example`:
+
+```json
+{ "routePolicy": { "requiredForAgents": { "reviewer": ["review"] } } }
+```
+
+`requiredForAgents` maps exact agent names to non-empty, duplicate-free arrays
+of configured route names, and every named route must have a candidate for that
+agent. Unsupported keys, blank agent names, unknown routes, and unmatched
+candidates make the config invalid. Enforcement happens in the shared launch
+path (the `subagent` tool, `/subagent`, and nested spawns): a direct launch of a
+protected agent without `route` fails with `route-required`, lists the allowed
+routes, and launches nothing. A route launch skips any candidate whose agent
+the route does not authorize, reporting why; if none remain, `route-unavailable`.
+Unprotected agents, `subagent_resume`, and automatic input routing are not
+affected. The mappings are listed in the parent's `subagent` guidelines.
+Routes and policy are read when the extension loads. After editing them, run
+`/reload`; native children that survive the reload then resolve their nested
+spawn requests through the reloaded extension, so the new policy applies to
+them as well. If no current extension can serve a nested request, it is rejected.
+
 Task preferences and manual APIs do **not** enable or authorize automatic input
 routing. `/subagents-init` and `subagents_write_task_models` preserve unrelated
 valid `autoRouting` semantics without granting consent or approving tuples.

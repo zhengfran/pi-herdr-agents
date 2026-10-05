@@ -17,8 +17,14 @@ export interface Route {
 	candidates: RouteCandidate[];
 }
 
+/** Opt-in enforcement: a protected agent launches only through listed routes. */
+export interface RoutePolicy {
+	requiredForAgents: Record<string, string[]>;
+}
+
 export interface RouteConfig {
 	routes: Record<string, Route>;
+	routePolicy?: RoutePolicy;
 }
 
 const ROUTE_NAME = /^[a-z][a-z0-9-]{0,39}$/;
@@ -26,6 +32,7 @@ const MAX_ROUTES = 32;
 const MAX_CANDIDATES = 16;
 const MAX_DESCRIPTION_LENGTH = 256;
 const ROUTE_KEYS = new Set(["description", "candidates"]);
+const POLICY_KEYS = new Set(["requiredForAgents"]);
 const CANDIDATE_KEYS = new Set(["agent", "harness", "model", "thinking"]);
 
 function invalidRouteConfig(source: string, message: string): never {
@@ -91,13 +98,79 @@ function parseCandidate(
 	return { agent: agent.trim(), harness, model: exactModel, thinking };
 }
 
+function parseRoutePolicy(
+	value: any,
+	routes: Record<string, Route>,
+	source: string,
+): RoutePolicy {
+	if (!isPlainObject(value))
+		invalidRouteConfig(source, "routePolicy must be an object");
+	rejectUnsupportedKeys(value, POLICY_KEYS, "routePolicy", source);
+	const mapping = value.requiredForAgents;
+	if (!isPlainObject(mapping))
+		invalidRouteConfig(
+			source,
+			"routePolicy.requiredForAgents must be an object mapping agent names to route name arrays",
+		);
+	const requiredForAgents: Record<string, string[]> = {};
+	for (const [agent, names] of Object.entries(mapping)) {
+		const field = `routePolicy.requiredForAgents[${JSON.stringify(agent)}]`;
+		if (agent.trim() === "" || agent !== agent.trim())
+			invalidRouteConfig(
+				source,
+				"routePolicy.requiredForAgents agent names must be non-blank and untrimmed",
+			);
+		if (!Array.isArray(names) || names.length === 0)
+			invalidRouteConfig(source, `${field} must be a non-empty array`);
+		const seen = new Set<string>();
+		for (const name of names) {
+			if (!isString(name) || name === "")
+				invalidRouteConfig(
+					source,
+					`${field} entries must be route name strings`,
+				);
+			if (seen.has(name))
+				invalidRouteConfig(source, `${field} repeats route "${name}"`);
+			seen.add(name);
+			if (!Object.hasOwn(routes, name))
+				invalidRouteConfig(source, `${field} names unknown route "${name}"`);
+			if (!routes[name].candidates.some((entry) => entry.agent === agent))
+				invalidRouteConfig(
+					source,
+					`${field} route "${name}" has no candidate for agent "${agent}"`,
+				);
+		}
+		Object.defineProperty(requiredForAgents, agent, {
+			value: [...names],
+			enumerable: true,
+		});
+	}
+	return { requiredForAgents };
+}
+
+/** Routes through which `agent` may launch, or undefined when unprotected. */
+export function requiredRoutesForAgent(
+	config: RouteConfig,
+	agent: string | undefined,
+): string[] | undefined {
+	const mapping = config.routePolicy?.requiredForAgents;
+	const name = agent?.trim();
+	return mapping && name && Object.hasOwn(mapping, name)
+		? mapping[name]
+		: undefined;
+}
+
 export function parseRouteConfig(
 	rawConfig: any,
 	source = "config.json",
 ): RouteConfig {
 	if (!isPlainObject(rawConfig))
 		invalidRouteConfig(source, "root must be an object");
-	if (!Object.hasOwn(rawConfig, "routes")) return { routes: {} };
+	const hasPolicy = Object.hasOwn(rawConfig, "routePolicy");
+	if (!Object.hasOwn(rawConfig, "routes")) {
+		if (hasPolicy) parseRoutePolicy(rawConfig.routePolicy, {}, source);
+		return { routes: {} };
+	}
 	const routes = rawConfig.routes;
 	if (!isPlainObject(routes))
 		invalidRouteConfig(source, "routes must be an object");
@@ -162,7 +235,11 @@ export function parseRouteConfig(
 			enumerable: true,
 		});
 	}
-	return { routes: parsedRoutes };
+	if (!hasPolicy) return { routes: parsedRoutes };
+	return {
+		routes: parsedRoutes,
+		routePolicy: parseRoutePolicy(rawConfig.routePolicy, parsedRoutes, source),
+	};
 }
 
 export function loadRouteConfig(

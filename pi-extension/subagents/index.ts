@@ -111,6 +111,7 @@ import {
 import {
 	formatRouteCandidate,
 	loadRouteConfig,
+	requiredRoutesForAgent,
 	type RouteConfig,
 	selectRouteCandidate,
 } from "./route-config.ts";
@@ -323,9 +324,10 @@ function getFirstText(
 	}
 }
 
-function buildRouteGuidelines({ routes }: RouteConfig): string[] {
+function buildRouteGuidelines({ routes, routePolicy }: RouteConfig): string[] {
 	const names = Object.keys(routes);
 	if (names.length === 0) return [];
+	const enforced = Object.entries(routePolicy?.requiredForAgents ?? {});
 	return [
 		"Prefer a configured route for delegated work: call subagent with route set to the route that fits the task, and omit agent, harness, model, and thinking. A route is the preferred complete explicit launch selection: it supplies all four, trying its candidates in order, and satisfies any requirement to explicitly choose role, harness, model, and thinking. The model/thinking rules below apply only to launches without a matching configured route; pass those fields yourself only when the user explicitly asks for a specific role or runtime or no route fits.",
 		`Configured routes: ${names
@@ -335,6 +337,18 @@ function buildRouteGuidelines({ routes }: RouteConfig): string[] {
 				return `${name}${label} [${route.candidates.map(formatRouteCandidate).join("; ")}]`;
 			})
 			.join(". ")}.`,
+		...(enforced.length > 0
+			? [
+					`Enforced route policy: ${enforced
+						.map(
+							([agent, allowed]) =>
+								`agent "${agent}" launches only through route ${allowed.join(" or ")}`,
+						)
+						.join(
+							"; ",
+						)}. A direct launch of such an agent (agent set without route) is rejected with route-required and launches nothing; use the route.`,
+				]
+			: []),
 	];
 }
 
@@ -2235,6 +2249,15 @@ interface SubagentRuntime {
 	plannedNativeDispatches?: Set<string>;
 	supervision?: SupervisionCoordinator;
 	pi?: ExtensionAPI;
+	/**
+	 * The newest loaded module's nested-spawn handler. Native watchers that
+	 * survive /reload keep older module closures, so they resolve nested
+	 * requests (and the route policy those apply) through this slot.
+	 */
+	nestedSpawnHandler?: (
+		requester: RunningSubagent,
+		request: BridgeRequest,
+	) => Promise<BridgeResponse>;
 	latestCtx?: ExtensionContext;
 	modelCatalog?: string;
 	/** Automatic-routing work dispatched or possibly dispatched; kept busy. */
@@ -4421,6 +4444,19 @@ const MAX_NESTED_RESULT_BYTES = 6_000;
  * as an ordinary standalone leaf, and never be persistent or a worktree.
  */
 async function handleNestedSpawnRequest(
+	requester: RunningSubagent,
+	request: BridgeRequest,
+): Promise<BridgeResponse> {
+	const current = runtime.nestedSpawnHandler;
+	if (!current)
+		return {
+			accepted: false,
+			text: "Rejected by the parent: no current extension runtime can serve nested spawns.",
+		};
+	return current(requester, request);
+}
+
+async function handleNestedSpawnLocally(
 	requester: RunningSubagent,
 	request: BridgeRequest,
 ): Promise<BridgeResponse> {
@@ -6968,6 +7004,12 @@ function prepareRoutedRun(
 		};
 	}
 	const selection = selectRouteCandidate(route, (candidate) => {
+		const allowed = requiredRoutesForAgent(routeConfig, candidate.agent);
+		if (allowed && !allowed.includes(name))
+			return {
+				ok: false,
+				reason: `route policy allows agent "${candidate.agent}" only through route ${allowed.join(" or ")}`,
+			};
 		const candidateParams = {
 			...params,
 			route: undefined,
@@ -7022,6 +7064,17 @@ async function startSubagentRun(
 	)
 		return invalidBinding;
 	let preparation: SubagentPreparation;
+	// Manual and nested direct launches of a protected agent must use a route;
+	// automatic and prepared (automatic handoff) runs are outside this policy.
+	const requiredRoutes =
+		params.route === undefined && !options.prepared && !options.auto
+			? requiredRoutesForAgent(routeConfig, params.agent)
+			: undefined;
+	if (requiredRoutes)
+		return routeError(
+			"route-required",
+			`agent "${params.agent?.trim()}" must be launched through a configured route (allowed: ${requiredRoutes.join(", ")}); call subagent with route set and omit agent, harness, model, and thinking. Nothing was launched.`,
+		);
 	if (params.route !== undefined && !options.prepared && !options.auto) {
 		const routed = prepareRoutedRun(pi, params, ctx, options.forceLeaf);
 		if (!routed.ok) return routed.result;
@@ -7568,6 +7621,7 @@ export default function subagentsExtension(
 	} = {},
 ) {
 	runtime.pi = pi;
+	runtime.nestedSpawnHandler = handleNestedSpawnLocally;
 	const parentSession = !process.env.PI_SUBAGENT_ID;
 	const autoRoutingSeams = options.autoRouting ?? {};
 	// One package decision at a time; manual paths never consult it.
@@ -7776,6 +7830,10 @@ export default function subagentsExtension(
 	// Clean up on session shutdown
 	pi.on("session_shutdown", async (event, _ctx) => {
 		autoRouting.onLifecycle("session_shutdown");
+		// Clear only this module generation's handler. An older generation may
+		// shut down after a reload has already installed its replacement.
+		if (runtime.nestedSpawnHandler === handleNestedSpawnLocally)
+			runtime.nestedSpawnHandler = undefined;
 		if (widgetInterval) {
 			clearInterval(widgetInterval);
 			widgetInterval = null;

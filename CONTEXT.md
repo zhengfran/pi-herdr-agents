@@ -233,6 +233,14 @@ child with a `spawn-agents` allowlist asks the parent to launch leaf children
 within its own tool ceiling. Results return as untrusted-data follow-up turns.
 _Avoid_: Shelling out to Pi, unrestricted delegation
 
+**Required-route policy**:
+The opt-in `routePolicy.requiredForAgents` mapping from exact agent names to the
+configured routes that alone may launch them. A protected agent's direct launch
+is rejected with `route-required` before any Herdr resource exists; surviving
+native children are held to the reloaded policy. Automatic input routing and
+resume are outside it.
+_Avoid_: Role permission, model allowlist
+
 **Native model candidates**:
 Ordered native CLI model IDs for one native launch, from an exact ID, a list,
 or `models.native.<cli>.tasks`. They are never Pi provider/model refs. Fallback

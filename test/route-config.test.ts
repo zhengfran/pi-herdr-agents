@@ -96,6 +96,47 @@ describe("route config", () => {
 	});
 });
 
+describe("route policy", () => {
+	type RequiredForAgentsFixture =
+		| Record<string, string | Array<string | number>>
+		| Array<string | number>;
+	const base = { routes: { review } };
+	const policy = (requiredForAgents: RequiredForAgentsFixture) => ({
+		...base,
+		routePolicy: { requiredForAgents },
+	});
+
+	it("accepts exact agent to route mappings and keeps the absent shape", () => {
+		assert.deepEqual(
+			parseRouteConfig(policy({ reviewer: ["review"] })).routePolicy,
+			{ requiredForAgents: { reviewer: ["review"] } },
+		);
+		assert.deepEqual(parseRouteConfig(base), base);
+		assert.equal("routePolicy" in parseRouteConfig(base), false);
+	});
+
+	it("rejects malformed policies", () => {
+		for (const [config, message] of [
+			[{ ...base, routePolicy: [] }, /routePolicy must be an object/],
+			[
+				{ ...base, routePolicy: { requiredForAgents: {}, extra: 1 } },
+				/unsupported key\(s\): extra/,
+			],
+			[policy([]), /requiredForAgents must be an object/],
+			[policy({ " ": ["review"] }), /non-blank/],
+			[policy({ reviewer: [] }), /non-empty array/],
+			[policy({ reviewer: "review" }), /non-empty array/],
+			[policy({ reviewer: [1] }), /route name strings/],
+			[policy({ reviewer: ["review", "review"] }), /repeats route/],
+			[policy({ reviewer: ["nope"] }), /unknown route "nope"/],
+			[policy({ tester: ["review"] }), /no candidate for agent "tester"/],
+			[{ routePolicy: { requiredForAgents: { a: ["r"] } } }, /unknown route/],
+		] as const) {
+			assert.throws(() => parseRouteConfig(config), message);
+		}
+	});
+});
+
 describe("route candidate selection", () => {
 	const { routes } = parseRouteConfig({ routes: { review } });
 	const route: Route = routes.review;
