@@ -295,6 +295,7 @@ export function watchDeps(harness: Harness, terminated: string[] = []) {
 			agentStatus: "done" as const,
 			observedAt: Date.now(),
 		}),
+		readVisiblePane: async () => "",
 		terminate: (processRun: ProcessRun) => {
 			terminated.push(processRun.id);
 			return terminateProcessRun(processRun);

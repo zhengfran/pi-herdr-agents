@@ -19,6 +19,7 @@ import {
 	claudeAdapter,
 	claudeCommand,
 	claudeTools,
+	isClaudeWorkspaceTrustPrompt,
 	prepareClaudeRun,
 	readClaudeState,
 	claudeHookPath,
@@ -881,6 +882,62 @@ describe("native process receipts", () => {
 	});
 });
 
+describe("Claude workspace trust diagnosis", () => {
+	it("requires the heading, full capability warning, and both choices", () => {
+		const prompt = `Do you trust the files in this folder?\nClaude Code may read, write, and execute files in this folder.\n1. Yes, proceed\n2. No, exit`;
+		const currentPrompt = `Accessing workspace: /tmp/example\nQuick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\nYes, I trust this folder\nNo, exit`;
+		assert.equal(isClaudeWorkspaceTrustPrompt(prompt), true);
+		assert.equal(isClaudeWorkspaceTrustPrompt(currentPrompt), true);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				currentPrompt.replace(
+					"No, exit",
+					"No, continue without these permissions",
+				),
+			),
+			true,
+		);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				currentPrompt.replace(
+					"trust this",
+					"trust\x1b]8;;https://example.test\x07 this",
+				),
+			),
+			true,
+			"OSC terminal sequences do not hide the prompt signature",
+		);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				"Do you trust the files in this folder? Yes, proceed. No, exit.",
+			),
+			false,
+			"a missing read/write/execute warning is not enough",
+		);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				"Claude may read, write, and execute files. Yes, proceed. No, exit.",
+			),
+			false,
+			"a generic warning without the trust heading is not enough",
+		);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				"Do you trust the files in this folder? Claude may read, write, and execute files. Yes, proceed.",
+			),
+			false,
+			"the negative choice is required",
+		);
+		assert.equal(
+			isClaudeWorkspaceTrustPrompt(
+				"Do you trust the files in this folder? Claude may read, write, and execute files. No, exit.",
+			),
+			false,
+			"the affirmative choice is required",
+		);
+	});
+});
+
 describe("native correlated completion", () => {
 	function claudeFixture(mode: "autonomous" | "interactive" = "autonomous") {
 		const dir = scratch("claude-hooks");
@@ -1095,11 +1152,175 @@ describe("native correlated completion", () => {
 				agentStatus: "done",
 				observedAt: Date.now(),
 			}),
+			readVisiblePane: async () =>
+				`Quick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\nYes, I trust this folder\nNo, exit`,
 			onPaneInspection: () => {
 				if (++inspections === 20) controller.abort();
 			},
 		});
 		await assert.rejects(waiting, /Aborted/);
+	});
+
+	it("does not diagnose stale trust text when acknowledgement races the pane read", async () => {
+		const dir = scratch("trust-ack-race");
+		const run = processRunIn(dir, "live-run");
+		writeFileSync(
+			run.receiptFile,
+			JSON.stringify({
+				version: 1,
+				runId: "live-run",
+				owner: run.ownerToken,
+				pid: process.pid,
+			}),
+		);
+		const sessionId = "78787878-7878-4787-8787-787878787878";
+		const claudeRun = prepareClaudeRun({
+			runDir: dir,
+			processRun: run,
+			cwd: dir,
+			sessionId,
+		});
+		const nativeRun: NativeRun = {
+			version: 1,
+			harness: "claude",
+			kind: "fresh",
+			processRun: run,
+			markerFile: "",
+			runDir: dir,
+			sessionKey: "live-run",
+			loadoutSha256: "",
+			model: null,
+			driver: createNativeDriver({
+				mode: "autonomous",
+				firstTurn: { id: "live-run", kind: "initial", ackTimeoutMs: 60_000 },
+			}),
+			claude: claudeRun,
+		};
+		nativeRun.driver.turns[0].submittedAt = Date.now();
+		const controller = new AbortController();
+		let inspections = 0;
+		let receiptWritten = false;
+		const waiting = waitForNativeCompletion(nativeRun, controller.signal, {
+			intervalMs: 5,
+			inspectEveryTicks: 1,
+			inspector: {
+				procRoot: null,
+				uid: null,
+				isAlive: () => true,
+				kill: () => assert.fail("must not signal"),
+			},
+			send: () => assert.fail("must not send input"),
+			terminate: () => assert.fail("must not terminate an acknowledged run"),
+			inspectPane: async () => ({
+				kind: "present",
+				agentStatus: "blocked",
+				observedAt: Date.now(),
+			}),
+			readVisiblePane: async () => {
+				if (!receiptWritten) {
+					receiptWritten = true;
+					assert.equal(
+						runHook(claudeHookPath, claudeRun.configFile, {
+							hook_event_name: "SessionStart",
+							session_id: sessionId,
+							cwd: dir,
+						}).status,
+						0,
+					);
+					assert.equal(
+						runHook(claudeHookPath, claudeRun.configFile, {
+							hook_event_name: "UserPromptSubmit",
+							session_id: sessionId,
+							cwd: dir,
+							prompt: nativePrompt("task", nativeRun.driver.turns[0].token),
+						}).status,
+						0,
+					);
+				}
+				return "Quick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\nYes, I trust this folder\nNo, exit";
+			},
+			onPaneInspection: () => {
+				if (++inspections === 20) controller.abort();
+			},
+		});
+		await assert.rejects(waiting, /Aborted/);
+		assert.equal(nativeRun.driver.turns[0].acknowledged, true);
+	});
+
+	it("keeps the normal acknowledgement timeout when the pane cannot be read", async () => {
+		const dir = scratch("trust-read-error");
+		const run = processRunIn(dir, "live-run");
+		writeFileSync(
+			run.receiptFile,
+			JSON.stringify({
+				version: 1,
+				runId: "live-run",
+				owner: run.ownerToken,
+				pid: process.pid,
+			}),
+		);
+		const nativeRun: NativeRun = {
+			version: 1,
+			harness: "claude",
+			kind: "fresh",
+			processRun: run,
+			markerFile: "",
+			runDir: dir,
+			sessionKey: "live-run",
+			loadoutSha256: "",
+			model: null,
+			driver: createNativeDriver({
+				mode: "autonomous",
+				firstTurn: { id: "live-run", kind: "initial", ackTimeoutMs: 120_000 },
+			}),
+			claude: prepareClaudeRun({
+				runDir: dir,
+				processRun: run,
+				cwd: dir,
+				sessionId: "79797979-7979-4797-8797-797979797979",
+			}),
+		};
+		nativeRun.driver.turns[0].submittedAt = 0;
+		let clock = 0;
+		let reads = 0;
+		let terminations = 0;
+		const result = await waitForNativeCompletion(
+			nativeRun,
+			new AbortController().signal,
+			{
+				now: () => clock,
+				delay: async () => {
+					clock += 60_001;
+				},
+				intervalMs: 1,
+				inspectEveryTicks: 1,
+				inspector: {
+					procRoot: null,
+					uid: null,
+					isAlive: () => true,
+					kill: () => assert.fail("must not signal through the inspector"),
+				},
+				send: () => assert.fail("must not send input"),
+				terminate: () => {
+					terminations++;
+					return { kind: "unverifiable", reason: "fixture" };
+				},
+				inspectPane: async () => ({
+					kind: "present",
+					agentStatus: "blocked",
+					observedAt: clock,
+				}),
+				readVisiblePane: async () => {
+					reads++;
+					throw new Error("pane unavailable");
+				},
+			},
+		);
+		assert.equal(result.reason, "error");
+		assert.equal(result.startupBlock, undefined);
+		assert.match(result.errorMessage ?? "", /did not acknowledge.*120 seconds/);
+		assert.equal(reads, 2);
+		assert.equal(terminations, 1);
 	});
 });
 

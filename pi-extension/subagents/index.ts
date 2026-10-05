@@ -223,6 +223,7 @@ import {
 	type NativeRun,
 	type NativeSessionMarker,
 	type NativeHarnessOperations,
+	type NativeStartupBlock,
 } from "./native-harness.ts";
 import {
 	enqueueNativeTurn,
@@ -1732,10 +1733,14 @@ interface NativeResultReference {
 	markerFile: string;
 	/** `unconfirmed`: an owned native process may still be running. */
 	processExit: "confirmed" | "unconfirmed";
-	/** Owned files and surfaces retained while exit is unconfirmed. */
+	/** Owned files and surfaces retained for inspection or while exit is unconfirmed. */
 	retained?: string[];
-	/** Herdr pane of a run whose exit is unconfirmed (retained). */
+	/** Herdr pane retained for an unresolved run or diagnosed startup block. */
 	surface?: string;
+	/** Diagnosed human-only startup gate; raw pane text is never retained. */
+	startupBlock?: NativeStartupBlock;
+	/** Working directory where an operator can resolve the startup gate. */
+	cwd?: string;
 	warning?: string;
 	mode?: "autonomous" | "interactive" | "persistent";
 	model?: string | null;
@@ -1777,6 +1782,8 @@ function formatNativeSessionReference(native: NativeResultReference): string {
 		text += `\nResume: subagent_resume({ sessionPath: ${JSON.stringify(native.markerFile)}, message: "<next task>" })`;
 	else
 		text += `\nNative resume unavailable: ${native.resume?.reason ?? "spawn a new subagent for further work"}.`;
+	if (native.startupBlock) text += `\nStartup block: ${native.startupBlock}`;
+	if (native.cwd) text += `\nNative cwd: ${native.cwd}`;
 	if (native.warning) text += `\nWarning: ${native.warning}`;
 	if (native.surface) text += `\nNative pane: ${native.surface}`;
 	if (native.retained?.length)
@@ -1965,7 +1972,21 @@ function resolveResultPresentation(
 			? (result.native.model ?? "(native CLI default)")
 			: undefined);
 
-	if (result.errorMessage && result.native) {
+	if (
+		result.errorMessage &&
+		result.native?.startupBlock === "claude-workspace-trust"
+	) {
+		const next = result.native.resume?.available
+			? "then resume the recorded native session or spawn a new subagent"
+			: "then spawn a fresh subagent (this blocked session cannot be resumed)";
+		body =
+			`Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
+			`(native ${nativeHarnessLabel(result.native.harness)} harness).\n\n` +
+			`Error: ${result.errorMessage}\n\n` +
+			`Claude was blocked by a workspace trust prompt in ${result.native.cwd ?? "the native working directory"}. ` +
+			`The extension stopped the owned process without answering the prompt and retained ${result.native.surface ?? "the pane"}. ` +
+			`Next action: inspect the retained pane, start Claude manually in that working directory, review and answer its trust prompt yourself, ${next}.`;
+	} else if (result.errorMessage && result.native) {
 		// Native completion failed closed: no correlated turn evidence plus exit.
 		const next = result.native.resume?.available
 			? "resume the native session with subagent_resume (it restores the recorded loadout exactly), or spawn a new subagent"
@@ -4187,6 +4208,11 @@ export function shouldAdvanceNativeFallback(
 		};
 	if (result.native?.processExit !== "confirmed")
 		return { advance: false, reason: "the attempt's exit is unconfirmed" };
+	if (result.native.startupBlock)
+		return {
+			advance: false,
+			reason: `startup was blocked by ${result.native.startupBlock}`,
+		};
 	const outcome = result.nativeOutcome;
 	if (!outcome) return { advance: false, reason: "no correlated outcome" };
 	if (outcome.interrupted)
@@ -4259,7 +4285,11 @@ async function watchNativeWithFallbacks(
 			);
 		}
 		// Retain the pane as evidence while native exit is unconfirmed.
-		if (!running.worktree && result.native?.processExit !== "unconfirmed")
+		if (
+			!running.worktree &&
+			result.native?.processExit !== "unconfirmed" &&
+			!result.native?.startupBlock
+		)
 			completedPanes.add(running.surface);
 		if (result.errorMessage)
 			failures.push({
@@ -5011,6 +5041,7 @@ async function watchSubagent(
 interface NativeWatchDependencies {
 	send(surface: string, text: string): void;
 	inspectPane(surface: string): Promise<PaneInspection>;
+	readVisiblePane(surface: string): Promise<string>;
 	terminate(run: NativeRun["processRun"]): TerminationResult | void;
 	confirmExit?(run: NativeRun["processRun"]): ExitConfirmation;
 	intervalMs?: number;
@@ -5026,6 +5057,7 @@ interface NativeWatchDependencies {
 const defaultNativeWatchDependencies: NativeWatchDependencies = {
 	send: runInPane,
 	inspectPane,
+	readVisiblePane: (surface) => readPaneAsync(surface, 80),
 	terminate: (processRun) => terminateProcessRun(processRun),
 };
 
@@ -5078,6 +5110,7 @@ function closePaneAfterLateExit(
 ): void {
 	const run = running.native;
 	if (!run || !native) return;
+	if (native.startupBlock) return;
 	if (running.worktree || running.persistent || running.nestedOf) return;
 	if (run.driver.mode !== "autonomous") return;
 	if (native.surface !== undefined && native.surface !== running.surface)
@@ -5513,6 +5546,7 @@ async function watchNativeSubagent(
 		exitCode: number,
 		detectedAt: number,
 		extra: Partial<SubagentResult> = {},
+		startupBlock?: NativeStartupBlock,
 	): SubagentResult => {
 		const native: NativeResultReference = {
 			harness: run.harness,
@@ -5523,6 +5557,25 @@ async function watchNativeSubagent(
 			model: run.model,
 			resume: nativeResumeAvailability(run, exit),
 		};
+		const addNativeWarning = (warning: string) => {
+			native.warning = native.warning
+				? `${native.warning} ${warning}`
+				: warning;
+		};
+		if (startupBlock) {
+			native.startupBlock = startupBlock;
+			native.surface = surface;
+			native.retained = [`pane ${surface}`];
+			native.cwd = run.claude?.cwd ?? run.kiro?.cwd;
+			native.resume = {
+				available: false,
+				reason:
+					"workspace trust blocked startup; approve trust manually and launch a fresh subagent",
+			};
+			addNativeWarning(
+				"The pane is retained for manual inspection and close; retained panes consume Agents-tab capacity.",
+			);
+		}
 		if ("turns" in outcome) {
 			native.turns = nativeTurnRecords(outcome);
 			if (outcome.interrupted) native.interrupted = true;
@@ -5549,14 +5602,16 @@ async function watchNativeSubagent(
 				warnings.push(
 					`exit was confirmed by an owned-process scan that could not inspect ${exit.unreadableCount} same-user process(es)`,
 				);
-			if (warnings.length) native.warning = `${warnings.join("; ")}.`;
+			if (warnings.length) addNativeWarning(`${warnings.join("; ")}.`);
 			worktreeHandoff = finalizeSubagentWorktree(
 				running,
 				completed ? "ready_for_review" : "failed",
 			);
 		} else {
 			completed = false;
-			native.warning = `native process exit is unconfirmed (${exit.reason}); the run is unresolved and treated as failed.`;
+			addNativeWarning(
+				`native process exit is unconfirmed (${exit.reason}); the run is unresolved and treated as failed.`,
+			);
 			native.surface = surface;
 			native.retained = [
 				...retainedNativeEvidence(run),
@@ -5606,6 +5661,7 @@ async function watchNativeSubagent(
 			send: (text) => deps.send(surface, text),
 			terminate: () => deps.terminate(run.processRun),
 			inspectPane: () => deps.inspectPane(surface),
+			readVisiblePane: () => deps.readVisiblePane(surface),
 			onPaneInspection: (inspection, observedAt) => {
 				running.lifecycle = observePaneInspection(
 					ensureLifecycle(running),
@@ -5638,8 +5694,17 @@ async function watchNativeSubagent(
 		// Turns settled only now (a Stop written just before a fast exit)
 		// reach the same durable queue as turns settled during ticks.
 		const outcome = nativeOutcome(run, exit, onTurnSettled);
+		// A screen diagnosis is failure context only, never positive no-work proof.
+		if (exit.startupBlock) outcome.neverStarted = false;
 		if (exit.interrupted) outcome.interrupted = true;
-		return settle(exit.exit, outcome, exit.exitCode, detectedAt);
+		return settle(
+			exit.exit,
+			outcome,
+			exit.exitCode,
+			detectedAt,
+			{},
+			exit.startupBlock,
+		);
 	} catch (err: any) {
 		// Parent shutdown aborts the watcher without terminating the child,
 		// matching Pi children. Release only an already-confirmed exit.
@@ -5988,7 +6053,9 @@ async function resumeNativeSession(
 				updateWidget();
 				if (!shouldDeliverSubagentCompletion(running)) {
 					running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-					closePane = result.native?.processExit !== "unconfirmed";
+					closePane =
+						result.native?.processExit !== "unconfirmed" &&
+						!result.native?.startupBlock;
 					return;
 				}
 				running.lifecycle = markDelivery(running.lifecycle, "delivered");
@@ -6008,7 +6075,9 @@ async function resumeNativeSession(
 					resolveResultPresentation(result, name),
 					details,
 				);
-				closePane = result.native?.processExit !== "unconfirmed";
+				closePane =
+					result.native?.processExit !== "unconfirmed" &&
+					!result.native?.startupBlock;
 				closePaneAfterLateExit(running, result.native);
 			},
 			(err) => {

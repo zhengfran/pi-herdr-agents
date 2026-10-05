@@ -27,6 +27,7 @@ import {
 import {
 	OWNER_ENV,
 	createProcessRun,
+	terminateProcessRun,
 } from "../pi-extension/subagents/process-run.ts";
 import { writeWorktreeManifest } from "../pi-extension/subagents/launch.ts";
 import { readPersistentDeliveryLedger } from "../pi-extension/subagents/session.ts";
@@ -195,6 +196,56 @@ describe("native follow-ups, reload, and fork context", () => {
 });
 
 describe("native model fallback", () => {
+	it("fails closed on Claude workspace trust without typing, fallback, or pane close", async () => {
+		const project = scratch("flow-workspace-trust");
+		const log = join(project, "..", "trust.json");
+		const terminations: string[] = [];
+		const herdr = useHerdr(
+			{ log, mode: "workspace-trust" },
+			{
+				watch: {
+					inspectPane: async () => ({
+						kind: "present",
+						agentStatus: "blocked",
+						observedAt: Date.now(),
+					}),
+					readVisiblePane: async () =>
+						"Accessing workspace: /tmp/example\nQuick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\nYes, I trust this folder\nNo, exit",
+					terminate: (run) => {
+						terminations.push(run.id);
+						return terminateProcessRun(run);
+					},
+				},
+			},
+		);
+		await start(project, {
+			name: "trust-claude",
+			task: "Task",
+			agent: "native-claude",
+			model: "first, second",
+		});
+		const result = await resultFor("trust-claude");
+		assert.equal(result.details.native.startupBlock, "claude-workspace-trust");
+		assert.deepEqual(result.details.fallbackAttempts, ["first"]);
+		assert.equal(terminations.length, 1, "owned termination runs exactly once");
+		assert.deepEqual(
+			fixtureEvents(log),
+			[],
+			"the parent never types an answer",
+		);
+		assert.equal(result.details.native.resume.available, false);
+		assert.match(result.content, /workspace trust blocked startup/);
+		assert.match(result.content, /Native cwd:/);
+		assert.match(result.content, /Native pane: pane-1/);
+		assert.match(result.content, /Retained for inspection: pane pane-1/);
+		assert.match(result.content, /start Claude manually/);
+		assert.deepEqual(
+			herdr.closed,
+			[],
+			"diagnostic pane remains for manual close",
+		);
+	});
+
 	it("advances past a model that never started and records ordered evidence", async () => {
 		const project = scratch("flow-fallback");
 		useHerdr({
@@ -546,6 +597,60 @@ describe("native interrupts and interactive sessions", () => {
 });
 
 describe("native resume", () => {
+	it("retains a resumed pane when Claude workspace trust blocks its first turn", async () => {
+		const project = scratch("flow-resume-trust");
+		useHerdr({ log: join(project, "..", "resume-trust-initial.json") });
+		const started = await start(project, {
+			name: "resume-trust-source",
+			task: "Initial task",
+			agent: "native-claude",
+		});
+		await resultFor("resume-trust-source");
+
+		const log = join(project, "..", "resume-trust.json");
+		const terminations: string[] = [];
+		const herdr = useHerdr(
+			{ log, mode: "workspace-trust" },
+			{
+				watch: {
+					inspectPane: async () => ({
+						kind: "present",
+						agentStatus: "blocked",
+						observedAt: Date.now(),
+					}),
+					readVisiblePane: async () =>
+						"Accessing workspace: /tmp/example\nQuick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\nYes, I trust this folder\nNo, exit",
+					terminate: (run) => {
+						terminations.push(run.id);
+						return terminateProcessRun(run);
+					},
+				},
+			},
+		);
+		const sentBefore = sent.length;
+		const acknowledgement = await resume(project, {
+			sessionPath: started.details.sessionFile,
+			name: "resume-trust-blocked",
+			message: "Continue",
+		});
+		assert.equal(acknowledgement.details.status, "started");
+		const result = await waitForMessage(
+			(message) =>
+				sent.indexOf(message) >= sentBefore &&
+				message.customType === "subagent_result" &&
+				message.details?.name === "resume-trust-blocked",
+		);
+		assert.equal(result.details.native.startupBlock, "claude-workspace-trust");
+		assert.equal(result.details.native.resume.available, false);
+		assert.equal(terminations.length, 1);
+		assert.deepEqual(fixtureEvents(log), [], "no trust choice is typed");
+		assert.deepEqual(
+			herdr.closed,
+			[],
+			"the resumed pane remains for manual close",
+		);
+	});
+
 	it("replays exactly the recorded loadout even after the role widens", async () => {
 		const project = scratch("flow-resume");
 		const log = join(project, "..", "resume.json");

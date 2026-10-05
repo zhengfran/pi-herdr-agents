@@ -53,5 +53,13 @@ seam keeps Herdr orchestration shared rather than duplicated.
 Native roles bypass Pi model routing and require the native CLI and `python3`
 on `PATH`. Approval prompts are bypassed only for the strictly mapped tool
 set, with no MCP servers. A first-run Claude workspace-trust dialog is never
-answered and fails the run after its acknowledgement deadline. Native resume,
-follow-up, interrupts, and persistent specialists require a later decision.
+answered. The current implementation diagnoses it early only from a strict
+bounded visible-pane match while the submitted first turn is unacknowledged,
+the pane is present, and Herdr reports `blocked`; it then uses the normal cancel
+marker and verified owned-process termination. Screen text is transient failure
+diagnostics only, never completion or no-work evidence, and is not persisted.
+The structured result reports the block, cwd, and retained pane; it never
+advances model fallback. Unknown wording or unavailable evidence retains the
+120-second acknowledgement deadline. Retained ordinary panes consume capacity
+until manually closed. Native resume, follow-up, interrupts, and persistent
+specialists require ADR-0013.

@@ -89,6 +89,12 @@ if mode == "spawn" and "--mcp-config" not in args:
     mode = "ok"  # a nested leaf has no bridge and cannot delegate
 if mode == "other-session":
     sid = "22222222-2222-4222-8222-222222222222"
+if mode == "workspace-trust":
+    # Claude's trust UI appears before the owned hooks are loaded. It accepts
+    # no orchestrator input in this fixture and waits for owned termination.
+    for raw in sys.stdin:
+        event({"input": raw.rstrip("\n")})
+    sys.exit(3)
 fire("SessionStart", source="resume" if resumed else "startup")
 if reject_model:
     sys.exit(1)  # session receipt proves hooks ran; the prompt was never submitted

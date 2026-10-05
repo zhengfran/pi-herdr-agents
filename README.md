@@ -1761,9 +1761,10 @@ seconds). It closes that run's ordinary pane once, after exit is confirmed.
 If a re-check released the run before the result was accepted, the pane closes
 once at acceptance, after a fresh check confirms that exit again. A failed
 watcher whose exit a fresh check confirms closes its ordinary pane after its
-error result is accepted. Interactive, persistent, nested, worktree,
-suppressed and rejected (failed parent send) runs keep their panes. The
-re-check lives in the parent process: it survives `/reload` but not a parent
+error result is accepted. Interactive, persistent, nested, worktree, workspace-trust-blocked,
+suppressed and rejected (failed parent send) runs keep their panes. A retained
+ordinary pane consumes Agents-tab capacity until the operator closes it
+manually. The re-check lives in the parent process: it survives `/reload` but not a parent
 restart, and panes retained before a restart need manual cleanup. Parent
 shutdown does not terminate native children. Launch scripts
 embed task text and are staged `0600` in `0700` directories created for them.
@@ -1832,9 +1833,21 @@ A resume recreates the same profile name; if a modified profile with that name
 was retained, the resume fails closed.
 
 Limitations: Claude Code may show a first-run workspace-trust dialog for a new
-directory, including a new worktree; the parent never answers it, and the run
-fails after 120 seconds without acknowledgement. Native session persistence
-depends on the CLI: an interrupted autonomous run is usually ended by verified
+directory, including a new worktree. Only while the submitted first
+initial/resume turn is still unacknowledged and unsettled, the pane exists, and
+Herdr reports it blocked, a bounded visible-pane read may diagnose that dialog.
+The matcher requires the trust heading, the read/edit-or-write/execute warning, and
+both affirmative and negative choices. The parent never types or answers it;
+it writes the normal cancel marker and terminates only the verified owned
+process. The result reports `startupBlock: "claude-workspace-trust"`, cwd and
+pane, does not advance native model fallback, and retains the pane for manual
+inspection and close (consuming Agents-tab capacity). A trust-blocked run is
+not resumable: approve trust manually in that working directory, then launch a
+fresh subagent. Screen text is transient diagnostic failure evidence
+only: it is never persisted and never proves completion or `neverStarted`.
+Unknown wording, screen-read errors, a missing pane, or a status other than
+`blocked` retain the existing 120-second acknowledgement failure. Native
+session persistence depends on the CLI: an interrupted autonomous run is usually ended by verified
 termination (Claude fires no hook for a user interrupt), so its resume depends
 on what the CLI saved. The interrupt key is Escape for both CLIs; if Kiro
 ignores it, the turn keeps running but is still recorded as interrupted, and an

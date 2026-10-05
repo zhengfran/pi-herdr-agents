@@ -22,6 +22,7 @@ import {
 	claudeAdapter,
 	claudeCommand,
 	claudeTools,
+	isClaudeWorkspaceTrustPrompt,
 	prepareClaudeRun,
 	type ClaudeRun,
 } from "./claude.ts";
@@ -1112,10 +1113,14 @@ export function createNativeHarnessOperations(
 	};
 }
 
+export type NativeStartupBlock = "claude-workspace-trust";
+
 export interface NativeCompletionResult {
 	reason: "done" | "error";
 	exitCode: number;
 	errorMessage?: string;
+	/** A diagnosed human-only startup gate; never completion/no-work evidence. */
+	startupBlock?: NativeStartupBlock;
 	/** Set when the run ended because a parent interrupt could not settle. */
 	interrupted?: boolean;
 	/**
@@ -1138,6 +1143,8 @@ export interface NativeCompletionOptions {
 	terminate(): TerminationResult | void;
 	inspector?: ProcessInspector;
 	inspectPane?: () => Promise<PaneInspection>;
+	/** Bounded visible-pane text used only to diagnose a known startup gate. */
+	readVisiblePane?: () => Promise<string>;
 	onPaneInspection?: (inspection: PaneInspection, observedAt: number) => void;
 	onStarted?: (observedAt: number) => void;
 	onTick?: () => void;
@@ -1178,8 +1185,9 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Wait for a native child's durable process exit. Success still requires the
- * driver outcome's correlated turn evidence; this loop never parses screen
- * text and never treats Herdr idle/done status as completion.
+ * driver outcome's correlated turn evidence. A bounded screen read may diagnose
+ * one known startup gate, but is never completion/no-work evidence; Herdr
+ * idle/done status is never completion.
  */
 export async function waitForNativeCompletion(
 	run: NativeRun,
@@ -1198,6 +1206,7 @@ export async function waitForNativeCompletion(
 	let missing = 0;
 	let ticks = 0;
 	let failure: string | undefined;
+	let startupBlock: NativeStartupBlock | undefined;
 	let interrupted = false;
 	let terminatedAt: number | undefined;
 	let termination: TerminationResult | void = undefined;
@@ -1227,6 +1236,7 @@ export async function waitForNativeCompletion(
 						exit,
 					}
 				: { reason: "done", exitCode: state.exitCode, exit };
+			if (startupBlock) result.startupBlock = startupBlock;
 			if (interrupted) result.interrupted = true;
 			return result;
 		}
@@ -1280,6 +1290,7 @@ export async function waitForNativeCompletion(
 			}
 			if (settled) {
 				if (interrupted) settled.interrupted = true;
+				if (startupBlock) settled.startupBlock = startupBlock;
 				return settled;
 			}
 		} else if (started) {
@@ -1312,6 +1323,47 @@ export async function waitForNativeCompletion(
 				inspection = { kind: "unavailable", error: "inspectPane threw" };
 			}
 			options.onPaneInspection?.(inspection, now());
+			const first = run.driver.turns[0];
+			if (
+				!failure &&
+				run.harness === "claude" &&
+				(first.kind === "initial" || first.kind === "resume") &&
+				first.submittedAt !== undefined &&
+				!first.acknowledged &&
+				!first.outcome &&
+				run.driver.turns.length === 1 &&
+				inspection.kind === "present" &&
+				inspection.agentStatus === "blocked" &&
+				options.readVisiblePane
+			) {
+				try {
+					const visible = (await options.readVisiblePane()).slice(-16_384);
+					// A hook receipt may arrive while the pane read is in flight. Re-read
+					// authoritative state before acting so screen evidence cannot race any
+					// hook progress or hook failure.
+					const receipt = nativeTurnAdapter(run).readState();
+					if (
+						isClaudeWorkspaceTrustPrompt(visible) &&
+						receipt === null &&
+						!readHookError(run.processRun)
+					) {
+						startupBlock = "claude-workspace-trust";
+						failure = `Claude Code workspace trust blocked startup in ${run.claude!.cwd}. The prompt was not answered; inspect and close retained pane manually.`;
+						terminatedAt = now();
+						writeCancelMarker(run.processRun);
+						try {
+							termination = options.terminate();
+						} catch (error) {
+							termination = {
+								kind: "unverifiable",
+								reason: error instanceof Error ? error.message : String(error),
+							};
+						}
+					}
+				} catch {
+					// Unknown/read-error evidence keeps the normal 120-second fallback.
+				}
+			}
 		}
 		ticks++;
 		options.onTick?.();

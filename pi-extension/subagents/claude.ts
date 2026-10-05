@@ -27,6 +27,74 @@ export const isNativeUuid = (value: any): value is string =>
 export const CLAUDE_START_ACK_MS = 120_000;
 export const CLAUDE_FOLLOW_UP_ACK_MS = 30_000;
 export const CLAUDE_EXIT_MS = 15_000;
+
+function stripAnsiSequences(value: string): string {
+	let clean = "";
+	for (let index = 0; index < value.length; index++) {
+		if (value.charCodeAt(index) !== 0x1b) {
+			clean += value[index];
+			continue;
+		}
+		if (value[index + 1] === "[") {
+			index += 2;
+			while (index < value.length) {
+				const code = value.charCodeAt(index);
+				if (code >= 0x40 && code <= 0x7e) break;
+				index++;
+			}
+			continue;
+		}
+		if (value[index + 1] === "]") {
+			index += 2;
+			while (index < value.length) {
+				if (value.charCodeAt(index) === 0x07) break;
+				if (value[index] === "\x1b" && value[index + 1] === "\\") {
+					index++;
+					break;
+				}
+				index++;
+			}
+			continue;
+		}
+		// Drop a single-character escape and its introducer.
+		if (index + 1 < value.length) index++;
+	}
+	return clean;
+}
+
+/**
+ * Match only Claude Code's high-confidence workspace-trust dialog. Terminal
+ * text is transient diagnostic evidence: callers must never persist it or use
+ * it as completion/no-work evidence.
+ */
+export function isClaudeWorkspaceTrustPrompt(screen: string): boolean {
+	const text = stripAnsiSequences(screen.slice(-16_384))
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!text) return false;
+	const heading =
+		/quick safety check:\s*is this a project you created or one you trust\b/i.test(
+			text,
+		) ||
+		/(?:do you trust|trust) (?:the )?(?:files|workspace|folder|directory|contents)/i.test(
+			text,
+		);
+	const warning =
+		/\bread\b/i.test(text) &&
+		/\b(?:edit|write)\b/i.test(text) &&
+		/\bexecute\b/i.test(text) &&
+		/(?:files|code|commands)/i.test(text);
+	const affirmative =
+		/yes,?\s+i trust this (?:folder|directory|workspace|project)/i.test(text) ||
+		/(?:^|\s)yes,?\s+(?:proceed|continue)(?:\s|$|[,.;:])/i.test(text);
+	const negative =
+		/no,?\s+(?:exit|cancel|continue without (?:these )?permissions|do not trust|don['’]t trust)/i.test(
+			text,
+		) ||
+		/(?:^|\s)(?:do not trust|don['’]t trust),?\s+(?:exit|cancel)/i.test(text);
+	return heading && warning && affirmative && negative;
+}
+
 export const NATIVE_EFFORT_LEVELS = [
 	"low",
 	"medium",

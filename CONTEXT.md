@@ -118,6 +118,16 @@ supersession, missing acknowledgement, or undelivered follow-up settles it
 without success.
 _Avoid_: Latest assistant text, Herdr idle status, human turn
 
+**Native startup block**:
+A diagnosed human-only gate before Claude's first initial or resume turn is
+acknowledged. Workspace trust requires a present pane, Herdr `blocked` status,
+and a strict bounded visible-screen match containing the trust heading, full
+read/edit-or-write/execute warning, and affirmative and negative choices. Screen text
+is ephemeral diagnostic failure evidence only: it is never persisted and never
+establishes completion or no-work. The parent never answers the gate; it uses
+verified owned-process termination and retains the pane for manual close.
+_Avoid_: Screen-scraped completion, automatic trust answer, fallback-safe no-work
+
 **Verified idle point**:
 The moment a native TUI provably accepts input: the latest tagged turn's
 correlated `Stop`/`StopFailure` receipt, or in interactive sessions a completed

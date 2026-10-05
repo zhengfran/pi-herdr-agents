@@ -75,6 +75,22 @@ marked removed, no live or unresolved in-memory holder, and no held durable
 worktree lease. Explicit cleanup also treats a held durable lease as a blocker.
 v1 markers and persistent specialists are not resumable.
 
+**Claude workspace trust.** A bounded visible-pane read may diagnose this one
+human-only startup gate only for Claude's submitted, unacknowledged and
+unsettled first initial/resume turn, with a present pane and Herdr `blocked`
+status. A high-confidence match requires the trust heading, a
+read/edit-or-write/execute warning, and affirmative and negative choices. The parent
+never types an answer; it writes the existing cancel marker and uses verified
+owned-process termination. The result carries
+`startupBlock: "claude-workspace-trust"`, cwd, and pane; a trust-blocked run is
+not resumable and no native model fallback follows. After manual approval, the
+operator launches a fresh child. Raw screen text is never
+persisted or treated as completion/`neverStarted`. Read errors, unknown wording,
+missing panes, and other statuses retain the 120-second acknowledgement path.
+The ordinary pane is retained after confirmed or later-confirmed exit, including
+resume, and consumes Agents-tab capacity until manually closed; worktrees keep
+their existing failed-manifest and retention behavior.
+
 **Exit confirmation.** A wrapper exit receipt confirms exit only when a trusted
 process scan shows that no owned descendant carrying the run's token survives.
 It never confirms exit on its own. The same scan also finds every same-user
