@@ -97,6 +97,7 @@ import {
 	loadSupervisionConfig,
 	parseSupervisionConfig,
 } from "../pi-extension/subagents/supervision-config.ts";
+import type { RouteConfig } from "../pi-extension/subagents/route-config.ts";
 import { FileWakeRegistry } from "../pi-extension/subagents/wake.ts";
 import {
 	POLLING_INTERVAL_MS,
@@ -7024,6 +7025,74 @@ describe("tool registration", () => {
 				guidelines.includes(clause),
 				`routing guidelines must include: ${clause}`,
 			);
+	});
+
+	it("scopes explicit model/thinking rules to launches without a configured route", () => {
+		const routes = {
+			routes: {
+				quick: {
+					candidates: [
+						{
+							agent: "worker",
+							harness: "claude",
+							model: "sonnet",
+							thinking: "low",
+						},
+					],
+				},
+			},
+		} satisfies RouteConfig;
+		const withRoutes = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", {}, routes)
+			.join("\n");
+		assert.match(withRoutes, /preferred complete explicit launch selection/);
+		assert.match(withRoutes, /satisfies any requirement to explicitly choose/);
+		assert.match(withRoutes, /quick \[worker on claude sonnet \(low\)\]/);
+		assert.match(
+			withRoutes,
+			/For launches without a matching configured route: For orchestrated subagent work, explicitly set both model and thinking/,
+		);
+		assert.match(
+			withRoutes,
+			/For launches without a matching configured route: Omitting model and thinking/,
+		);
+
+		const withRoutesAndShortlist = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines(
+				"catalog",
+				{ coding: ["fake/worker"] },
+				routes,
+			)
+			.join("\n");
+		assert.match(
+			withRoutesAndShortlist,
+			/For launches without a matching configured route: For non-review work, prefer the configured task-category shortlists/,
+		);
+
+		const without = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", {})
+			.join("\n");
+		assert.doesNotMatch(without, /configured route/);
+		assert.match(
+			without,
+			/^For orchestrated subagent work, explicitly set both/m,
+		);
+	});
+
+	it("allows route-supplied model and thinking in the tool schema", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const subagentTool = registeredTools.find(
+			(tool) => tool.name === "subagent",
+		);
+		assert.match(
+			subagentTool.parameters.properties.model.description,
+			/unless a configured route supplies it/,
+		);
+		assert.match(
+			subagentTool.parameters.properties.thinking.description,
+			/unless a configured route supplies it/,
+		);
 	});
 
 	it("renders generic routing tiers only when no authenticated shortlist is available", () => {

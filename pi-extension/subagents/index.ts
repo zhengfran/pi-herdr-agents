@@ -326,7 +326,7 @@ function buildRouteGuidelines({ routes }: RouteConfig): string[] {
 	const names = Object.keys(routes);
 	if (names.length === 0) return [];
 	return [
-		"Prefer a configured route for delegated work: call subagent with route set to the route that fits the task, and omit agent, harness, model, and thinking — the route supplies all four, trying its candidates in order. Pass those fields yourself only when the user explicitly asks for a specific role or runtime.",
+		"Prefer a configured route for delegated work: call subagent with route set to the route that fits the task, and omit agent, harness, model, and thinking. A route is the preferred complete explicit launch selection: it supplies all four, trying its candidates in order, and satisfies any requirement to explicitly choose role, harness, model, and thinking. The model/thinking rules below apply only to launches without a matching configured route; pass those fields yourself only when the user explicitly asks for a specific role or runtime or no route fits.",
 		`Configured routes: ${names
 			.map((name) => {
 				const route = routes[name];
@@ -342,20 +342,24 @@ function buildSubagentRoutingGuidelines(
 	authenticatedTaskPreferences?: TaskPreferences,
 	routes: RouteConfig = { routes: {} },
 ): string[] {
+	const noRoute =
+		Object.keys(routes.routes).length > 0
+			? "For launches without a matching configured route: "
+			: "";
 	return [
 		...buildRouteGuidelines(routes),
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
 		...(Object.keys(authenticatedTaskPreferences ?? {}).length > 0
 			? [
-					"For non-review work, prefer the configured task-category shortlists below and use task:<category> only as the entire model value. Use exact IDs for reviews when the authoring family is known.",
+					`${noRoute}For non-review work, prefer the configured task-category shortlists below and use task:<category> only as the entire model value. Use exact IDs for reviews when the authoring family is known.`,
 				]
 			: [
-					"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
+					`${noRoute}For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.`,
 					"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
 				]),
 		"For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
-		"Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.",
+		`${noRoute}Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.`,
 		"Before launching a new group of subagents, choose a short task slug and name each new child <task>-<role>[-n], for example login-api or login-test2. Use only plan, research, ui, api, build, test, review, browser, security, perf, or merge as roles; leave existing names unchanged. After the final launch, print name | agent kind | role | model | worktree (if any), then use each name in prompts, handoffs, and results.",
 		catalog ??
 			"Authenticated subagent model catalog becomes available after session start.",
@@ -368,7 +372,7 @@ const ThinkingLevelSchema = Type.Union(
 	THINKING_LEVELS.map((level) => Type.Literal(level)),
 	{
 		description:
-			"Pi thinking level. Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; do not omit on orchestrated child work.",
+			"Pi thinking level. Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; do not omit on orchestrated child work unless a configured route supplies it.",
 	},
 );
 
@@ -408,7 +412,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees. When the effective harness is claude or kiro (role cli or the harness parameter), model instead takes native CLI model IDs, an ordered native fallback list, or task:<category> resolved from models.native.<cli>.tasks, never Pi provider/model refs.",
+				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children unless a configured route supplies it. Fallback lists cannot be used with worktrees. When the effective harness is claude or kiro (role cli or the harness parameter), model instead takes native CLI model IDs, an ordered native fallback list, or task:<category> resolved from models.native.<cli>.tasks, never Pi provider/model refs.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
@@ -6927,6 +6931,10 @@ async function startSubagentRun(
 	ctx: Parameters<typeof launchSubagent>[1],
 	options: StartSubagentOptions = {},
 ): Promise<AgentToolResult<any>> {
+	// Strict-schema clients may fill an unused optional string with blanks.
+	// Normalize only blank routes; nonblank names retain exact lookup semantics.
+	if (params.route !== undefined && params.route.trim() === "")
+		params = { ...params, route: undefined };
 	const { autoRun } = options;
 	const invalidBinding: AgentToolResult<any> = {
 		content: [

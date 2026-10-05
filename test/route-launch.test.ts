@@ -73,7 +73,13 @@ const ctx = {
 	},
 };
 
-async function run(params: { route: string; model?: string }) {
+async function run(params: {
+	route?: string;
+	agent?: string;
+	harness?: "pi";
+	model?: string;
+	thinking?: "high";
+}) {
 	const { tool } = registerSubagentTool();
 	return tool.execute(
 		"call",
@@ -95,11 +101,31 @@ describe("subagent route launch", () => {
 		rmSync(agentDir, { recursive: true, force: true });
 	});
 
-	it("rejects a route combined with explicit runtime fields", async () => {
-		const result = await run({ route: "review", model: "fake/other" });
-		assert.equal(result.details.error, "route-conflict");
-		assert.match(result.content[0].text, /remove model/);
-	});
+	const explicit = {
+		agent: "reviewer",
+		harness: "pi" as const,
+		model: "fake/other",
+		thinking: "high" as const,
+	};
+
+	for (const route of ["", " \t\n "]) {
+		it(`treats blank route ${JSON.stringify(route)} exactly like omission with explicit runtime fields`, async () => {
+			const omitted = await run(explicit);
+			const blank = await run({ route, ...explicit });
+			assert.notEqual(blank.details.error, "route-conflict");
+			assert.deepEqual(blank, omitted);
+			// Ordinary preparation resolves the role/runtime and reaches the Herdr check.
+			assert.match(blank.content[0].text, /[Hh]erdr/);
+		});
+	}
+
+	for (const field of ["agent", "harness", "model", "thinking"] as const) {
+		it(`rejects a real route combined with explicit ${field}`, async () => {
+			const result = await run({ route: "review", [field]: explicit[field] });
+			assert.equal(result.details.error, "route-conflict");
+			assert.match(result.content[0].text, new RegExp(`remove ${field}`));
+		});
+	}
 
 	it("names the configured routes when the route is unknown", async () => {
 		const result = await run({ route: "deploy" });

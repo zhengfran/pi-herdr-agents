@@ -419,10 +419,11 @@ in the top-level `routes` section of `config.json`:
 ```
 
 Call `subagent({ route: "review", name, task })` without `agent`, `harness`,
-`model`, or `thinking`; combining them with `route` is rejected. Before any
-Herdr resource exists, each candidate goes through ordinary spawn preparation
-in order: role discovery, harness projection, native CLI availability, and Pi
-model resolution. The first candidate that prepares launches. When none can,
+`model`, or `thinking`; combining them with a nonblank `route` is rejected.
+An empty or whitespace-only `route` is treated as omitted, so explicit runtime
+fields remain valid. Before any Herdr resource exists, each candidate goes through
+ordinary spawn preparation in order: role discovery, harness projection, native
+CLI availability, and Pi model resolution. The first candidate that prepares launches. When none can,
 the call fails and reports every candidate's reason. A route chooses only at
 launch; a launched child does not move to a later candidate.
 
