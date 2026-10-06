@@ -35,7 +35,7 @@ The extension is fire-and-forget: `subagent` returns an acknowledgement, and com
 - [`RELEASING.md`](RELEASING.md) — release checks and publishing procedure
 - [`docs/adr/0014-jev-auto-input-dispatch.md`](docs/adr/0014-jev-auto-input-dispatch.md) — automatic evidence/authority, ownership, egress and residual host limits
 
-Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrate` public-review fan-out skill lives at [`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md). The `/plan` orchestration prompt lives at [`pi-extension/subagents/plan-skill.md`](pi-extension/subagents/plan-skill.md).
+Bundled role prompts live in [`agents/`](agents/). The native `/skill:review` public-review fan-out skill lives at [`skills/review/SKILL.md`](skills/review/SKILL.md). The `/plan` orchestration prompt lives at [`pi-extension/subagents/plan-skill.md`](pi-extension/subagents/plan-skill.md).
 
 ## Code map
 
@@ -165,7 +165,7 @@ Use `PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run te
 Before committing:
 
 - inspect `git status` and the final diff;
-- confirm the package preview includes `CHANGELOG.md`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, and `skills/orchestrate/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, tests/evals/fixtures and generated captures, plans, journals, sessions, prototypes, generated evidence, local config, and `openspec/`;
+- confirm the package preview includes `CHANGELOG.md`, `skills/review/SKILL.md`, `skills/review/adversarial-review.md`, and `skills/review/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, tests/evals/fixtures and generated captures, plans, journals, sessions, prototypes, generated evidence, local config, and `openspec/`;
 - run `npm pack --dry-run` when package contents or documentation paths changed; durable configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`, never package-root `config.json` (move old files manually or re-run `/subagents-init`);
 - confirm that no generated plans, journals, sessions, provider configuration, test scripts, or review artifacts are staged; and
 - confirm that no accidental empty directory exists at the repository root:

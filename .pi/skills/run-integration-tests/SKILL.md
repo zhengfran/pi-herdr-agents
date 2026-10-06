@@ -76,8 +76,8 @@ PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:in
 ```
 
 Report passing, failing, and skipped tests. Do not claim full verification when Herdr-dependent tests were skipped. For package changes, inspect the dry-run contents for `CHANGELOG.md`,
-`skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md` and
-`skills/orchestrate/adversarial-review-example.js`. Confirm `workflow-worker.js`,
+`skills/review/SKILL.md`, `skills/review/adversarial-review.md` and
+`skills/review/adversarial-review-example.js`. Confirm `workflow-worker.js`,
 tests/evals/fixtures/generated captures, plans, journals, sessions, prototypes,
 generated evidence, local config and `openspec/` are absent. The config example
 must remain disabled/model-neutral without consent or tuples.

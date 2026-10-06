@@ -10,9 +10,9 @@ are evidence, not shipped contracts, when a later ADR supersedes them.
   lifecycle, and role authoring; [automatic input routing](../README.md#automatic-input-routing)
   is the canonical current-view TUI contract, schema and egress disclosure.
 - [`../CONTEXT.md`](../CONTEXT.md) — orchestration glossary.
-- [`../skills/orchestrate/SKILL.md`](../skills/orchestrate/SKILL.md) — public
+- [`../skills/review/SKILL.md`](../skills/review/SKILL.md) — public
   subagent review fan-out and parent synthesis procedure.
-- [`../skills/orchestrate/adversarial-review.md`](../skills/orchestrate/adversarial-review.md)
+- [`../skills/review/adversarial-review.md`](../skills/review/adversarial-review.md)
   — adversarial topology, finding records, and incomplete-coverage policy.
 - [`worktree-subagents.md`](worktree-subagents.md) — worktree operation,
   review, recovery, and cleanup.

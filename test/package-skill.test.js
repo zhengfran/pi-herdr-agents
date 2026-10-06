@@ -8,12 +8,9 @@ import { describe, it } from "node:test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const biomeConfig = JSON.parse(readFileSync(join(root, "biome.json"), "utf8"));
-const skill = readFileSync(
-	join(root, "skills", "orchestrate", "SKILL.md"),
-	"utf8",
-);
+const skill = readFileSync(join(root, "skills", "review", "SKILL.md"), "utf8");
 const adversarialReview = readFileSync(
-	join(root, "skills", "orchestrate", "adversarial-review.md"),
+	join(root, "skills", "review", "adversarial-review.md"),
 	"utf8",
 );
 const reviewer = readFileSync(join(root, "agents", "reviewer.md"), "utf8");
@@ -22,7 +19,7 @@ const adversarialAgent = readFileSync(
 	"utf8",
 );
 const adversarialExample = readFileSync(
-	join(root, "skills", "orchestrate", "adversarial-review-example.js"),
+	join(root, "skills", "review", "adversarial-review-example.js"),
 	"utf8",
 );
 const planSkill = readFileSync(
@@ -43,7 +40,7 @@ const ordinaryReviewClauses = [
 	"For ordinary review, prefer a different authenticated model family.",
 	"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 	"Disclose that this review is context-isolated, not cross-family independent.",
-	"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+	"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 ];
 const packageFiles = new Set(
 	JSON.parse(
@@ -82,14 +79,14 @@ describe("bundled orchestration skill", () => {
 	it("checks the shipped review helper", () => {
 		assert.ok(
 			biomeConfig.files?.includes.includes(
-				"skills/orchestrate/adversarial-review-example.js",
+				"skills/review/adversarial-review-example.js",
 			),
 			"missing shipped helper from Biome coverage",
 		);
 		for (const script of ["format", "format:check", "lint"]) {
 			assert.match(
 				manifest.scripts?.[script] ?? "",
-				/skills\/orchestrate\/adversarial-review-example\.js/,
+				/skills\/review\/adversarial-review-example\.js/,
 				`missing shipped helper from ${script}`,
 			);
 		}
@@ -100,15 +97,15 @@ describe("bundled orchestration skill", () => {
 		assert.deepEqual(manifest.pi?.extensions, [
 			"./pi-extension/subagents/index.ts",
 		]);
-		assert.match(skill, /^---\nname: orchestrate\ndescription: .+\n---/);
+		assert.match(skill, /^---\nname: review\ndescription: .+\n---/);
 		for (const path of [
 			"README.md",
 			"AGENTS.md",
 			"CONTEXT.md",
 			"RELEASING.md",
-			"skills/orchestrate/SKILL.md",
-			"skills/orchestrate/adversarial-review.md",
-			"skills/orchestrate/adversarial-review-example.js",
+			"skills/review/SKILL.md",
+			"skills/review/adversarial-review.md",
+			"skills/review/adversarial-review-example.js",
 			"agents/adversarial-reviewer.md",
 			"agents/planner.md",
 			"agents/poteto.md",
@@ -327,7 +324,7 @@ describe("bundled orchestration skill", () => {
 		);
 	});
 
-	it("requires fork:false in orchestrate skill reviewer launches", () => {
+	it("requires fork:false in review skill reviewer launches", () => {
 		const selectSection = sectionBetween(
 			skill,
 			"## 2. Select reviewers",
@@ -335,7 +332,7 @@ describe("bundled orchestration skill", () => {
 		);
 		assert.ok(
 			selectSection.includes("`fork: false`"),
-			"orchestrate SKILL.md reviewer section must require fork: false",
+			"review SKILL.md reviewer section must require fork: false",
 		);
 		const adversarialTopology = sectionBetween(
 			adversarialReview,

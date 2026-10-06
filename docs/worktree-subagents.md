@@ -164,7 +164,7 @@ For parallel read-only review, prepare one stable existing checkout of the pull 
 
 A `read,bash` tool allowlist does not enforce read-only behavior because Bash can mutate the checkout. Tell public reviewers to use only safe inspection, avoid artifact-generating verification, and consume supplied mechanical evidence. Public completion reports above 16,000 characters are abbreviated; when a completed report is needed, retrieve its final assistant message once from the supplied session path with bounded output. This is evidence retrieval, not live-session polling.
 
-For a committed candidate, prefer the `/skill:orchestrate` adversarial procedure.
+For a committed candidate, prefer the `/skill:review` adversarial procedure.
 It uses fresh public reviewer children in ordinary panes, not an approved private
 runner or automatically created detached checkout. The resolved role tool
 allowlist is the available enforcement boundary; Bash is not read-only. The parent

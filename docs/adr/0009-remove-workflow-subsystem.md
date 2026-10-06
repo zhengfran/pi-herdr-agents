@@ -12,7 +12,7 @@ security risk without providing a needed product capability.
 ## Decision
 
 Remove `herdr_workflow`, its Worker, workflow tests, and runner-owned review
-checkout. The bundled `orchestrate` skill now has the parent materialize pinned
+checkout. The bundled `review` skill now has the parent materialize pinned
 evidence, fan out fresh public read-only reviewers through `subagent()`, wait
 for automatic completion delivery, and synthesize outcomes in the parent.
 

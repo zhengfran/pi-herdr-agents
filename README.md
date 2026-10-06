@@ -171,8 +171,8 @@ The current orchestration inventory is:
 | Iteration | `/iterate` | Opens one interactive full-context Pi fork. |
 | Side question | `/btw`, `/btw-close` | Opens one replaceable interactive Pi side session. |
 | Worktree handoff | `/worktree <name> [task]`, `/worktree list` | Forks the active conversation into a managed worktree. |
-| Orchestrated review | `/skill:orchestrate` | Parent materializes evidence, fans out public reviewers, and synthesizes results. |
-| Adversarial review | `/skill:orchestrate`, `adversarial-reviewer` | Risk-based public discovery, cross-family verification, and parent synthesis. |
+| Orchestrated review | `/skill:review` | Parent materializes evidence, fans out public reviewers, and synthesizes results. |
+| Adversarial review | `/skill:review`, `adversarial-reviewer` | Risk-based public discovery, cross-family verification, and parent synthesis. |
 | Automatic input routing | Eligible idle top-level TUI input; durable `autoRouting` opt-in | One authorized standalone autonomous leaf in the shared checkout; no worktree or review-purpose launch in v1. |
 
 See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
@@ -224,7 +224,7 @@ different model family than the author. For ordinary review, prefer a different
 authenticated model family. When no other authenticated model family is
 available, ordinary review may use a same-family reviewer in a fresh standalone
 session. Disclose that this review is context-isolated, not cross-family
-independent. Cross-family verification, `/skill:orchestrate`, and
+independent. Cross-family verification, `/skill:review`, and
 `adversarial-reviewer` must not use this fallback. A stronger model in the same
 family is a quality escalation, not cross-family
 independent review. Family is the independence boundary; project policy may
@@ -392,7 +392,7 @@ a reviewer from a different model family than the author. For ordinary review,
 prefer a different authenticated model family. When no other authenticated
 model family is available, ordinary review may use a same-family reviewer in a
 fresh standalone session. Disclose that this review is context-isolated, not
-cross-family independent. Cross-family verification, `/skill:orchestrate`, and
+cross-family independent. Cross-family verification, `/skill:review`, and
 `adversarial-reviewer` must not use this fallback. Use an exact authenticated
 shortlist `provider/model-id` when the
 authoring family is known; `task:review` does not establish independence. Family
@@ -532,7 +532,7 @@ ordinary review, prefer a different authenticated model family. When no other
 authenticated model family is available, ordinary review may use a same-family
 reviewer in a fresh standalone session. Disclose that this review is
 context-isolated, not cross-family independent. Cross-family verification,
-`/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.
+`/skill:review`, and `adversarial-reviewer` must not use this fallback.
 Another route to the same family is not
 independent review. Family is the independence boundary; project policy may
 separately require a different provider. Run `/reload` (or start a new session)
@@ -1077,10 +1077,11 @@ For a native `cli: claude|kiro` child, the interrupt is accepted only when its p
 
 ---
 
-## Orchestrated review skill
+## Review skill
 
-The bundled `/skill:orchestrate` procedure accepts local paths, URLs, tickets,
-or accessible combinations. The parent pins repository, base/head SHAs, task and
+The bundled `/skill:review` procedure (formerly `/skill:orchestrate`) accepts
+local paths, URLs, tickets, or accessible combinations. Update saved prompts to
+use the new command. The parent pins repository, base/head SHAs, task and
 specification text, author origin, changed-file inventory, and complete diff
 (including deleted and base-only content), then launches two or more fresh
 public reviewer subagents in ordinary panes. Each child receives an exact model

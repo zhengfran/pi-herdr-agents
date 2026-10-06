@@ -44,7 +44,7 @@ const ordinaryReviewClauses = [
 	"For ordinary review, prefer a different authenticated model family.",
 	"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 	"Disclose that this review is context-isolated, not cross-family independent.",
-	"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+	"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 ];
 
 function registry(entries = [model("fake", "parent"), model("other", "fast")]) {

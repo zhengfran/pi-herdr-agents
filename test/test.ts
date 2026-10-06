@@ -6301,7 +6301,7 @@ describe("commands", () => {
 				"For ordinary review, prefer a different authenticated model family.",
 				"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 				"Disclose that this review is context-isolated, not cross-family independent.",
-				"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+				"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 			])
 				assert.ok(
 					normalizedPrompt.includes(clause),
@@ -6975,7 +6975,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 		];
 		for (const [label, taskPreferences] of [
 			["shortlist", { coding: ["fake/worker"] }],
@@ -7019,7 +7019,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 		])
 			assert.ok(
 				guidelines.includes(clause),
@@ -7210,7 +7210,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 		])
 			assert.ok(
 				modelDesc.includes(clause),
@@ -7224,15 +7224,12 @@ describe("tool registration", () => {
 	});
 
 	it("strict surfaces never permit same-family fallback", () => {
-		const orchestrateSkill = readFileSync(
-			join(getSubagentsPackageRoot(), "skills/orchestrate/SKILL.md"),
+		const reviewSkill = readFileSync(
+			join(getSubagentsPackageRoot(), "skills/review/SKILL.md"),
 			"utf8",
 		);
 		const adversarialProcedure = readFileSync(
-			join(
-				getSubagentsPackageRoot(),
-				"skills/orchestrate/adversarial-review.md",
-			),
+			join(getSubagentsPackageRoot(), "skills/review/adversarial-review.md"),
 			"utf8",
 		);
 		const adversarialAgent = readFileSync(
@@ -7243,11 +7240,11 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification, `/skill:review`, and `adversarial-reviewer` must not use this fallback.",
 		];
 		for (const [label, content] of [
-			["skills/orchestrate/SKILL.md", orchestrateSkill],
-			["skills/orchestrate/adversarial-review.md", adversarialProcedure],
+			["skills/review/SKILL.md", reviewSkill],
+			["skills/review/adversarial-review.md", adversarialProcedure],
 			["agents/adversarial-reviewer.md", adversarialAgent],
 		] as const) {
 			assert.doesNotMatch(

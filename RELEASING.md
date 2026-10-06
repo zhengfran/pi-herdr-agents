@@ -77,7 +77,7 @@ The optional live-provider smoke test is not a release gate:
 PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:integration:live
 ```
 
-Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, `skills/orchestrate/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes tests/evals/fixtures and generated captures, plans, journals,
+Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/review/SKILL.md`, `skills/review/adversarial-review.md`, `skills/review/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes tests/evals/fixtures and generated captures, plans, journals,
 sessions, prototypes, generated evidence, local `config.json` and `openspec/`.
 Verify before/after inventories of test-owned Herdr workspaces, processes, temporary
 repositories and worktrees; remove only positively test-owned residue after checking

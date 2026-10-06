@@ -678,7 +678,7 @@ describe("current text and image predicates", () => {
 			["", "blank-prompt"],
 			[" \n\t ", "blank-prompt"],
 			["/subagent scout inspect", "command-input"],
-			["  \n/skill:orchestrate", "command-input"],
+			["  \n/skill:review", "command-input"],
 			["!ls -la", "command-input"],
 			["\t!git status", "command-input"],
 			[

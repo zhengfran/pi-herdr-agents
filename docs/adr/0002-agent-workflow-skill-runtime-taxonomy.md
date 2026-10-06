@@ -99,7 +99,7 @@ The package already exposes these workflow surfaces:
 - **Approved review runner** — `herdr_workflow`, a low-level control tool for
   exact approved project-local JavaScript. It is an execution surface, not the
   user-facing workflow recipe.
-- **Orchestrated review authoring** — bundled native `/skill:orchestrate`, which
+- **Orchestrated review authoring** — bundled native `/skill:review`, which
   teaches the parent to author and approve the first-flow review workflow.
 
 An orchestration agent remains a compatibility implementation detail—not a
@@ -111,7 +111,7 @@ implementations:
 
 - **Review** — one or more evidence-backed review passes against a supplied
   base/ref and rubric.
-- **Adversarial review** — the preferred branch of `/skill:orchestrate`, with
+- **Adversarial review** — the preferred branch of `/skill:review`, with
   independent discovery, candidate-dependent verification, and fresh synthesis.
 
 The legacy coordinator remains a compatibility surface. New review outcomes use
@@ -153,7 +153,7 @@ Apply these rules:
 
 This preserves useful multi-model review behavior without baking a particular
 vendor choice into the generic `reviewer` role. The preferred adversarial review
-is now a procedure in the existing `orchestrate` skill: it applies project
+is now a procedure in the existing `review` skill: it applies project
 constraints, requires known author model families or confirmed human-only
 origin, uses two distinct eligible exact model IDs for routine risk or three
 distinct lenses for concrete high-risk surfaces, conditionally verifies serious
@@ -212,7 +212,7 @@ project authors can still add their own namespaced fields.
   new outcomes.
 - `plan-skill.md` — Planning workflow instruction. Document by workflow purpose,
   not agent type.
-- `skills/orchestrate/SKILL.md` — Bundled native authoring skill for the first
+- `skills/review/SKILL.md` — Bundled native authoring skill for the first
   review workflow and the preferred adversarial-review procedure; exposed with
   the package through Pi skills metadata.
 

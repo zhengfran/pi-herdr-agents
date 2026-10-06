@@ -88,7 +88,7 @@ Stop before widening scope if implementation appears to require:
 
 ## External control surface
 
-The bundled `orchestrate` skill is the user entry point. The extension provides the parent-facing control tool that skill uses:
+The bundled `review` skill is the user entry point. The extension provides the parent-facing control tool that skill uses:
 
 ```ts
 herdr_workflow({ action: "prepare", path: string })
@@ -193,7 +193,7 @@ Metadata is an approved capability envelope, not a promise of the exact future n
 
 ## Review-policy boundary
 
-The bundled `orchestrate` skill must author the first flow as independent
+The bundled `review` skill must author the first flow as independent
 reviewers followed by one fresh synthesizer. Every original success or failure
 envelope remains in script state and runner journal evidence. Synthesis receives
 every outcome through an identity-stripped projection: canonical validated report
@@ -424,7 +424,7 @@ All slices are sequential because they touch the same runtime and lifecycle seam
 
 **Files**
 
-- Add `skills/orchestrate/SKILL.md`.
+- Add `skills/review/SKILL.md`.
 - Add `"skills": ["./skills"]` to the package manifest.
 - Update `README.md`, `AGENTS.md`, `.pi/skills/run-integration-tests/SKILL.md`, and proposed ADR statuses only after implementation approval.
 
@@ -433,7 +433,7 @@ All slices are sequential because they touch the same runtime and lifecycle seam
 1. Resolve the user-selected ADR, PRD, ticket set, or combination through parent capabilities.
 2. Pin the canonical repository, exact comparison base and checkout head, task/spec evidence, and dirty-state scope.
 3. Perform preflight role/runtime discovery and record the catalog source and omissions.
-4. For adversarial review, apply `skills/orchestrate/adversarial-review.md`; otherwise use the generic independent-review flow.
+4. For adversarial review, apply `skills/review/adversarial-review.md`; otherwise use the generic independent-review flow.
 5. Create a unique `.pi/plans/<run>/workflow.js` at the committed checkout `baseSha`.
 6. Call `herdr_workflow prepare`.
 7. Present the returned packet without rewriting it.

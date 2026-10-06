@@ -1,9 +1,9 @@
 ---
-name: orchestrate
+name: review
 description: Run a bounded review with fresh public subagents and parent synthesis from local files, URLs, tickets, or accessible sources.
 ---
 
-# Orchestrate a review
+# Review with multiple agents
 
 Use public `subagent()` fan-out. The parent owns source resolution, evidence,
 launches, and synthesis. Use only ordinary public child launches; do not compile

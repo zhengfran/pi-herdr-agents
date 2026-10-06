@@ -12,7 +12,7 @@ The first workflow reviews an exact source or candidate. The parent author and a
 
 ## Decision
 
-The bundled `orchestrate` skill authors every v1 review workflow with independent fresh read-only review nodes followed by one fresh review synthesizer. Each reviewer and the synthesizer receive the exact source or candidate evidence rather than inherited implementation context. The synthesizer receives every explicit reviewer success or failure and returns the task-specific result.
+The bundled `review` skill authors every v1 review workflow with independent fresh read-only review nodes followed by one fresh review synthesizer. Each reviewer and the synthesizer receive the exact source or candidate evidence rather than inherited implementation context. The synthesizer receives every explicit reviewer success or failure and returns the task-specific result.
 
 The runtime remains task-agnostic: it enforces the approved capability envelope and operational evidence but does not infer prompts, impose a fixed review receipt, or prove JavaScript data flow. Exact-script human approval is the task-semantics boundary.
 
