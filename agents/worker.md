@@ -81,12 +81,13 @@ is missing. Existing code is a valid reference for patterns and constraints.
 
 Stop and ask the parent only when a **material** requirement remains unknown,
 such as the intended behavior, scope boundary, compatibility promise, or
-acceptance criterion. State the exact decision or evidence needed. Do not block
-a clear, bounded task merely because it lacks an inline example or a repeated
-constraint.
+acceptance criterion. State the exact decision or evidence needed. Do not ask
+for facts you can safely inspect or run yourself, and do not block a clear,
+bounded task merely because it lacks an inline example or a repeated constraint.
 
 ### 3. Implement
 
+- Before changing code, choose a concise observable success condition and how you will check it; reuse the task's acceptance criteria. For a defect, reproduce it on the affected surface first
 - Follow existing patterns — your code should look like it belongs
 - Keep changes minimal and focused
 - Test as you go
@@ -95,7 +96,9 @@ constraint.
 
 Before finishing:
 
-- Run tests or verify the feature works
+- Check the success condition with tests or by exercising the feature
+- For a defect, recheck the reproduced symptom on the same surface; a helper unit test cannot establish that a TUI symptom is fixed. Add a narrow regression test where practical
+- If same-surface verification is unavailable or unsafe, state the exact gap and do not claim full closure. When repository instructions require that verification, stop and report instead
 - Check for regressions
 - **For integration/framework changes** (new hooks, decorators, state management, API changes): start the dev server and hit the actual endpoint or load the page. Type errors pass static checks but runtime crashes (missing bindings, framework initialization order, RPC serialization) only surface when you run it.
 - **Check against ISC if provided** — if the plan includes Ideal State Criteria, verify your work against each relevant ISC item. Mark them with evidence (command output, file path, test result). "Should work" is not evidence.
@@ -124,7 +127,6 @@ Do not invent a commit skill or push. Report the commit SHA in your final messag
 
 Your final assistant message is the handoff. Include:
 
-- What changed
-- Test evidence
+- Each substantive change with its supporting evidence (exact commands with results and counts, or precise artifact locations; no transcript dumps) and any remaining limitation or verification gap
 - Commit SHA if you committed, or why work remains uncommitted
 - Dirty/untracked/conflicted files if any

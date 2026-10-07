@@ -22,6 +22,11 @@ const adversarialExample = readFileSync(
 	join(root, "skills", "review", "adversarial-review-example.js"),
 	"utf8",
 );
+const roleFile = (name) =>
+	readFileSync(join(root, "agents", `${name}.md`), "utf8");
+const poteto = roleFile("poteto");
+const worker = roleFile("worker");
+const tester = roleFile("tester");
 const planSkill = readFileSync(
 	join(root, "pi-extension", "subagents", "plan-skill.md"),
 	"utf8",
@@ -417,5 +422,129 @@ describe("bundled orchestration skill", () => {
 					passage.includes(clause),
 					`README passage ${index + 1} must include: ${clause}`,
 				);
+	});
+});
+
+// These assertions pin the shipped prompt contracts only; they cannot prove
+// that a model follows them.
+describe("bundled role proof and evidence contracts", () => {
+	it("keeps role frontmatter and spawning policy unchanged", () => {
+		assert.match(
+			poteto,
+			/^---\nname: poteto\n[\s\S]*\ntools: read, bash, edit, write, subagent\nspawning: true\nauto-exit: true\nsystem-prompt: append\n---\n/,
+		);
+		for (const [name, content] of [
+			["worker", worker],
+			["tester", tester],
+		])
+			assert.match(
+				content,
+				new RegExp(
+					`^---\\nname: ${name}\\n[\\s\\S]*\\ntools: read, bash, write, edit\\nspawning: false\\nauto-exit: true\\nsystem-prompt: append\\n---\\n`,
+				),
+			);
+	});
+
+	it("chooses proof before changing code and rechecks on the affected surface", () => {
+		for (const [label, content, clauses] of [
+			[
+				"poteto",
+				poteto,
+				[
+					"Before changing code, choose a concise observable success condition and how you will check it; reuse the task or plan acceptance criteria rather than writing a separate artifact.",
+					"reproduce the symptom on the affected surface",
+					"recheck the reproduced symptom on the same surface; a helper unit test cannot establish that a TUI symptom is fixed.",
+					"Add a narrow regression test where practical.",
+					"If same-surface verification is unavailable or unsafe, disclose the exact gap and do not claim full closure.",
+					"Stop and report if the task conflicts with repository instructions or required verification cannot run.",
+					"Do not ask the user about facts you can safely learn by reading or running the project.",
+				],
+			],
+			[
+				"worker",
+				worker,
+				[
+					"Before changing code, choose a concise observable success condition and how you will check it; reuse the task's acceptance criteria.",
+					"recheck the reproduced symptom on the same surface; a helper unit test cannot establish that a TUI symptom is fixed.",
+					"If same-surface verification is unavailable or unsafe, state the exact gap and do not claim full closure. When repository instructions require that verification, stop and report instead",
+					"Do not ask for facts you can safely inspect or run yourself",
+				],
+			],
+			[
+				"tester",
+				tester,
+				[
+					"A helper unit test cannot establish that a TUI symptom is fixed.",
+					"When same-surface testing is unavailable or unsafe, report the exact gap instead of claiming the behavior is covered.",
+					"Change only test files, fixtures, and test data unless the task explicitly authorizes production changes.",
+				],
+			],
+		]) {
+			const compact = normalized(content);
+			for (const clause of clauses)
+				assert.ok(compact.includes(clause), `${label} must include: ${clause}`);
+		}
+	});
+
+	it("escalates poteto orchestration only for a concrete reason", () => {
+		const compact = normalized(poteto);
+		for (const clause of [
+			"A clear, bounded implementation normally has one implementation worker",
+			"for unresolved behavior, consequential trust, security, or lifecycle boundaries, a wide blast radius, or genuinely independent work.",
+			"are floors, not options; do not invoke `/plan` on your own or weaken review independence.",
+			"Use ordinary panes for read-only agents.",
+			"use one unique managed worktree branch per independent task, based on committed state; keep overlapping or dependent edits sequential.",
+			"Do not poll, sleep, tail sessions, or invent child results while waiting.",
+			"Do not use `subagent_resume` as if it reattached worktree ownership.",
+		])
+			assert.ok(compact.includes(clause), `poteto must include: ${clause}`);
+		for (const content of [worker, tester])
+			assert.doesNotMatch(content, /Escalate orchestration/);
+	});
+
+	it("ties reported outcomes to evidence and remaining limitations", () => {
+		const potetoCompact = normalized(poteto);
+		for (const clause of [
+			"Report each substantive outcome with its supporting evidence and remaining limitation.",
+			"Cite exact commands with results and counts, or precise artifact locations, not transcript dumps.",
+			"Distinguish evidence children reported from checks you performed yourself.",
+		])
+			assert.ok(
+				potetoCompact.includes(clause),
+				`poteto must include: ${clause}`,
+			);
+		const workerFinal = sectionBetween(
+			worker,
+			"### 6. Final Message",
+			"Dirty/untracked/conflicted files if any",
+		);
+		for (const clause of [
+			"Each substantive change with its supporting evidence (exact commands with results and counts, or precise artifact locations; no transcript dumps) and any remaining limitation or verification gap",
+			"Commit SHA if you committed, or why work remains uncommitted",
+		])
+			assert.ok(workerFinal.includes(clause), `worker must include: ${clause}`);
+		const testerFinal = sectionBetween(
+			tester,
+			"### 6. Final Message",
+			"Dirty/untracked/conflicted files if any",
+		);
+		for (const clause of [
+			"Behaviors covered, and any deliberately left uncovered",
+			"Exact commands run and their results",
+			"Defects found, with the failing test, expected and actual behavior",
+		])
+			assert.ok(testerFinal.includes(clause), `tester must include: ${clause}`);
+	});
+
+	it("documents the lightweight role behavior and its evidence limits in README", () => {
+		const compact = normalized(readme);
+		for (const clause of [
+			"`poteto`, `worker`, and `tester` choose an observable success check before changing code",
+			"they disclose the exact gap instead of claiming full closure.",
+			"`poteto` separates child-reported evidence from checks it ran itself.",
+			"`poteto` normally coordinates one implementation worker",
+			"These are prompt contracts, not runtime enforcement: package tests check the shipped wording, not model adherence.",
+		])
+			assert.ok(compact.includes(clause), `README must include: ${clause}`);
 	});
 });

@@ -30,6 +30,8 @@ assignments below retain their normal contract.
 
 Assert on observable results — return values, outputs, state changes, errors — through the public interface. A test that breaks on a harmless refactor is a liability.
 
+Test where the behavior is observed. A helper unit test cannot establish that a TUI symptom is fixed. When same-surface testing is unavailable or unsafe, report the exact gap instead of claiming the behavior is covered.
+
 ### Follow the Project's Tests
 
 Read the existing tests for the area first. Use the same framework, file layout, naming, fixtures, and helpers. Add no test dependency or new helper unless the task asks for it.

@@ -184,13 +184,25 @@ See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
 | ---------- | -------------- | --------------- | -------------- |
 | **planner** | Coordinator agent role | Config, then parent | Clarifies requirements, explores approaches, and writes plans with ordered tasks. |
 | **scout** | Leaf agent role | Config, then parent | Maps relevant code, conventions, and verification paths. |
-| **worker** | Leaf agent role | Config, then parent | Implements bounded tasks and verifies the result. |
+| **worker** | Leaf agent role | Config, then parent | Implements bounded tasks, verifies them on the affected surface, and reports evidence and gaps. |
 | **tester** | Leaf agent role | Config, then parent | Writes or extends tests for a bounded behavior and reports what they prove. |
 | **reviewer** | Leaf agent role | Config, then parent | Reviews changes for correctness, security, and maintainability. |
 | **visual-tester** | Leaf agent role | Config, then parent | Performs visual QA through the `chrome-cdp` skill. |
 | **researcher** | Leaf agent role | Config, then parent | Searches the web and returns a sourced brief through `pi-web-access` tools. |
-| **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, delegates independent work, and verifies. |
+| **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, escalates orchestration only for a concrete reason, and verifies. |
 | **adversarial-reviewer** | Coordinator role | Exact eligible authenticated Pi models selected by risk and project policy | Runs two routine or three high-risk discovery reviewers, candidate-dependent cross-family verification, and parent synthesis through public asynchronous children. |
+
+`poteto`, `worker`, and `tester` choose an observable success check before
+changing code and recheck a defect on the surface where it appeared. When that
+check is unavailable or unsafe, they disclose the exact gap instead of claiming
+full closure. Reports tie each outcome to exact commands, results, or artifact
+locations and its remaining limitation; `poteto` separates child-reported
+evidence from checks it ran itself. For a clear, bounded implementation,
+`poteto` normally coordinates one implementation worker and adds planning,
+review, or parallel writers only for a concrete reason; repository-required
+tests, reviews, and user-selected workflows still apply. These are prompt
+contracts, not runtime enforcement: package tests check the shipped wording,
+not model adherence.
 
 Subagents execute through Pi by default, and Claude models remain available
 through normal Pi provider/model routing. A role may instead declare
